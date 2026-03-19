@@ -1,5 +1,11 @@
+# Core — required for the bridge (main.py)
 meshtastic
 paho-mqtt
 pypubsub
 python-dotenv
 pyserial
+
+# Optional — required for the DB ingestor (src/navamesh/mqtt_to_db.py)
+# Install with:  pip install -e ".[db]"
+# psycopg[binary]
+# influxdb-client

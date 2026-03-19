@@ -8,9 +8,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(usecwd=True))
+
 import paho.mqtt.client as mqtt
 
-from config import load_config
+from navamesh.config import load_config
 
 try:
     import psycopg
@@ -57,9 +60,7 @@ class NodeState:
     soil_raw: Optional[float] = None
     soil_percent: Optional[float] = None
     battery_level: Optional[float] = None
-    battery_usb: Optional[bool] = None    # True when RAK4631 reports "Bat: USB"
     voltage: Optional[float] = None
-    uptime_seconds: Optional[int] = None  # from "Up: Xh Ym" in status messages
     rx_rssi: Optional[float] = None
     rx_snr: Optional[float] = None
 
@@ -71,9 +72,7 @@ class NodeState:
             "soil_raw": self.soil_raw,
             "soil_percent": self.soil_percent,
             "battery_level": self.battery_level,
-            "battery_usb": self.battery_usb,
             "voltage": self.voltage,
-            "uptime_seconds": self.uptime_seconds,
             "alt": self.alt,
             "sats": self.sats,
             "hdop": self.hdop,
@@ -203,12 +202,8 @@ class InfluxWriter:
             point = point.field("percent", float(state.soil_percent))
         if state.battery_level is not None:
             point = point.field("battery_level", float(state.battery_level))
-        if state.battery_usb is not None:
-            point = point.field("battery_usb", int(state.battery_usb))  # 1=USB, 0=battery
         if state.voltage is not None:
             point = point.field("voltage", float(state.voltage))
-        if state.uptime_seconds is not None:
-            point = point.field("uptime_seconds", float(state.uptime_seconds))
         if state.lat is not None:
             point = point.field("lat", float(state.lat))
         if state.lon is not None:
@@ -240,7 +235,12 @@ class MqttToDbIngestor:
             bucket=self.db_cfg.influx_bucket,
         )
 
-        self.client = mqtt.Client()
+        try:
+            # paho-mqtt >= 2.0 requires explicit callback API version
+            self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        except AttributeError:
+            # paho-mqtt < 2.0 fallback
+            self.client = mqtt.Client()
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
         self.client.on_disconnect = self.on_disconnect
@@ -290,7 +290,7 @@ class MqttToDbIngestor:
         self.pg.close()
         self.influx.close()
 
-    def on_connect(self, client: mqtt.Client, userdata: Any, flags: Dict[str, Any], rc: int) -> None:
+    def on_connect(self, client: mqtt.Client, userdata: Any, flags: Dict[str, Any], rc: int, properties=None) -> None:
         if rc != 0:
             logger.error("MQTT connect failed with rc=%s", rc)
             return
@@ -299,7 +299,7 @@ class MqttToDbIngestor:
             client.subscribe(topic)
             logger.info("Subscribed to %s -> %s", name, topic)
 
-    def on_disconnect(self, client: mqtt.Client, userdata: Any, rc: int) -> None:
+    def on_disconnect(self, client: mqtt.Client, userdata: Any, rc: int, properties=None) -> None:
         if rc != 0:
             logger.warning("Unexpected MQTT disconnect rc=%s", rc)
         else:
@@ -370,12 +370,6 @@ class MqttToDbIngestor:
         elif kind == "battery":
             state.battery_level = self._coerce_float(payload.get("batteryLevel"))
             state.voltage = self._coerce_float(payload.get("voltage"))
-            # batteryUsb and uptimeSeconds arrive from FORMAT B text messages;
-            # TELEMETRY_APP packets won't have them — that's fine, we just skip.
-            if "batteryUsb" in payload:
-                state.battery_usb = bool(payload["batteryUsb"])
-            if "uptimeSeconds" in payload:
-                state.uptime_seconds = self._coerce_int(payload.get("uptimeSeconds"))
         elif kind == "link":
             state.rx_rssi = self._coerce_float(payload.get("rxRssi"))
             state.rx_snr = self._coerce_float(payload.get("rxSnr"))
