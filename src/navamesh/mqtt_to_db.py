@@ -60,7 +60,9 @@ class NodeState:
     soil_raw: Optional[float] = None
     soil_percent: Optional[float] = None
     battery_level: Optional[float] = None
+    battery_usb: Optional[bool] = None    # True when RAK4631 reports "Bat: USB"
     voltage: Optional[float] = None
+    uptime_seconds: Optional[int] = None  # from "Up: Xh Ym" in status messages
     rx_rssi: Optional[float] = None
     rx_snr: Optional[float] = None
 
@@ -72,7 +74,9 @@ class NodeState:
             "soil_raw": self.soil_raw,
             "soil_percent": self.soil_percent,
             "battery_level": self.battery_level,
+            "battery_usb": self.battery_usb,
             "voltage": self.voltage,
+            "uptime_seconds": self.uptime_seconds,
             "alt": self.alt,
             "sats": self.sats,
             "hdop": self.hdop,
@@ -129,35 +133,48 @@ class PostgresWriter:
     def upsert_node(self, state: NodeState, location_name: str, node_type: str) -> None:
         if self._conn is None:
             return
-        if state.lat is None or state.lon is None:
-            logger.info("Skipping PostGIS upsert for %s: no coordinates yet.", state.node_id)
-            return
 
         ts = state.last_seen_ts or int(datetime.now(tz=timezone.utc).timestamp())
         metadata_json = json.dumps(state.metadata(location_name, node_type))
+        has_coords = state.lat is not None and state.lon is not None
 
         with self._conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, geom, metadata)
-                VALUES (
-                    %s,
-                    to_timestamp(%s),
-                    %s,
-                    %s,
-                    ST_SetSRID(ST_MakePoint(%s, %s), 4326),
-                    %s::jsonb
+            if has_coords:
+                # Full upsert with GPS coordinates and PostGIS geometry
+                cur.execute(
+                    """
+                    INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, geom, metadata)
+                    VALUES (
+                        %s,
+                        to_timestamp(%s),
+                        %s,
+                        %s,
+                        ST_SetSRID(ST_MakePoint(%s, %s), 4326),
+                        %s::jsonb
+                    )
+                    ON CONFLICT (node_id) DO UPDATE SET
+                        last_seen = EXCLUDED.last_seen,
+                        lat       = EXCLUDED.lat,
+                        lon       = EXCLUDED.lon,
+                        geom      = EXCLUDED.geom,
+                        metadata  = EXCLUDED.metadata;
+                    """,
+                    (state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
                 )
-                ON CONFLICT (node_id) DO UPDATE SET
-                    last_seen = EXCLUDED.last_seen,
-                    lat = EXCLUDED.lat,
-                    lon = EXCLUDED.lon,
-                    geom = EXCLUDED.geom,
-                    metadata = EXCLUDED.metadata;
-                """,
-                (state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
-            )
-        logger.info("Upserted mesh_nodes row for %s.", state.node_id)
+            else:
+                # No GPS yet — upsert metadata and last_seen only,
+                # preserve any coordinates already set (e.g. manually via SQL UPDATE)
+                cur.execute(
+                    """
+                    INSERT INTO mesh_nodes (node_id, last_seen, metadata)
+                    VALUES (%s, to_timestamp(%s), %s::jsonb)
+                    ON CONFLICT (node_id) DO UPDATE SET
+                        last_seen = EXCLUDED.last_seen,
+                        metadata  = EXCLUDED.metadata;
+                    """,
+                    (state.node_id, ts, metadata_json),
+                )
+        logger.info("Upserted mesh_nodes row for %s (coords=%s).", state.node_id, has_coords)
 
     def close(self) -> None:
         if self._conn is not None:
@@ -202,8 +219,12 @@ class InfluxWriter:
             point = point.field("percent", float(state.soil_percent))
         if state.battery_level is not None:
             point = point.field("battery_level", float(state.battery_level))
+        if state.battery_usb is not None:
+            point = point.field("battery_usb", int(state.battery_usb))  # 1=USB, 0=battery
         if state.voltage is not None:
             point = point.field("voltage", float(state.voltage))
+        if state.uptime_seconds is not None:
+            point = point.field("uptime_seconds", float(state.uptime_seconds))
         if state.lat is not None:
             point = point.field("lat", float(state.lat))
         if state.lon is not None:
@@ -370,6 +391,12 @@ class MqttToDbIngestor:
         elif kind == "battery":
             state.battery_level = self._coerce_float(payload.get("batteryLevel"))
             state.voltage = self._coerce_float(payload.get("voltage"))
+            # batteryUsb and uptimeSeconds arrive from FORMAT B text messages
+            # TELEMETRY_APP packets won't have them — that's fine, we just skip
+            if "batteryUsb" in payload:
+                state.battery_usb = bool(payload["batteryUsb"])
+            if "uptimeSeconds" in payload:
+                state.uptime_seconds = self._coerce_int(payload.get("uptimeSeconds"))
         elif kind == "link":
             state.rx_rssi = self._coerce_float(payload.get("rxRssi"))
             state.rx_snr = self._coerce_float(payload.get("rxSnr"))
