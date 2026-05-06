@@ -7,5 +7,9 @@ pyserial
 
 # Optional — required for the DB ingestor (src/navamesh/mqtt_to_db.py)
 # Install with:  pip install -e ".[db]"
-# psycopg[binary]
-# influxdb-client
+ psycopg[binary]
+ influxdb-client
+
+#reticulum
+rns
+lxmf

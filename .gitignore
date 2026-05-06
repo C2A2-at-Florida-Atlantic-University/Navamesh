@@ -33,3 +33,17 @@ data/
 
 # Old single-file bridge (do not commit)
 mesh_to_mqtt.py
+influxdata-archive_compat.key
+mqtt_to_influx.py
+reticulum-meshchat/
+src/navamesh.egg-info/
+To
+mosquitto/
+cloud_sync_queue.db
+influxdata-archive_compat.key
+mqtt_to_influx.py
+reticulum-meshchat/
+src/navamesh.egg-info/
+To
+mosquitto/
+cloud_sync_queue.db

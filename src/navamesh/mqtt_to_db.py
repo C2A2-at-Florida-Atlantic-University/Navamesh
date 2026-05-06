@@ -2,11 +2,13 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(usecwd=True))
@@ -36,16 +38,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mqtt_to_db")
 
+# Gateway node IDs to exclude from DB writes
+
+CLOUD_RETRY_INTERVAL = int(os.getenv("CLOUD_RETRY_INTERVAL", "30"))
+
 
 @dataclass(frozen=True)
 class DatabaseConfig:
+    # Local (primary — always write)
     pg_dsn: str
     influx_url: str
     influx_token: str
     influx_org: str
     influx_bucket: str
+    # Cloud (secondary — best-effort, queue on failure)
+    pg_cloud_dsn: str
+    influx_cloud_url: str
+    influx_cloud_token: str
+    influx_cloud_org: str
+    influx_cloud_bucket: str
+
     location_name: str
     node_type: str
+    farm_id: str
 
 
 @dataclass
@@ -86,6 +101,105 @@ class NodeState:
         }
 
 
+def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "") -> dict:
+    return {
+        "node_id": state.node_id,
+        "last_seen_ts": state.last_seen_ts,
+        "lat": state.lat,
+        "lon": state.lon,
+        "alt": state.alt,
+        "sats": state.sats,
+        "hdop": state.hdop,
+        "soil_raw": state.soil_raw,
+        "soil_percent": state.soil_percent,
+        "battery_level": state.battery_level,
+        "battery_usb": state.battery_usb,
+        "voltage": state.voltage,
+        "uptime_seconds": state.uptime_seconds,
+        "rx_rssi": state.rx_rssi,
+        "rx_snr": state.rx_snr,
+        "location_name": location_name,
+        "node_type": node_type,
+    }
+
+
+def _state_from_dict(d: dict) -> NodeState:
+    return NodeState(
+        node_id=d["node_id"],
+        last_seen_ts=d.get("last_seen_ts"),
+        lat=d.get("lat"),
+        lon=d.get("lon"),
+        alt=d.get("alt"),
+        sats=d.get("sats"),
+        hdop=d.get("hdop"),
+        soil_raw=d.get("soil_raw"),
+        soil_percent=d.get("soil_percent"),
+        battery_level=d.get("battery_level"),
+        battery_usb=d.get("battery_usb"),
+        voltage=d.get("voltage"),
+        uptime_seconds=d.get("uptime_seconds"),
+        rx_rssi=d.get("rx_rssi"),
+        rx_snr=d.get("rx_snr"),
+    )
+
+
+class CloudSyncQueue:
+    """SQLite-backed queue for cloud writes that failed due to connectivity loss."""
+
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = threading.Lock()
+        self._init_schema()
+        logger.info("Cloud sync queue at %s", db_path)
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sync_queue (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    queued_at INTEGER NOT NULL,
+                    target    TEXT    NOT NULL,
+                    payload   TEXT    NOT NULL
+                )
+                """
+            )
+            self._conn.commit()
+
+    def enqueue(self, target: str, payload: dict) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO sync_queue (queued_at, target, payload) VALUES (?, ?, ?)",
+                (int(time.time()), target, json.dumps(payload)),
+            )
+            self._conn.commit()
+        logger.debug("Queued failed %s write (queue size=%d).", target, self.size())
+
+    def peek(self, limit: int = 100) -> List[Tuple[int, str, dict]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, target, payload FROM sync_queue ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [(row[0], row[1], json.loads(row[2])) for row in rows]
+
+    def delete(self, ids: List[int]) -> None:
+        if not ids:
+            return
+        with self._lock:
+            placeholders = ",".join("?" * len(ids))
+            self._conn.execute(f"DELETE FROM sync_queue WHERE id IN ({placeholders})", ids)
+            self._conn.commit()
+
+    def size(self) -> int:
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) FROM sync_queue").fetchone()[0]
+
+    def close(self) -> None:
+        self._conn.close()
+
+
 class PostgresWriter:
     def __init__(self, dsn: str):
         self._dsn = dsn
@@ -108,6 +222,25 @@ class PostgresWriter:
         self._conn.autocommit = True
         self.ensure_schema()
         logger.info("Connected to Postgres/PostGIS.")
+
+    def _try_reconnect(self) -> bool:
+        if not self._enabled or psycopg is None:
+            return False
+        try:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = psycopg.connect(self._dsn)
+            self._conn.autocommit = True
+            self.ensure_schema()
+            logger.info("Postgres reconnected.")
+            return True
+        except Exception as e:
+            logger.debug("Postgres reconnect failed: %s", e)
+            self._conn = None
+            return False
 
     def ensure_schema(self) -> None:
         if self._conn is None:
@@ -132,49 +265,51 @@ class PostgresWriter:
 
     def upsert_node(self, state: NodeState, location_name: str, node_type: str) -> None:
         if self._conn is None:
-            return
+            if not self._try_reconnect():
+                raise ConnectionError("Postgres not connected and reconnect failed.")
 
         ts = state.last_seen_ts or int(datetime.now(tz=timezone.utc).timestamp())
         metadata_json = json.dumps(state.metadata(location_name, node_type))
         has_coords = state.lat is not None and state.lon is not None
 
-        with self._conn.cursor() as cur:
-            if has_coords:
-                # Full upsert with GPS coordinates and PostGIS geometry
-                cur.execute(
-                    """
-                    INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, geom, metadata)
-                    VALUES (
-                        %s,
-                        to_timestamp(%s),
-                        %s,
-                        %s,
-                        ST_SetSRID(ST_MakePoint(%s, %s), 4326),
-                        %s::jsonb
+        try:
+            with self._conn.cursor() as cur:
+                if has_coords:
+                    cur.execute(
+                        """
+                        INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, geom, metadata)
+                        VALUES (
+                            %s,
+                            to_timestamp(%s),
+                            %s,
+                            %s,
+                            ST_SetSRID(ST_MakePoint(%s, %s), 4326),
+                            %s::jsonb
+                        )
+                        ON CONFLICT (node_id) DO UPDATE SET
+                            last_seen = EXCLUDED.last_seen,
+                            lat       = EXCLUDED.lat,
+                            lon       = EXCLUDED.lon,
+                            geom      = EXCLUDED.geom,
+                            metadata  = EXCLUDED.metadata;
+                        """,
+                        (state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
                     )
-                    ON CONFLICT (node_id) DO UPDATE SET
-                        last_seen = EXCLUDED.last_seen,
-                        lat       = EXCLUDED.lat,
-                        lon       = EXCLUDED.lon,
-                        geom      = EXCLUDED.geom,
-                        metadata  = EXCLUDED.metadata;
-                    """,
-                    (state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
-                )
-            else:
-                # No GPS yet — upsert metadata and last_seen only,
-                # preserve any coordinates already set (e.g. manually via SQL UPDATE)
-                cur.execute(
-                    """
-                    INSERT INTO mesh_nodes (node_id, last_seen, metadata)
-                    VALUES (%s, to_timestamp(%s), %s::jsonb)
-                    ON CONFLICT (node_id) DO UPDATE SET
-                        last_seen = EXCLUDED.last_seen,
-                        metadata  = EXCLUDED.metadata;
-                    """,
-                    (state.node_id, ts, metadata_json),
-                )
-        logger.info("Upserted mesh_nodes row for %s (coords=%s).", state.node_id, has_coords)
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO mesh_nodes (node_id, last_seen, metadata)
+                        VALUES (%s, to_timestamp(%s), %s::jsonb)
+                        ON CONFLICT (node_id) DO UPDATE SET
+                            last_seen = EXCLUDED.last_seen,
+                            metadata  = EXCLUDED.metadata;
+                        """,
+                        (state.node_id, ts, metadata_json),
+                    )
+            logger.info("Upserted mesh_nodes row for %s (coords=%s).", state.node_id, has_coords)
+        except Exception:
+            self._conn = None  # mark stale so next call reconnects
+            raise
 
     def close(self) -> None:
         if self._conn is not None:
@@ -190,6 +325,7 @@ class InfluxWriter:
         self._bucket = bucket
         self._client = None
         self._write_api = None
+        self._farm_id = os.getenv("FARM_ID", "farm_1")
         self._enabled = bool(url and token and org and bucket)
 
     @property
@@ -212,7 +348,7 @@ class InfluxWriter:
         if self._write_api is None:
             return
         ts = datetime.fromtimestamp(state.last_seen_ts or int(datetime.now().timestamp()), tz=timezone.utc)
-        point = Point("soil_moisture").tag("node_id", state.node_id)
+        point = Point("soil_moisture").tag("node_id", state.node_id).tag("farm_id", self._farm_id)
         if state.soil_raw is not None:
             point = point.field("raw", float(state.soil_raw))
         if state.soil_percent is not None:
@@ -240,6 +376,65 @@ class InfluxWriter:
             self._write_api = None
 
 
+class CloudSyncWorker:
+    """Background thread that flushes the SQLite queue to cloud DBs when connectivity returns."""
+
+    def __init__(
+        self,
+        queue: CloudSyncQueue,
+        pg_cloud: PostgresWriter,
+        influx_cloud: InfluxWriter,
+        interval: int = 30,
+    ):
+        self._queue = queue
+        self._pg = pg_cloud
+        self._influx = influx_cloud
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="cloud-sync")
+
+    def start(self) -> None:
+        self._thread.start()
+        logger.info("Cloud sync worker started (retry interval=%ds).", self._interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            pending = self._queue.size()
+            if pending == 0:
+                continue
+            logger.info("Cloud sync: %d item(s) queued, attempting flush...", pending)
+            try:
+                self._flush()
+            except Exception as e:
+                logger.warning("Cloud sync worker unexpected error: %s", e)
+
+    def _flush(self) -> None:
+        rows = self._queue.peek(limit=100)
+        flushed = []
+        for row_id, target, payload in rows:
+            try:
+                state = _state_from_dict(payload)
+                if target == "pg":
+                    self._pg.upsert_node(
+                        state,
+                        payload.get("location_name", ""),
+                        payload.get("node_type", ""),
+                    )
+                elif target == "influx":
+                    self._influx.write_soil(state)
+                flushed.append(row_id)
+            except Exception as e:
+                logger.debug("Flush failed for queue id=%d target=%s: %s", row_id, target, e)
+                break  # cloud still unreachable — stop and wait for next interval
+        if flushed:
+            self._queue.delete(flushed)
+            logger.info("Cloud sync: flushed %d/%d queued writes.", len(flushed), len(rows))
+
+
 class MqttToDbIngestor:
     def __init__(self) -> None:
         self.cfg = load_config()
@@ -247,13 +442,34 @@ class MqttToDbIngestor:
         self.cache: Dict[str, NodeState] = {}
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.ignored_nodes = set(filter(None, os.getenv("IGNORED_NODES", "").split(",")))
 
+        # Local writers — primary, always write
         self.pg = PostgresWriter(self.db_cfg.pg_dsn)
         self.influx = InfluxWriter(
             url=self.db_cfg.influx_url,
             token=self.db_cfg.influx_token,
             org=self.db_cfg.influx_org,
             bucket=self.db_cfg.influx_bucket,
+        )
+
+        # Cloud writers — secondary, best-effort
+        self.pg_cloud = PostgresWriter(self.db_cfg.pg_cloud_dsn)
+        self.influx_cloud = InfluxWriter(
+            url=self.db_cfg.influx_cloud_url,
+            token=self.db_cfg.influx_cloud_token,
+            org=self.db_cfg.influx_cloud_org,
+            bucket=self.db_cfg.influx_cloud_bucket,
+        )
+
+        # Offline sync queue — persists writes that failed due to connectivity loss
+        queue_path = os.getenv("SYNC_QUEUE_PATH", "cloud_sync_queue.db")
+        self.sync_queue = CloudSyncQueue(queue_path)
+        self.sync_worker = CloudSyncWorker(
+            queue=self.sync_queue,
+            pg_cloud=self.pg_cloud,
+            influx_cloud=self.influx_cloud,
+            interval=CLOUD_RETRY_INTERVAL,
         )
 
         try:
@@ -282,13 +498,32 @@ class MqttToDbIngestor:
             influx_token=os.getenv("INFLUX_TOKEN", ""),
             influx_org=os.getenv("INFLUX_ORG", ""),
             influx_bucket=os.getenv("INFLUX_BUCKET", "soil"),
+            pg_cloud_dsn=os.getenv("PG_CLOUD_DSN", ""),
+            influx_cloud_url=os.getenv("INFLUX_CLOUD_URL", ""),
+            influx_cloud_token=os.getenv("INFLUX_CLOUD_TOKEN", ""),
+            influx_cloud_org=os.getenv("INFLUX_CLOUD_ORG", ""),
+            influx_cloud_bucket=os.getenv("INFLUX_CLOUD_BUCKET", ""),
             location_name=os.getenv("LOCATION_NAME", "FAU Garden"),
             node_type=os.getenv("NODE_TYPE", "field-node"),
+            farm_id=os.getenv("FARM_ID", "farm_1"),
         )
 
     def start(self) -> None:
         self.pg.connect()
         self.influx.connect()
+
+        # Cloud connections — failures are non-fatal; sync queue handles the backlog
+        try:
+            self.pg_cloud.connect()
+        except Exception as e:
+            logger.warning("Cloud Postgres unavailable at startup (will retry): %s", e)
+
+        try:
+            self.influx_cloud.connect()
+        except Exception as e:
+            logger.warning("Cloud InfluxDB unavailable at startup (will retry): %s", e)
+
+        self.sync_worker.start()
 
         logger.info(
             "Connecting to MQTT broker at %s:%s...",
@@ -300,6 +535,7 @@ class MqttToDbIngestor:
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.sync_worker.stop()
         try:
             self.client.loop_stop()
         except Exception:
@@ -310,6 +546,9 @@ class MqttToDbIngestor:
             pass
         self.pg.close()
         self.influx.close()
+        self.pg_cloud.close()
+        self.influx_cloud.close()
+        self.sync_queue.close()
 
     def on_connect(self, client: mqtt.Client, userdata: Any, flags: Dict[str, Any], rc: int, properties=None) -> None:
         if rc != 0:
@@ -320,7 +559,8 @@ class MqttToDbIngestor:
             client.subscribe(topic)
             logger.info("Subscribed to %s -> %s", name, topic)
 
-    def on_disconnect(self, client: mqtt.Client, userdata: Any, rc: int, properties=None) -> None:
+    def on_disconnect(self, client: mqtt.Client, userdata: Any, *args) -> None:
+        rc = args[0] if args else 0
         if rc != 0:
             logger.warning("Unexpected MQTT disconnect rc=%s", rc)
         else:
@@ -340,6 +580,10 @@ class MqttToDbIngestor:
             kind, node_id = self.classify_topic(topic)
             if kind is None or node_id is None:
                 logger.warning("Ignoring unexpected topic: %s", topic)
+                return
+
+            # Skip gateway node's own data
+            if node_id in self.ignored_nodes:
                 return
 
             state = self.cache.setdefault(node_id, NodeState(node_id=node_id))
@@ -402,15 +646,29 @@ class MqttToDbIngestor:
             state.rx_snr = self._coerce_float(payload.get("rxSnr"))
 
     def write_outputs(self, state: NodeState, kind: str) -> None:
+        # --- Local (primary — always write) ---
         if kind in {"soil_raw", "soil_percent", "battery"} and self.influx.enabled:
             self.influx.write_soil(state)
-
         if self.pg.enabled:
-            self.pg.upsert_node(
-                state,
-                location_name=self.db_cfg.location_name,
-                node_type=self.db_cfg.node_type,
-            )
+            self.pg.upsert_node(state, self.db_cfg.location_name, self.db_cfg.node_type)
+
+        # --- Cloud (secondary — best-effort, queue on failure) ---
+        if kind in {"soil_raw", "soil_percent", "battery"} and self.influx_cloud.enabled:
+            try:
+                self.influx_cloud.write_soil(state)
+            except Exception as e:
+                logger.warning("Cloud InfluxDB write failed, queuing: %s", e)
+                self.sync_queue.enqueue("influx", _state_to_dict(state))
+
+        if self.pg_cloud.enabled:
+            try:
+                self.pg_cloud.upsert_node(state, self.db_cfg.location_name, self.db_cfg.node_type)
+            except Exception as e:
+                logger.warning("Cloud Postgres write failed, queuing: %s", e)
+                self.sync_queue.enqueue(
+                    "pg",
+                    _state_to_dict(state, self.db_cfg.location_name, self.db_cfg.node_type),
+                )
 
     @staticmethod
     def _coerce_float(value: Any) -> Optional[float]:

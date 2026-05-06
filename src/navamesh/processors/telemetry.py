@@ -10,14 +10,11 @@ def extract_battery(packet: dict) -> Optional[Dict]:
     decoded = packet.get("decoded") or {}
     if not isinstance(decoded, dict):
         return None
-
     if decoded.get("portnum") != "TELEMETRY_APP":
         return None
-
     tel = decoded.get("telemetry") or {}
     if not isinstance(tel, dict):
         return None
-
     dm = tel.get("deviceMetrics") or {}
     if not isinstance(dm, dict):
         return None
