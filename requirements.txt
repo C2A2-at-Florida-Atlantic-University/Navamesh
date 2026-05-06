@@ -13,3 +13,5 @@ pyserial
 #reticulum
 rns
 lxmf
+rns
+lxmf
