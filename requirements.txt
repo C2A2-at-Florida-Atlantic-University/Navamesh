@@ -15,3 +15,5 @@ rns
 lxmf
 rns
 lxmf
+staticmap
+pillow
