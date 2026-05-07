@@ -1,39 +1,37 @@
 """
-reticulum_bridge.py — Navamesh → Reticulum/LXMF fanout
+reticulum_bridge.py — Navamesh LXMF command/response gateway
 
-Subscribes to all clean MQTT topics published by the Navamesh pipeline and
-forwards them as LXMF messages to the farmer's Sideband app over Reticulum.
+Listens for incoming LXMF messages from the farmer's Sideband app and
+replies with live sensor data pulled from the local MQTT cache.
+
+The Pi does NOT need the farmer's address hardcoded — it learns it
+automatically from the first incoming message.
+
+Supported commands (case-insensitive, send from Sideband):
+  status   — full summary of all nodes (soil, battery, link, position)
+  soil     — soil moisture readings for all nodes
+  battery  — battery levels for all nodes
+  position — GPS coordinates for all nodes
+  link     — RSSI/SNR link quality for all nodes
+  help     — list available commands
 
 Architecture
 ------------
-  Field nodes
-    → Meshtastic LoRa mesh
-    → Navamesh bridge (main.py)
-    → Mosquitto MQTT (local)
-    → THIS SERVICE                 ← new, runs on the house node
-    → Reticulum (LoRa backhaul via Field Access Node)
-    → Farmer's Sideband app (phone / laptop)
+  Farmer types command in Sideband
+    → LXMF message over Reticulum (LoRa backhaul)
+    → THIS SERVICE on house node
+    → looks up latest data from MQTT cache
+    → replies directly to farmer's Sideband address
 
-Deployment
-----------
-  Run alongside the existing bridge and ingestor:
-
-    python -m navamesh.reticulum_bridge
-    # or after pip install -e .
-    navamesh-reticulum
-
-Required env vars (add to your .env):
-  LXMF_PEER_HASH          — Sideband destination hash (hex, from Sideband → Share address)
-  RNS_CONFIG_DIR          — path to Reticulum config dir (default: ~/.reticulum)
-  LXMF_DISPLAY_NAME       — display name shown in Sideband (default: "Navamesh Gateway")
-  LXMF_STORAGE_DIR        — where to store LXMF identity (default: ~/.navamesh_lxmf)
+Required env vars:
+  RNS_CONFIG_DIR      — path to Reticulum config dir (default: ~/.reticulum)
+  LXMF_STORAGE_DIR    — where to store LXMF identity (default: ~/.navamesh_lxmf)
+  LXMF_DISPLAY_NAME   — display name shown in Sideband (default: "Navamesh Gateway")
 
 Optional env vars:
-  LXMF_SEND_METHOD        — "direct" or "propagated" (default: direct)
-  LXMF_TITLE_PREFIX       — prefix for message titles (default: "🌱 Navamesh")
-  LXMF_ANNOUNCE_INTERVAL  — seconds between RNS announces (default: 300)
-  LXMF_THROTTLE_SECONDS   — min seconds between messages per node/topic (default: 60)
-                             prevents flooding when sensors are noisy
+  LXMF_ANNOUNCE_INTERVAL — seconds between RNS announces (default: 300)
+  IGNORED_NODES          — comma-separated node IDs to ignore (same as mqtt_to_db)
+  LOG_LEVEL              — logging level (default: INFO)
 """
 
 from __future__ import annotations
@@ -56,7 +54,7 @@ import paho.mqtt.client as mqtt
 try:
     import RNS
     import LXMF
-except ImportError as exc:  # pragma: no cover
+except ImportError as exc:
     raise SystemExit(
         "Reticulum and LXMF are required:\n  pip install rns lxmf"
     ) from exc
@@ -80,14 +78,10 @@ logger = logging.getLogger("reticulum_bridge")
 
 @dataclass(frozen=True)
 class ReticulumBridgeConfig:
-    peer_hash: str                  # hex destination hash of the Sideband app
     rns_config_dir: str
     lxmf_storage_dir: str
     display_name: str
-    send_method: str                # "direct" | "propagated"
-    title_prefix: str
-    announce_interval: int          # seconds
-    throttle_seconds: int           # min gap between messages per (node, topic_kind)
+    announce_interval: int
 
 
 def load_rns_config() -> ReticulumBridgeConfig:
@@ -95,131 +89,82 @@ def load_rns_config() -> ReticulumBridgeConfig:
         v = os.getenv(name)
         return int(v) if v else default
 
-    peer_hash = os.getenv("LXMF_PEER_HASH", "").strip()
-    if not peer_hash:
-        raise SystemExit(
-            "LXMF_PEER_HASH is not set.\n"
-            "Open Sideband on your phone/laptop → My Address → copy the hex hash.\n"
-            "Add it to your .env:  LXMF_PEER_HASH=<hex>"
-        )
-
     return ReticulumBridgeConfig(
-        peer_hash=peer_hash,
         rns_config_dir=os.getenv("RNS_CONFIG_DIR", os.path.expanduser("~/.reticulum")),
         lxmf_storage_dir=os.path.expanduser(
             os.getenv("LXMF_STORAGE_DIR", "~/.navamesh_lxmf")
         ),
         display_name=os.getenv("LXMF_DISPLAY_NAME", "Navamesh Gateway"),
-        send_method=os.getenv("LXMF_SEND_METHOD", "direct").lower(),
-        title_prefix=os.getenv("LXMF_TITLE_PREFIX", "🌱 Navamesh"),
         announce_interval=_int("LXMF_ANNOUNCE_INTERVAL", 300),
-        throttle_seconds=_int("LXMF_THROTTLE_SECONDS", 60),
     )
 
 
 # ---------------------------------------------------------------------------
-# Message formatting
+# Sensor cache — updated by MQTT subscriber
 # ---------------------------------------------------------------------------
 
-def _fmt_node(from_id: str) -> str:
-    """Shorten '!86b0c98d' → 'Node 8d' for compact titles."""
-    return f"Node {from_id[-4:]}" if from_id.startswith("!") else from_id
+@dataclass
+class NodeSnapshot:
+    """Latest known state for a single field node."""
+    node_id: str
+    ts: Optional[int] = None
+    soil_raw: Optional[float] = None
+    soil_percent: Optional[float] = None
+    battery_level: Optional[float] = None
+    battery_usb: Optional[bool] = None
+    voltage: Optional[float] = None
+    uptime_seconds: Optional[int] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    alt: Optional[float] = None
+    rx_rssi: Optional[float] = None
+    rx_snr: Optional[float] = None
 
 
-def format_soil(payload: Dict[str, Any], kind: str) -> Tuple[str, str]:
-    """Return (title, body) for a soil MQTT message."""
-    node = _fmt_node(payload.get("fromId", "unknown"))
-    val = payload.get("value", "?")
-    if kind == "soil_raw":
-        title = f"Soil ADC · {node}"
-        body = (
-            f"Node:     {payload.get('fromId', '?')}\n"
-            f"Raw ADC:  {val}\n"
-            f"Time:     {_ts(payload.get('ts'))}"
-        )
-    else:
-        title = f"Soil Moisture · {node}"
-        body = (
-            f"Node:       {payload.get('fromId', '?')}\n"
-            f"Moisture:   {val}%\n"
-            f"Time:       {_ts(payload.get('ts'))}"
-        )
-    return title, body
+class SensorCache:
+    """Thread-safe store of the latest snapshot per node."""
+
+    def __init__(self):
+        self._data: Dict[str, NodeSnapshot] = {}
+        self._lock = threading.Lock()
+
+    def update(self, node_id: str, **kwargs) -> None:
+        with self._lock:
+            snap = self._data.setdefault(node_id, NodeSnapshot(node_id=node_id))
+            for k, v in kwargs.items():
+                if hasattr(snap, k) and v is not None:
+                    setattr(snap, k, v)
+
+    def all_nodes(self) -> Dict[str, NodeSnapshot]:
+        with self._lock:
+            return dict(self._data)
+
+    def node(self, node_id: str) -> Optional[NodeSnapshot]:
+        with self._lock:
+            return self._data.get(node_id)
 
 
-def format_battery(payload: Dict[str, Any]) -> Tuple[str, str]:
-    node = _fmt_node(payload.get("fromId", "unknown"))
-    level = payload.get("batteryLevel")
-    voltage = payload.get("voltage")
-    usb = payload.get("batteryUsb", False)
-    uptime = payload.get("uptimeSeconds")
+# ---------------------------------------------------------------------------
+# Response formatters
+# ---------------------------------------------------------------------------
 
-    bat_str = "USB (charging)" if usb else (f"{level}%" if level is not None else "?")
-    volt_str = f"{voltage:.2f}V" if voltage is not None else "N/A"
-    up_str = _fmt_uptime(uptime) if uptime is not None else "N/A"
-
-    title = f"Battery · {node}"
-    body = (
-        f"Node:     {payload.get('fromId', '?')}\n"
-        f"Battery:  {bat_str}\n"
-        f"Voltage:  {volt_str}\n"
-        f"Uptime:   {up_str}\n"
-        f"Time:     {_ts(payload.get('ts'))}"
-    )
-    return title, body
+def _fmt_node(node_id: str) -> str:
+    return f"Node {node_id[-4:]}" if node_id.startswith("!") else node_id
 
 
-def format_position(payload: Dict[str, Any]) -> Tuple[str, str]:
-    node = _fmt_node(payload.get("fromId", "unknown"))
-    lat = payload.get("lat", "?")
-    lon = payload.get("lon", "?")
-    alt = payload.get("alt")
-    sats = payload.get("sats")
-
-    alt_str = f"{alt}m" if alt is not None else "N/A"
-    sats_str = str(sats) if sats is not None else "N/A"
-
-    title = f"Position · {node}"
-    body = (
-        f"Node:     {payload.get('fromId', '?')}\n"
-        f"Lat:      {lat}\n"
-        f"Lon:      {lon}\n"
-        f"Alt:      {alt_str}\n"
-        f"Sats:     {sats_str}\n"
-        f"Time:     {_ts(payload.get('ts'))}"
-    )
-    return title, body
-
-
-def format_link(payload: Dict[str, Any]) -> Tuple[str, str]:
-    node = _fmt_node(payload.get("fromId", "unknown"))
-    rssi = payload.get("rxRssi", "?")
-    snr = payload.get("rxSnr", "?")
-    hops = payload.get("hopStart", "?")
-
-    title = f"Link Quality · {node}"
-    body = (
-        f"Node:     {payload.get('fromId', '?')}\n"
-        f"RSSI:     {rssi} dBm\n"
-        f"SNR:      {snr} dB\n"
-        f"Hops:     {hops}\n"
-        f"Time:     {_ts(payload.get('ts'))}"
-    )
-    return title, body
-
-
-def _ts(unix_ts: Any) -> str:
-    """Format a unix timestamp as a human-readable local time string."""
-    if unix_ts is None:
-        return "unknown"
+def _fmt_ts(ts: Optional[int]) -> str:
+    if ts is None:
+        return "never"
     try:
         import datetime
-        return datetime.datetime.fromtimestamp(int(unix_ts)).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return str(unix_ts)
+        return str(ts)
 
 
-def _fmt_uptime(seconds: int) -> str:
+def _fmt_uptime(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "N/A"
     h, rem = divmod(int(seconds), 3600)
     m, s = divmod(rem, 60)
     if h:
@@ -229,28 +174,156 @@ def _fmt_uptime(seconds: int) -> str:
     return f"{s}s"
 
 
+def _header(title: str) -> str:
+    return f"{'─' * 30}\n{title}\n{'─' * 30}\n"
+
+
+def fmt_status(cache: SensorCache) -> str:
+    nodes = cache.all_nodes()
+    if not nodes:
+        return "No node data received yet. Are field nodes transmitting?"
+
+    lines = [_header("🌱 Navamesh Status")]
+    for node_id, snap in sorted(nodes.items()):
+        lines.append(f"[ {_fmt_node(node_id)} ]  {node_id}")
+        lines.append(f"  Last seen:  {_fmt_ts(snap.ts)}")
+        if snap.soil_percent is not None:
+            lines.append(f"  Soil:       {snap.soil_percent:.1f}%")
+        elif snap.soil_raw is not None:
+            lines.append(f"  Soil ADC:   {snap.soil_raw}")
+        if snap.battery_usb:
+            lines.append(f"  Battery:    USB (charging)")
+        elif snap.battery_level is not None:
+            lines.append(f"  Battery:    {snap.battery_level:.0f}%")
+        if snap.voltage is not None:
+            lines.append(f"  Voltage:    {snap.voltage:.2f}V")
+        if snap.rx_rssi is not None:
+            lines.append(f"  RSSI/SNR:   {snap.rx_rssi} dBm / {snap.rx_snr} dB")
+        if snap.lat is not None:
+            lines.append(f"  Position:   {snap.lat:.6f}, {snap.lon:.6f}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def fmt_soil(cache: SensorCache) -> str:
+    nodes = cache.all_nodes()
+    if not nodes:
+        return "No soil data received yet."
+
+    lines = [_header("🌱 Soil Moisture")]
+    for node_id, snap in sorted(nodes.items()):
+        if snap.soil_percent is not None:
+            lines.append(f"{_fmt_node(node_id)}: {snap.soil_percent:.1f}%  ({_fmt_ts(snap.ts)})")
+        elif snap.soil_raw is not None:
+            lines.append(f"{_fmt_node(node_id)}: ADC={snap.soil_raw}  ({_fmt_ts(snap.ts)})")
+        else:
+            lines.append(f"{_fmt_node(node_id)}: no soil data yet")
+    return "\n".join(lines)
+
+
+def fmt_battery(cache: SensorCache) -> str:
+    nodes = cache.all_nodes()
+    if not nodes:
+        return "No battery data received yet."
+
+    lines = [_header("🔋 Battery")]
+    for node_id, snap in sorted(nodes.items()):
+        if snap.battery_usb:
+            bat = "USB (charging)"
+        elif snap.battery_level is not None:
+            bat = f"{snap.battery_level:.0f}%"
+        else:
+            bat = "no data"
+        volt = f"  {snap.voltage:.2f}V" if snap.voltage is not None else ""
+        up = f"  up {_fmt_uptime(snap.uptime_seconds)}" if snap.uptime_seconds else ""
+        lines.append(f"{_fmt_node(node_id)}: {bat}{volt}{up}  ({_fmt_ts(snap.ts)})")
+    return "\n".join(lines)
+
+
+def fmt_position(cache: SensorCache) -> str:
+    nodes = cache.all_nodes()
+    if not nodes:
+        return "No position data received yet."
+
+    lines = [_header("📍 Position")]
+    for node_id, snap in sorted(nodes.items()):
+        if snap.lat is not None:
+            alt = f"  alt={snap.alt}m" if snap.alt is not None else ""
+            lines.append(
+                f"{_fmt_node(node_id)}: {snap.lat:.6f}, {snap.lon:.6f}{alt}  ({_fmt_ts(snap.ts)})"
+            )
+        else:
+            lines.append(f"{_fmt_node(node_id)}: no GPS fix yet")
+    return "\n".join(lines)
+
+
+def fmt_link(cache: SensorCache) -> str:
+    nodes = cache.all_nodes()
+    if not nodes:
+        return "No link data received yet."
+
+    lines = [_header("📡 Link Quality")]
+    for node_id, snap in sorted(nodes.items()):
+        if snap.rx_rssi is not None:
+            lines.append(
+                f"{_fmt_node(node_id)}: RSSI={snap.rx_rssi} dBm  SNR={snap.rx_snr} dB  ({_fmt_ts(snap.ts)})"
+            )
+        else:
+            lines.append(f"{_fmt_node(node_id)}: no link data yet")
+    return "\n".join(lines)
+
+
+HELP_TEXT = """🌱 Navamesh Gateway — Commands
+
+  status   — full summary of all nodes
+  soil     — soil moisture readings
+  battery  — battery levels & uptime
+  position — GPS coordinates
+  link     — RSSI/SNR link quality
+  help     — this message
+
+Send any command from Sideband to query live data."""
+
+
+def handle_command(cmd: str, cache: SensorCache) -> str:
+    cmd = cmd.strip().lower().split()[0] if cmd.strip() else ""
+    if cmd == "status":
+        return fmt_status(cache)
+    elif cmd == "soil":
+        return fmt_soil(cache)
+    elif cmd == "battery":
+        return fmt_battery(cache)
+    elif cmd == "position":
+        return fmt_position(cache)
+    elif cmd == "link":
+        return fmt_link(cache)
+    elif cmd == "help":
+        return HELP_TEXT
+    else:
+        return f"Unknown command: '{cmd}'\n\n{HELP_TEXT}"
+
+
 # ---------------------------------------------------------------------------
-# Reticulum / LXMF sender
+# LXMF listener / responder
 # ---------------------------------------------------------------------------
 
-class LxmfSender:
+class LxmfGateway:
     """
-    Wraps Reticulum + LXMF to send messages to a fixed destination hash.
-    Thread-safe: send() may be called from any thread.
+    Registers an LXMF delivery identity, announces on Reticulum, and
+    handles incoming messages by replying with sensor data.
     """
 
-    def __init__(self, cfg: ReticulumBridgeConfig):
+    def __init__(self, cfg: ReticulumBridgeConfig, cache: SensorCache):
         self._cfg = cfg
+        self._cache = cache
         self._router: Optional[LXMF.LXMRouter] = None
-        self._source: Optional[Any] = None          # LXMF local delivery identity
-        self._destination: Optional[Any] = None     # RNS.Destination for the peer
+        self._source: Optional[Any] = None
         self._lock = threading.Lock()
-        self._started = False
 
     def start(self) -> None:
         os.makedirs(self._cfg.lxmf_storage_dir, exist_ok=True)
 
-        # ── Load or generate the gateway identity ──────────────────────────
+        # Load or generate identity
         identity_path = os.path.join(self._cfg.lxmf_storage_dir, "identity")
         if os.path.exists(identity_path):
             identity = RNS.Identity.from_file(identity_path)
@@ -260,214 +333,138 @@ class LxmfSender:
             identity.to_file(identity_path)
             logger.info("Generated new RNS identity, saved to %s", identity_path)
 
-        # ── Start Reticulum ────────────────────────────────────────────────
+        # Start Reticulum
         RNS.Reticulum(self._cfg.rns_config_dir)
         logger.info("Reticulum started (config: %s)", self._cfg.rns_config_dir)
 
-        # ── Create LXMF router and register the source identity ───────────
+        # Create LXMF router
         self._router = LXMF.LXMRouter(
             storagepath=self._cfg.lxmf_storage_dir,
             autopeer=True,
         )
+
+        # Register delivery identity with incoming message handler
         self._source = self._router.register_delivery_identity(
             identity,
             display_name=self._cfg.display_name,
         )
+        self._router.register_delivery_callback(self._on_message)
+
+        # Announce so farmer's Sideband can discover the gateway
         self._router.announce(self._source.hash)
         logger.info(
-            "LXMF source registered. Gateway address: %s",
+            "LXMF gateway ready. Address: %s  Display name: %s",
             RNS.prettyhexrep(self._source.hash),
+            self._cfg.display_name,
+        )
+        logger.info(
+            "Waiting for commands from Sideband. "
+            "The farmer can find this gateway by announcing or sending a message."
         )
 
-        # ── Resolve peer destination ───────────────────────────────────────
-        peer_hash_bytes = bytes.fromhex(self._cfg.peer_hash)
-        peer_identity = RNS.Identity.recall(peer_hash_bytes)
+    def _on_message(self, message: Any) -> None:
+        """Called by LXMF router when a message arrives."""
+        try:
+            sender_hash = RNS.hexrep(message.source_hash, delimit=False)
+            content = message.content.decode("utf-8").strip() if message.content else ""
+            title = message.title.decode("utf-8").strip() if message.title else ""
+            cmd = content or title
+            logger.info("Received command from %s: %r", sender_hash, cmd)
 
-        if peer_identity is None:
-            # Not in path table yet — request a path and wait briefly
-            logger.info(
-                "Peer %s not in path table, requesting path...",
-                self._cfg.peer_hash,
-            )
-            RNS.Transport.request_path(peer_hash_bytes)
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                peer_identity = RNS.Identity.recall(peer_hash_bytes)
-                if peer_identity is not None:
-                    break
-                time.sleep(1)
+            response = handle_command(cmd, self._cache)
+            self._reply(message, response)
+        except Exception as exc:
+            logger.error("Error handling message: %s", exc)
 
-        if peer_identity is None:
-            logger.warning(
-                "Could not resolve peer %s within 30s. "
-                "Messages will be queued and delivered when the path becomes available.",
-                self._cfg.peer_hash,
-            )
-
-        self._destination = RNS.Destination(
-            peer_identity,
-            RNS.Destination.OUT,
-            RNS.Destination.SINGLE,
-            "lxmf",
-            "delivery",
-        )
-        self._destination.set_default_app_data(
-            self._cfg.display_name.encode("utf-8")
-        )
-
-        self._started = True
-        logger.info("LxmfSender ready → peer %s", self._cfg.peer_hash)
-
-    def send(self, title: str, body: str) -> None:
-        """Send an LXMF message to the configured peer. Non-blocking."""
-        if not self._started:
-            logger.warning("LxmfSender.send() called before start()")
-            return
-
+    def _reply(self, original: Any, text: str) -> None:
+        """Send a reply LXMF message back to the sender."""
         with self._lock:
             try:
-                msg = LXMF.LXMessage(
-                    destination=self._destination,
-                    source=self._source,
-                    content=body,
-                    title=title,
-                    desired_method=(
-                        LXMF.LXMessage.PROPAGATED
-                        if self._cfg.send_method == "propagated"
-                        else LXMF.LXMessage.DIRECT
+                reply = LXMF.LXMessage(
+                    destination=RNS.Destination(
+                        original.source,
+                        RNS.Destination.OUT,
+                        RNS.Destination.SINGLE,
+                        "lxmf",
+                        "delivery",
                     ),
+                    source=self._source,
+                    content=text,
+                    title="Navamesh",
+                    desired_method=LXMF.LXMessage.DIRECT,
                 )
-                msg.register_delivery_callback(self._on_delivered)
-                msg.register_failed_callback(self._on_failed)
-                self._router.handle_outbound(msg)
-                logger.info("Queued LXMF message: %s", title)
+                self._router.handle_outbound(reply)
+                logger.info("Reply queued to %s", RNS.hexrep(original.source_hash, delimit=False))
             except Exception as exc:
-                logger.error("Failed to send LXMF message: %s", exc)
+                logger.error("Failed to send reply: %s", exc)
 
     def announce(self) -> None:
-        """Emit a Reticulum announce so peers can discover this gateway."""
         if self._router and self._source:
             self._router.announce(self._source.hash)
-            logger.debug("Announced LXMF source identity")
+            logger.debug("Announced LXMF identity")
 
     def stop(self) -> None:
-        self._started = False
-        # RNS does not expose a clean shutdown API; GC handles it
-
-    # ── Callbacks ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _on_delivered(message: Any) -> None:
-        logger.info("LXMF delivered: %s", message.title_as_string())
-
-    @staticmethod
-    def _on_failed(message: Any) -> None:
-        logger.warning("LXMF delivery failed: %s", message.title_as_string())
+        pass  # RNS GC handles cleanup
 
 
 # ---------------------------------------------------------------------------
-# MQTT → LXMF bridge
+# MQTT subscriber — keeps sensor cache up to date
 # ---------------------------------------------------------------------------
 
-class ReticulumBridge:
+class MqttCacheUpdater:
     """
-    Subscribes to all Navamesh clean MQTT topics and forwards each packet as
-    an LXMF message to the farmer's Sideband app.
-
-    Throttling: at most one message per (node_id, topic_kind) per
-    cfg.throttle_seconds to avoid flooding when sensors are chatty.
+    Subscribes to all clean Navamesh MQTT topics and updates the SensorCache.
+    Mirrors the topic classification from mqtt_to_db.py.
     """
 
-    def __init__(self) -> None:
-        self.cfg = load_config()
-        self.rns_cfg = load_rns_config()
-        self._sender = LxmfSender(self.rns_cfg)
-        self._stop_event = threading.Event()
-        self.ignored_nodes = set(filter(None, os.getenv("IGNORED_NODES", "").split(",")))
-
-        # throttle: (node_id, kind) → last sent timestamp
-        self._throttle: Dict[Tuple[str, str], float] = {}
-        self._throttle_lock = threading.Lock()
+    def __init__(self, cfg, cache: SensorCache, ignored_nodes: set):
+        self._cfg = cfg
+        self._cache = cache
+        self._ignored = ignored_nodes
 
         try:
-            self._mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+            self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         except AttributeError:
-            self._mqtt = mqtt.Client()
+            self._client = mqtt.Client()
 
-        self._mqtt.on_connect = self._on_connect
-        self._mqtt.on_message = self._on_message
-        self._mqtt.on_disconnect = self._on_disconnect
+        self._client.on_connect = self._on_connect
+        self._client.on_message = self._on_message
+        self._client.on_disconnect = self._on_disconnect
 
-        # Topics to subscribe — mirrors mqtt_to_db.py clean topic set
         self._topics = {
-            "soil_raw":     f"{self.cfg.root_sensors}/soil/+/raw",
-            "soil_percent": f"{self.cfg.root_sensors}/soil/+/percent",
-            "position":     f"{self.cfg.root_nodes}/+/position",
-            "battery":      f"{self.cfg.root_nodes}/+/battery",
-            "link":         f"{self.cfg.root_nodes}/+/link",
+            "soil_raw":     f"{cfg.root_sensors}/soil/+/raw",
+            "soil_percent": f"{cfg.root_sensors}/soil/+/percent",
+            "position":     f"{cfg.root_nodes}/+/position",
+            "battery":      f"{cfg.root_nodes}/+/battery",
+            "link":         f"{cfg.root_nodes}/+/link",
         }
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
-
     def start(self) -> None:
-        logger.info("Starting LxmfSender (Reticulum)...")
-        self._sender.start()
-
-        logger.info(
-            "Connecting to MQTT broker at %s:%s ...",
-            self.cfg.mqtt_host,
-            self.cfg.mqtt_port,
-        )
-        self._mqtt.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, 60)
-        self._mqtt.loop_start()
-
-        # Periodic RNS announce thread
-        t = threading.Thread(target=self._announce_loop, daemon=True)
-        t.start()
+        self._client.connect(self._cfg.mqtt_host, self._cfg.mqtt_port, 60)
+        self._client.loop_start()
+        logger.info("MQTT cache updater connecting to %s:%s", self._cfg.mqtt_host, self._cfg.mqtt_port)
 
     def stop(self) -> None:
-        self._stop_event.set()
         try:
-            self._mqtt.loop_stop()
-            self._mqtt.disconnect()
+            self._client.loop_stop()
+            self._client.disconnect()
         except Exception:
             pass
-        self._sender.stop()
 
-    # ── MQTT callbacks ───────────────────────────────────────────────────
-
-    def _on_connect(
-        self,
-        client: mqtt.Client,
-        userdata: Any,
-        flags: Any,
-        rc: int,
-        properties: Any = None,
-    ) -> None:
+    def _on_connect(self, client, userdata, flags, rc, properties=None) -> None:
         if rc != 0:
             logger.error("MQTT connect failed rc=%s", rc)
             return
-        logger.info("Connected to MQTT broker")
+        logger.info("MQTT connected — subscribing to sensor topics")
         for name, topic in self._topics.items():
             client.subscribe(topic)
             logger.info("Subscribed %s → %s", name, topic)
 
-    def _on_disconnect(
-        self,
-        client: mqtt.Client,
-        userdata: Any,
-        rc: int,
-        properties: Any = None,
-    ) -> None:
+    def _on_disconnect(self, client, userdata, rc, properties=None) -> None:
         if rc != 0:
-            logger.warning("Unexpected MQTT disconnect rc=%s", rc)
+            logger.warning("MQTT unexpected disconnect rc=%s", rc)
 
-    def _on_message(
-        self,
-        client: mqtt.Client,
-        userdata: Any,
-        msg: mqtt.MQTTMessage,
-    ) -> None:
+    def _on_message(self, client, userdata, msg: mqtt.MQTTMessage) -> None:
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
         except Exception as exc:
@@ -475,22 +472,42 @@ class ReticulumBridge:
             return
 
         kind, node_id = self._classify(msg.topic)
-        if kind is None or node_id in self.ignored_nodes:
+        if kind is None or node_id is None:
+            return
+        if node_id in self._ignored:
+            logger.debug("Ignoring node %s (IGNORED_NODES)", node_id)
             return
 
-        if not self._should_send(node_id, kind):
-            logger.debug("Throttled (%s, %s)", node_id, kind)
-            return
-
-        title, body = self._format(kind, payload)
-        full_title = f"{self.rns_cfg.title_prefix} · {title}"
-        self._sender.send(full_title, body)
-
-    # ── Topic classification (mirrors mqtt_to_db.py) ─────────────────────
+        ts = payload.get("ts")
+        if kind == "soil_raw":
+            self._cache.update(node_id, ts=ts, soil_raw=payload.get("value"))
+        elif kind == "soil_percent":
+            self._cache.update(node_id, ts=ts, soil_percent=payload.get("value"))
+        elif kind == "battery":
+            self._cache.update(
+                node_id, ts=ts,
+                battery_level=payload.get("batteryLevel"),
+                battery_usb=payload.get("batteryUsb"),
+                voltage=payload.get("voltage"),
+                uptime_seconds=payload.get("uptimeSeconds"),
+            )
+        elif kind == "position":
+            self._cache.update(
+                node_id, ts=ts,
+                lat=payload.get("lat"),
+                lon=payload.get("lon"),
+                alt=payload.get("alt"),
+            )
+        elif kind == "link":
+            self._cache.update(
+                node_id, ts=ts,
+                rx_rssi=payload.get("rxRssi"),
+                rx_snr=payload.get("rxSnr"),
+            )
 
     def _classify(self, topic: str) -> Tuple[Optional[str], Optional[str]]:
-        soil_pfx = f"{self.cfg.root_sensors}/soil/"
-        node_pfx = f"{self.cfg.root_nodes}/"
+        soil_pfx = f"{self._cfg.root_sensors}/soil/"
+        node_pfx = f"{self._cfg.root_nodes}/"
 
         if topic.startswith(soil_pfx):
             parts = topic[len(soil_pfx):].split("/")
@@ -509,37 +526,41 @@ class ReticulumBridge:
 
         return None, None
 
-    # ── Throttle ─────────────────────────────────────────────────────────
 
-    def _should_send(self, node_id: Optional[str], kind: Optional[str]) -> bool:
-        key = (node_id or "", kind or "")
-        now = time.time()
-        with self._throttle_lock:
-            last = self._throttle.get(key, 0.0)
-            if now - last < self.rns_cfg.throttle_seconds:
-                return False
-            self._throttle[key] = now
-            return True
+# ---------------------------------------------------------------------------
+# Main bridge
+# ---------------------------------------------------------------------------
 
-    # ── Formatting ───────────────────────────────────────────────────────
+class ReticulumBridge:
+    def __init__(self) -> None:
+        self.cfg = load_config()
+        self.rns_cfg = load_rns_config()
+        self.ignored_nodes = set(filter(None, os.getenv("IGNORED_NODES", "").split(",")))
+        self._stop_event = threading.Event()
 
-    @staticmethod
-    def _format(kind: str, payload: Dict[str, Any]) -> Tuple[str, str]:
-        if kind in ("soil_raw", "soil_percent"):
-            return format_soil(payload, kind)
-        if kind == "battery":
-            return format_battery(payload)
-        if kind == "position":
-            return format_position(payload)
-        if kind == "link":
-            return format_link(payload)
-        return "Unknown", json.dumps(payload)
+        self._cache = SensorCache()
+        self._gateway = LxmfGateway(self.rns_cfg, self._cache)
+        self._mqtt = MqttCacheUpdater(self.cfg, self._cache, self.ignored_nodes)
 
-    # ── Announce loop ────────────────────────────────────────────────────
+    def start(self) -> None:
+        logger.info("Starting Reticulum LXMF gateway...")
+        self._gateway.start()
+
+        logger.info("Starting MQTT cache updater...")
+        self._mqtt.start()
+
+        # Periodic announce thread
+        t = threading.Thread(target=self._announce_loop, daemon=True)
+        t.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._mqtt.stop()
+        self._gateway.stop()
 
     def _announce_loop(self) -> None:
         while not self._stop_event.wait(self.rns_cfg.announce_interval):
-            self._sender.announce()
+            self._gateway.announce()
 
 
 # ---------------------------------------------------------------------------
@@ -560,9 +581,8 @@ def main() -> int:
     bridge.start()
     logger.info(
         "Navamesh Reticulum bridge running. "
-        "Forwarding clean MQTT topics → Sideband app (%s). "
-        "Press Ctrl+C to stop.",
-        bridge.rns_cfg.peer_hash,
+        "Send 'help' from Sideband to get started. "
+        "Press Ctrl+C to stop."
     )
 
     try:
