@@ -718,7 +718,7 @@ class LxmfGateway:
             try:
                 reply = LXMF.LXMessage(
                     destination=RNS.Destination(
-                        original.source,
+                        RNS.Identity.recall(original.source_hash),
                         RNS.Destination.OUT,
                         RNS.Destination.SINGLE,
                         "lxmf",
@@ -743,7 +743,7 @@ class LxmfGateway:
             try:
                 reply = LXMF.LXMessage(
                     destination=RNS.Destination(
-                        original.source,
+                        RNS.Identity.recall(original.source_hash),
                         RNS.Destination.OUT,
                         RNS.Destination.SINGLE,
                         "lxmf",
