@@ -355,7 +355,7 @@ class InfluxWriter:
         if self._write_api is None:
             return
         ts = datetime.fromtimestamp(state.last_seen_ts or int(datetime.now().timestamp()), tz=timezone.utc)
-        point = Point("soil_moisture").tag("node_id", state.node_id).tag("farm_id", state._farm_id)
+        point = Point("soil_moisture").tag("node_id", state.node_id).tag("farm_id", state.farm_id)
         if state.soil_raw is not None:
             point = point.field("raw", float(state.soil_raw))
         if state.soil_percent is not None:
