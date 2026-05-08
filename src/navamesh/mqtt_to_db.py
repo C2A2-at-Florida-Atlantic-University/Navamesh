@@ -306,7 +306,7 @@ class PostgresWriter:
                     cur.execute(
                         """
                         INSERT INTO mesh_nodes (farm_id,node_id, last_seen, metadata)
-                        VALUES (%s, to_timestamp(%s), %s::jsonb)
+                        VALUES (%s, %s, to_timestamp(%s), %s::jsonb)
                         ON CONFLICT (farm_id, node_id) DO UPDATE SET
                             last_seen = EXCLUDED.last_seen,
                             metadata  = EXCLUDED.metadata;
@@ -332,7 +332,7 @@ class InfluxWriter:
         self._bucket = bucket
         self._client = None
         self._write_api = None
-        self._farm_id = os.getenv("FARM_ID", "farm_1")
+        self.farm_id = os.getenv("FARM_ID", "farm_1")
         self._enabled = bool(url and token and org and bucket)
 
     @property
