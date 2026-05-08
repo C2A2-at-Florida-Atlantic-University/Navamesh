@@ -15,6 +15,8 @@ class Config:
 
     adc_dry: int
     adc_wet: int
+    
+    farm_id: str
 
 def load_config() -> Config:
     def getenv_int(name: str, default: int) -> int:
@@ -34,4 +36,5 @@ def load_config() -> Config:
 
         adc_dry=getenv_int("ADC_DRY", 3500),
         adc_wet=getenv_int("ADC_WET", 1200),
+        farm_id=os.getenv("FARM_ID", "farm_1"),
     )

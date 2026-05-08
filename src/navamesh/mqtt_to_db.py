@@ -66,6 +66,7 @@ class DatabaseConfig:
 @dataclass
 class NodeState:
     node_id: str
+    farm_id: str
     last_seen_ts: Optional[int] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
@@ -83,6 +84,7 @@ class NodeState:
 
     def metadata(self, location_name: str, node_type: str) -> Dict[str, Any]:
         return {
+            "farm_id": self.farm_id,
             "location": location_name,
             "type": node_type,
             "status": "online",
@@ -250,17 +252,22 @@ class PostgresWriter:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mesh_nodes (
-                    node_id TEXT PRIMARY KEY,
+                    farm_id  TEXT NOT NULL,
+                    node_id  TEXT NOT NULL,
                     last_seen TIMESTAMPTZ DEFAULT now(),
-                    lat DOUBLE PRECISION,
-                    lon DOUBLE PRECISION,
-                    geom geometry(Point, 4326),
-                    metadata JSONB
+                    lat      DOUBLE PRECISION,
+                    lon      DOUBLE PRECISION,
+                    geom     geometry(Point, 4326),
+                    metadata JSONB,
+                    PRIMARY KEY (farm_id, node_id)
                 );
                 """
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mesh_nodes_geom ON mesh_nodes USING GIST (geom);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mesh_nodes_farm_id ON mesh_nodes (farm_id);"
             )
 
     def upsert_node(self, state: NodeState, location_name: str, node_type: str) -> None:
@@ -277,7 +284,7 @@ class PostgresWriter:
                 if has_coords:
                     cur.execute(
                         """
-                        INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, geom, metadata)
+                        INSERT INTO mesh_nodes (farm_id,node_id, last_seen, lat, lon, geom, metadata)
                         VALUES (
                             %s,
                             to_timestamp(%s),
@@ -286,25 +293,25 @@ class PostgresWriter:
                             ST_SetSRID(ST_MakePoint(%s, %s), 4326),
                             %s::jsonb
                         )
-                        ON CONFLICT (node_id) DO UPDATE SET
+                        ON CONFLICT (farm_id, node_id) DO UPDATE SET
                             last_seen = EXCLUDED.last_seen,
                             lat       = EXCLUDED.lat,
                             lon       = EXCLUDED.lon,
                             geom      = EXCLUDED.geom,
                             metadata  = EXCLUDED.metadata;
                         """,
-                        (state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
+                        (state.farm_id, state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
                     )
                 else:
                     cur.execute(
                         """
-                        INSERT INTO mesh_nodes (node_id, last_seen, metadata)
+                        INSERT INTO mesh_nodes (farm_id,node_id, last_seen, metadata)
                         VALUES (%s, to_timestamp(%s), %s::jsonb)
-                        ON CONFLICT (node_id) DO UPDATE SET
+                        ON CONFLICT (farm_id, node_id) DO UPDATE SET
                             last_seen = EXCLUDED.last_seen,
                             metadata  = EXCLUDED.metadata;
                         """,
-                        (state.node_id, ts, metadata_json),
+                        (state.farm_id, state.node_id, ts, metadata_json),
                     )
             logger.info("Upserted mesh_nodes row for %s (coords=%s).", state.node_id, has_coords)
         except Exception:
@@ -348,7 +355,7 @@ class InfluxWriter:
         if self._write_api is None:
             return
         ts = datetime.fromtimestamp(state.last_seen_ts or int(datetime.now().timestamp()), tz=timezone.utc)
-        point = Point("soil_moisture").tag("node_id", state.node_id).tag("farm_id", self._farm_id)
+        point = Point("soil_moisture").tag("node_id", state.node_id).tag("farm_id", state._farm_id)
         if state.soil_raw is not None:
             point = point.field("raw", float(state.soil_raw))
         if state.soil_percent is not None:
@@ -586,7 +593,10 @@ class MqttToDbIngestor:
             if node_id in self.ignored_nodes:
                 return
 
-            state = self.cache.setdefault(node_id, NodeState(node_id=node_id))
+            cache_key = f"{self.cfg.farm_id}:{node_id}"
+            if cache_key not in self.cache:
+                self.cache[cache_key] = NodeState(node_id=node_id, farm_id=self.cfg.farm_id)
+            state = self.cache[cache_key]
             self.apply_payload(state, kind, payload)
             self.write_outputs(state, kind)
 
