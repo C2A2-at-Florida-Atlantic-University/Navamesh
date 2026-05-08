@@ -287,6 +287,7 @@ class PostgresWriter:
                         INSERT INTO mesh_nodes (farm_id,node_id, last_seen, lat, lon, geom, metadata)
                         VALUES (
                             %s,
+                            %s,
                             to_timestamp(%s),
                             %s,
                             %s,
