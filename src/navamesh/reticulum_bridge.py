@@ -665,7 +665,7 @@ class LxmfGateway:
         # Create LXMF router and register delivery identity
         self._router = LXMF.LXMRouter(
             storagepath=self._cfg.lxmf_storage_dir,
-            autopeer=True,
+            autopeer=False,
         )
         self._source = self._router.register_delivery_identity(
             identity,
