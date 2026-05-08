@@ -106,6 +106,7 @@ class NodeState:
 def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "") -> dict:
     return {
         "node_id": state.node_id,
+        "farm_id": state.farm_id,
         "last_seen_ts": state.last_seen_ts,
         "lat": state.lat,
         "lon": state.lon,
@@ -128,6 +129,7 @@ def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "
 def _state_from_dict(d: dict) -> NodeState:
     return NodeState(
         node_id=d["node_id"],
+        farm_id=d.get("farm_id", "farm_1"),
         last_seen_ts=d.get("last_seen_ts"),
         lat=d.get("lat"),
         lon=d.get("lon"),
