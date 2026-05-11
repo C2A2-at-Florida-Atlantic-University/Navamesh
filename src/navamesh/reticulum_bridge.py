@@ -481,11 +481,16 @@ def render_map(
     except Exception:
         font = None
 
+    
+    center_lon = sum(s.lon for s in geo_nodes.values()) / len(geo_nodes)
+    center_lat = sum(s.lat for s in geo_nodes.values()) / len(geo_nodes)
+    zoom = smap._zoom if hasattr(smap, '_zoom') else 17
+
     for node_id, snap in geo_nodes.items():
         px, py = _lonlat_to_pixel(
             snap.lon, snap.lat,
-            smap.center[0], smap.center[1],
-            smap.zoom, cfg.map_width, cfg.map_height,
+            center_lon, center_lat,
+            zoom, cfg.map_width, cfg.map_height,
         )
         soil_str = f"{snap.soil_percent:.0f}%" if snap.soil_percent is not None else "?"
         if snap.battery_usb:
