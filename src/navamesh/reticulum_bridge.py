@@ -708,11 +708,11 @@ class LxmfGateway:
                 self._send_file(message, img_bytes, "navamesh_map.png")
 
             # Send GeoJSON as a second text message if available
-            if geojson_str:
-                self._send_text(
-                    message,
-                    f"GeoJSON:\n```json\n{geojson_str}\n```",
-                )
+          # if geojson_str:
+          #     self._send_text(
+          #       message,
+          #       f"GeoJSON:\n```json\n{geojson_str}\n```",
+          #       )
 
         except Exception as exc:
             logger.error("Error handling message: %s", exc, exc_info=True)
