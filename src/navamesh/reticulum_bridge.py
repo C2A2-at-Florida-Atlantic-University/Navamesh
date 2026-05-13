@@ -9,6 +9,8 @@ Changes from original:
 - Added logging at each initialization step
 - Added graceful degradation for missing dependencies
 - Added config validation
+- Fixed _send_file indentation (was at module level, now correctly inside LxmfGateway)
+- Added JPEG recompression + 40KB size gate to prevent large image stalling LXMF
 
 Listens for incoming LXMF messages from the farmer's Sideband app and
 replies with live sensor data pulled from the local MQTT cache.
@@ -45,7 +47,7 @@ except ImportError as exc:
 # Optional map rendering dependencies
 try:
     from staticmap import StaticMap, CircleMarker
-    from PIL import ImageDraw, ImageFont
+    from PIL import ImageDraw, ImageFont, Image
     MAP_AVAILABLE = True
 except ImportError:
     MAP_AVAILABLE = False
@@ -413,7 +415,6 @@ def render_map(
     except Exception:
         font = None
 
-    
     center_lon = sum(s.lon for s in geo_nodes.values()) / len(geo_nodes)
     center_lat = sum(s.lat for s in geo_nodes.values()) / len(geo_nodes)
     zoom = smap._zoom if hasattr(smap, '_zoom') else 17
@@ -498,7 +499,7 @@ def handle_command(
 
         geojson     = build_geojson(nodes)
         geojson_str = json.dumps(geojson, indent=2)
-        img_bytes = render_map(nodes, cfg)
+        img_bytes   = render_map(nodes, cfg)
 
         geo_nodes_count = sum(
             1 for s in nodes.values() if s.lat is not None
@@ -557,8 +558,8 @@ class LxmfGateway:
         cache: SensorCache,
         navamesh_cfg: Any,
     ):
-        self._cfg         = cfg
-        self._cache       = cache
+        self._cfg          = cfg
+        self._cache        = cache
         self._navamesh_cfg = navamesh_cfg
         self._router: Optional[LXMF.LXMRouter] = None
         self._source: Optional[Any] = None
@@ -589,7 +590,7 @@ class LxmfGateway:
                 logger.error("  ✗ Reticulum config directory does not exist: %s", self._cfg.rns_config_dir)
                 logger.error("    Create it with: rnsd --config %s", self._cfg.rns_config_dir)
                 raise FileNotFoundError(f"Reticulum config dir missing: {self._cfg.rns_config_dir}")
-            
+
             config_file = os.path.join(self._cfg.rns_config_dir, "config")
             if not os.path.exists(config_file):
                 logger.warning("  ⚠ Reticulum config file not found: %s", config_file)
@@ -678,7 +679,7 @@ class LxmfGateway:
 
     def _on_message(self, message: Any) -> None:
         try:
-            sender = RNS.hexrep(message.source_hash, delimit=False)
+            sender  = RNS.hexrep(message.source_hash, delimit=False)
             content = message.content.decode("utf-8").strip() if message.content else ""
             title   = message.title.decode("utf-8").strip() if message.title else ""
             cmd     = content or title
@@ -721,6 +722,32 @@ class LxmfGateway:
                 logger.error("Failed to send text reply: %s", exc)
 
     def _send_file(self, original: Any, data: bytes, filename: str) -> None:
+        # Recompress to JPEG to shrink size for LXMF transport
+        mime = "image/png"
+        try:
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=55, optimize=True)
+            data     = buf.getvalue()
+            filename = filename.replace(".png", ".jpg")
+            mime     = "image/jpeg"
+            logger.info("Recompressed map image to JPEG: %d bytes", len(data))
+        except Exception as e:
+            logger.warning("Image recompression failed, using original PNG: %s", e)
+
+        MAX_IMAGE_BYTES = 40_000
+        if len(data) > MAX_IMAGE_BYTES:
+            logger.warning(
+                "Map image still too large after recompression (%d bytes > %d), skipping.",
+                len(data), MAX_IMAGE_BYTES,
+            )
+            self._send_text(
+                original,
+                f"⚠️ Map image too large to send over Reticulum ({len(data) // 1024}KB). "
+                f"GPS coordinates are in the text reply above."
+            )
+            return
+
         with self._lock:
             try:
                 reply = LXMF.LXMessage(
@@ -737,7 +764,7 @@ class LxmfGateway:
                     desired_method=LXMF.LXMessage.DIRECT,
                     fields={
                         LXMF.FIELD_IMAGE: [
-                            "image/png",
+                            mime,
                             data,
                         ]
                     },
@@ -757,7 +784,7 @@ class LxmfGateway:
             logger.info("Reticulum announce sent.")
 
     def stop(self) -> None:
-        pass
+        pass  # RNS GC handles cleanup
 
 
 # ── MQTT subscriber ───────────────────────────────────────────────────────────
@@ -880,8 +907,8 @@ class MqttCacheUpdater:
 
 class ReticulumBridge:
     def __init__(self) -> None:
-        self.cfg      = load_config()
-        self.rns_cfg  = load_rns_config()
+        self.cfg           = load_config()
+        self.rns_cfg       = load_rns_config()
         self.ignored_nodes = set(
             filter(None, os.getenv("IGNORED_NODES", "").split(","))
         )
@@ -917,7 +944,7 @@ def main() -> int:
     logger.info("=" * 60)
     logger.info("Navamesh Reticulum Bridge v2 (DEBUGGED)")
     logger.info("=" * 60)
-    
+
     bridge = ReticulumBridge()
 
     def _shutdown(signum: int, frame: Any) -> None:
