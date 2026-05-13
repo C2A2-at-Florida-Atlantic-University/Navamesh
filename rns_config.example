@@ -1,0 +1,40 @@
+[reticulum]
+  enable_transport = True
+  share_instance = No
+  shared_instance_port = 37430
+  instance_control_port = 37431
+
+[logging]
+  loglevel = 5
+
+[interfaces]
+
+ # [[Default Interface]]
+ #   type = AutoInterface
+ #   enabled = true
+
+  [[TCP Server]]
+    type = TCPServerInterface
+    enabled = true
+    listen_ip = 0.0.0.0
+    listen_port = 4243
+
+  [[UDP Broadcast]]
+    type = UDPInterface
+    enabled = true
+    listen_ip = 0.0.0.0
+    listen_port = 4242
+    forward_ip = 192.168.10.255
+    forward_port = 4242
+
+  [[HaLow AutoInterface]]
+    type = AutoInterface
+    enabled = yes
+    devices = eth0
+    group_id = navamesh
+
+#  [[HaLow TCP Server]]
+#    type = TCPServerInterface
+#    enabled = true
+#    listen_ip = 0.0.0.0
+#    listen_port = 4243
