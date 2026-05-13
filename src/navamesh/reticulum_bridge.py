@@ -754,7 +754,7 @@ class LxmfGateway:
     def announce(self) -> None:
         if self._router and self._source:
             self._router.announce(self._source.hash)
-            logger.debug("Reticulum announce sent.")
+            logger.info("Reticulum announce sent.")
 
     def stop(self) -> None:
         pass

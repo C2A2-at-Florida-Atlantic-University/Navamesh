@@ -29,7 +29,8 @@ class MeshBridge:
         try:
             print(f"[BRIDGE] Connecting to {self._serial_port}...")
             self._iface = SerialInterface(self._serial_port)
-            pub.subscribe(self._on_receive, "meshtastic.receive")
+            self._pubsub_listener = lambda packet, interface=None, **kw: self._on_receive(packet)
+            pub.subscribe(self._pubsub_listener, "meshtastic.receive")
             print(f"[BRIDGE] Connected to {self._serial_port}")
             return True
         except Exception as e:
@@ -38,7 +39,8 @@ class MeshBridge:
 
     def _disconnect(self) -> None:
         try:
-            pub.unsubscribe(self._on_receive, "meshtastic.receive")
+            if hasattr(self, '_pubsub_listener'):
+                pub.unsubscribe(self._pubsub_listener, "meshtastic.receive")
         except Exception:
             pass
         try:

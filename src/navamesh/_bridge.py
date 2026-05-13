@@ -41,7 +41,7 @@ def main():
           f"(private channel index={cfg.private_channel_index})")
     mqtt_pub = MqttPublisher(cfg.mqtt_host, cfg.mqtt_port)
 
-    def on_receive(packet: dict):
+    def on_receive(packet: dict, interface=None, **kwargs):
         try:
             if not _should_bridge(packet, cfg.private_channel_index):
                 return
