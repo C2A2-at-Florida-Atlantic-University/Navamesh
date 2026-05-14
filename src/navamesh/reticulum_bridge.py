@@ -392,7 +392,7 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
     image.thumbnail((cfg.map_max_dimension, cfg.map_max_dimension))
 
     buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=cfg.map_jpeg_quality, optimize=True)
+    image.save(buf, format="WEBP", quality=cfg.map_jpeg_quality)
     logger.info(
         "Map JPEG: %d bytes  %dx%d px  quality=%d  nodes=%d",
         buf.tell(), image.width, image.height, cfg.map_jpeg_quality, len(geo_nodes),
@@ -554,7 +554,7 @@ class LxmfGateway:
                     content=text,
                     title="Navamesh Map",
                     desired_method=LXMF.LXMessage.DIRECT,
-                    fields={LXMF.FIELD_IMAGE: ["image/jpeg", img_bytes]},
+                    fields={LXMF.FIELD_IMAGE: ["webp", img_bytes]},
                 ))
                 logger.info(
                     "Map reply queued to %s  image=%d bytes",
