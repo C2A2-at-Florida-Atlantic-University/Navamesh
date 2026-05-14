@@ -1,23 +1,85 @@
 """
-reticulum_bridge.py — Navamesh LXMF command/response gateway (v2 - DEBUGGED)
+reticulum_bridge.py — Navamesh LXMF command/response gateway (v3)
 ==================================================================
-
-FIXED VERSION with comprehensive error logging to diagnose crash-loop issue.
-
-Changes from original:
-- Added detailed exception handling in LxmfGateway.start()
-- Added logging at each initialization step
-- Added graceful degradation for missing dependencies
-- Added config validation
-- Fixed _send_file indentation (was at module level, now correctly inside LxmfGateway)
-- Added JPEG recompression + 40KB size gate to prevent large image stalling LXMF
 
 Listens for incoming LXMF messages from the farmer's Sideband app and
 replies with live sensor data pulled from the local MQTT cache.
+
+All processing happens on the Pi — the farmer's Android only needs
+stock Sideband, no plugin required.
+
+Supported commands (case-insensitive, send from Sideband):
+  status       — full plain-text summary of all nodes
+  soil         — soil moisture readings for all nodes
+  battery      — battery levels for all nodes
+  position     — GPS coordinates for all nodes
+  link         — RSSI/SNR link quality for all nodes
+  map          — PNG map image + GeoJSON for all nodes (Pi-rendered)
+  map <id>     — PNG map image + GeoJSON for one specific node
+  nodes        — list all known node IDs
+  help         — list available commands
+
+Architecture
+------------
+  Farmer types command in Sideband (Android)
+    → LXMF message over Reticulum (mesh → Wi-Fi HaLow backhaul)
+    → THIS SERVICE on house node (Pi)
+    → looks up latest data from MQTT cache
+    → renders map image + GeoJSON entirely on the Pi
+    → replies directly to farmer's Sideband over Wi-Fi HaLow
+
+IMAGE TRANSFER PROTOCOL
+-----------------------
+  Because RNS has a ~500-byte MTU, binary FIELD_IMAGE attachments of any
+  meaningful size cause Sideband to crash on receipt.  Instead, map images
+  are sent as a sequence of plain-text messages carrying base64 chunks:
+
+    MSG 1:  IMG:START:<xfer_id>:<total_chunks>:navamesh_map.jpg
+    MSG 2…: IMG:<xfer_id>:<n>/<total>:<base64_chunk>
+    LAST:   IMG:END:<xfer_id>:<sha256_hex>
+
+  The receiver (or a helper script) reassembles chunks in order, base64-
+  decodes them, verifies the SHA-256, and saves the JPEG.  Each text
+  message is ≤ 400 bytes so it sits well inside the RNS MTU with room
+  for LXMF framing overhead.
+
+  CHUNK_B64_SIZE controls how many base64 characters go in each chunk
+  message.  300 characters of base64 ≈ 225 bytes of raw data per chunk.
+  With a 8 KB compressed JPEG that is ~28 chunks — a manageable burst.
+
+Required env vars (add to your .env):
+  RNS_CONFIG_DIR          — path to Reticulum config dir (default: ~/.reticulum)
+  LXMF_STORAGE_DIR        — where to store LXMF identity (default: ~/.navamesh_lxmf)
+  LXMF_DISPLAY_NAME       — display name shown in Sideband (default: "Navamesh Gateway")
+
+Optional env vars:
+  LXMF_ANNOUNCE_INTERVAL  — seconds between RNS announces (default: 300)
+  IGNORED_NODES           — comma-separated node IDs to ignore
+  LOG_LEVEL               — logging level (default: INFO)
+
+  # Map rendering (only needed for 'map' command)
+  MAP_TILE_URL            — local tile server URL
+                            (default: http://127.0.0.1:8080/data/florida/{z}/{x}/{y}.png)
+  MAP_TILE_FALLBACK       — fallback tile URL if local server unreachable
+                            (default: https://tile.openstreetmap.org/{z}/{x}/{y}.png)
+                            Set to empty string to disable fallback entirely.
+  MAP_WIDTH               — map image width in pixels (default: 400)
+  MAP_HEIGHT              — map image height in pixels (default: 300)
+  MAP_JPEG_QUALITY        — JPEG compression quality 1-95 (default: 40)
+  CHUNK_B64_SIZE          — base64 chars per chunk message (default: 300)
+  CHUNK_DELAY_MS          — ms to sleep between chunk sends (default: 200)
+  SOIL_WET_THRESHOLD      — soil % at or above which pin is blue (default: 60)
+  SOIL_DRY_THRESHOLD      — soil % at or below which pin is red (default: 30)
+
+Dependencies:
+  pip install rns lxmf paho-mqtt python-dotenv
+  pip install staticmap pillow    # optional — only needed for map rendering
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import json
 import logging
@@ -28,6 +90,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -64,7 +127,7 @@ logger = logging.getLogger("reticulum_bridge")
 
 if not MAP_AVAILABLE:
     logger.warning(
-        "staticmap/pillow not installed — 'map' command will return GeoJSON only. "
+        "staticmap/pillow not installed — 'map' command will return text summary only. "
         "Run: pip install staticmap pillow --break-system-packages"
     )
 
@@ -78,8 +141,14 @@ class ReticulumBridgeConfig:
     announce_interval: int
     map_tile_url: str
     map_tile_fallback: str
+    # Map render dimensions — keep small to reduce transfer size
     map_width: int
     map_height: int
+    # JPEG quality: lower = smaller file, faster transfer (40 is readable on mobile)
+    map_jpeg_quality: int
+    # Chunked transfer settings
+    chunk_b64_size: int   # base64 chars per chunk message
+    chunk_delay_ms: int   # ms pause between chunk sends (avoid flooding)
     soil_wet_threshold: float
     soil_dry_threshold: float
 
@@ -110,8 +179,11 @@ def load_rns_config() -> ReticulumBridgeConfig:
             "MAP_TILE_FALLBACK",
             "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
         ),
-        map_width=_int("MAP_WIDTH", 800),
-        map_height=_int("MAP_HEIGHT", 600),
+        map_width=_int("MAP_WIDTH", 400),
+        map_height=_int("MAP_HEIGHT", 300),
+        map_jpeg_quality=_int("MAP_JPEG_QUALITY", 40),
+        chunk_b64_size=_int("CHUNK_B64_SIZE", 300),
+        chunk_delay_ms=_int("CHUNK_DELAY_MS", 200),
         soil_wet_threshold=_float("SOIL_WET_THRESHOLD", 60.0),
         soil_dry_threshold=_float("SOIL_DRY_THRESHOLD", 30.0),
     )
@@ -289,49 +361,12 @@ HELP_TEXT = """🌱 Navamesh Gateway — Commands
   battery      — battery levels & uptime
   position     — GPS coordinates
   link         — RSSI/SNR link quality
-  map          — rendered map image + GeoJSON (all nodes)
-  map <id>     — rendered map image + GeoJSON (one node)
+  map          — map image (chunked) + node summary
+  map <id>     — map image for one node
   nodes        — list all known node IDs
   help         — this message
 
 Send any command from Sideband to query live data."""
-
-
-# ── GeoJSON builder ───────────────────────────────────────────────────────────
-
-def build_geojson(nodes: Dict[str, NodeSnapshot]) -> dict:
-    features = []
-    now = int(time.time())
-
-    for node_id, snap in nodes.items():
-        geometry = (
-            {"type": "Point", "coordinates": [snap.lon, snap.lat]}
-            if snap.lat is not None and snap.lon is not None
-            else None
-        )
-        props = {
-            "node_id":         node_id,
-            "last_seen":       _fmt_ts(snap.ts),
-            "last_seen_ago_s": (now - snap.ts) if snap.ts else None,
-            "soil_percent":    snap.soil_percent,
-            "soil_raw":        snap.soil_raw,
-            "battery_level":   snap.battery_level,
-            "battery_usb":     snap.battery_usb,
-            "voltage":         snap.voltage,
-            "uptime_seconds":  snap.uptime_seconds,
-            "rx_rssi":         snap.rx_rssi,
-            "rx_snr":          snap.rx_snr,
-            "altitude":        snap.alt,
-        }
-        props = {k: v for k, v in props.items() if v is not None}
-
-        features.append({
-            "type":       "Feature",
-            "geometry":   geometry,
-            "properties": props,
-        })
-
-    return {"type": "FeatureCollection", "features": features}
 
 
 # ── Map image renderer ────────────────────────────────────────────────────────
@@ -387,6 +422,16 @@ def render_map(
     nodes: Dict[str, NodeSnapshot],
     cfg: ReticulumBridgeConfig,
 ) -> Optional[bytes]:
+    """
+    Render a small JPEG map image suitable for chunked RNS transfer.
+
+    Returns compressed JPEG bytes, or None if rendering is unavailable.
+
+    Key differences from v2:
+    - Output is JPEG (not PNG) at cfg.map_jpeg_quality for much smaller files
+    - Dimensions default to 400×300 (configurable via MAP_WIDTH / MAP_HEIGHT)
+    - Target size is < 10 KB so the chunked transfer completes in ~35 messages
+    """
     if not MAP_AVAILABLE:
         return None
 
@@ -405,7 +450,8 @@ def render_map(
 
     for node_id, snap in geo_nodes.items():
         color = _pin_color(snap, cfg)
-        smap.add_marker(CircleMarker((snap.lon, snap.lat), color, 14))
+        # Slightly smaller pins (12px) to keep labels readable at low resolution
+        smap.add_marker(CircleMarker((snap.lon, snap.lat), color, 12))
 
     image = smap.render()
     draw  = ImageDraw.Draw(image)
@@ -434,9 +480,9 @@ def render_map(
             bat_str = "?"
 
         short_id = node_id[-4:] if node_id.startswith("!") else node_id
-        label = f"{short_id}\nSoil:{soil_str} Bat:{bat_str}"
+        label = f"{short_id}\nS:{soil_str} B:{bat_str}"
 
-        lx, ly = px + 12, py - 24
+        lx, ly = px + 10, py - 20
         bbox = draw.textbbox((lx, ly), label, font=font)
         draw.rectangle(
             [bbox[0] - 2, bbox[1] - 2, bbox[2] + 2, bbox[3] + 2],
@@ -444,10 +490,61 @@ def render_map(
         )
         draw.text((lx, ly), label, fill="white", font=font)
 
+    # Convert to RGB (JPEG does not support alpha channel)
+    if image.mode in ("RGBA", "P"):
+        image = image.convert("RGB")
+
     buf = io.BytesIO()
-    image.save(buf, format="PNG", optimize=True)
-    logger.info("Map image rendered (%d bytes, %d nodes)", buf.tell(), len(geo_nodes))
+    image.save(buf, format="JPEG", quality=cfg.map_jpeg_quality, optimize=True)
+    size = buf.tell()
+    logger.info(
+        "Map JPEG rendered: %d bytes @ quality=%d (%d nodes)",
+        size, cfg.map_jpeg_quality, len(geo_nodes),
+    )
     return buf.getvalue()
+
+
+# ── Chunked image transfer ────────────────────────────────────────────────────
+
+def build_image_chunks(
+    img_bytes: bytes,
+    filename: str,
+    chunk_b64_size: int,
+) -> Tuple[str, list[str]]:
+    """
+    Encode img_bytes as base64 and split into chunk_b64_size-char pieces.
+
+    Returns:
+        (transfer_id, [msg1, msg2, ..., msgN])
+
+    Message format:
+        Header:  IMG:START:<xfer_id>:<total_chunks>:<filename>:<sha256>
+        Chunks:  IMG:<xfer_id>:<n>/<total>:<base64_data>
+        Footer:  IMG:END:<xfer_id>
+
+    All messages are plain text, well under 500 bytes each.
+    """
+    xfer_id = uuid.uuid4().hex[:8].upper()
+    sha256  = hashlib.sha256(img_bytes).hexdigest()
+    b64     = base64.b64encode(img_bytes).decode("ascii")
+
+    chunks = [b64[i:i + chunk_b64_size] for i in range(0, len(b64), chunk_b64_size)]
+    total  = len(chunks)
+
+    messages = []
+    # Header
+    messages.append(f"IMG:START:{xfer_id}:{total}:{filename}:{sha256}")
+    # Chunks
+    for n, chunk in enumerate(chunks, 1):
+        messages.append(f"IMG:{xfer_id}:{n}/{total}:{chunk}")
+    # Footer
+    messages.append(f"IMG:END:{xfer_id}")
+
+    logger.info(
+        "Image chunked: xfer_id=%s total_chunks=%d b64_len=%d chunk_size=%d",
+        xfer_id, total, len(b64), chunk_b64_size,
+    )
+    return xfer_id, messages
 
 
 # ── Command handler ───────────────────────────────────────────────────────────
@@ -456,7 +553,14 @@ def handle_command(
     cmd: str,
     cache: SensorCache,
     cfg: ReticulumBridgeConfig,
-) -> Tuple[str, Optional[bytes], Optional[str]]:
+) -> Tuple[str, Optional[bytes]]:
+    """
+    Parse a command string and return a 2-tuple:
+      (text_reply, jpeg_bytes_or_None)
+
+    The caller sends text_reply as a single LXMF message, then sends
+    the image via the chunked text protocol if jpeg_bytes is not None.
+    """
     parts   = cmd.strip().lower().split(None, 1)
     command = parts[0] if parts else ""
     target  = parts[1].strip() if len(parts) > 1 else None
@@ -464,47 +568,41 @@ def handle_command(
     if command == "nodes":
         all_nodes = cache.all_nodes()
         if not all_nodes:
-            return "No nodes seen yet.", None, None
+            return "No nodes seen yet.", None
         body = "Known field nodes:\n" + "\n".join(f"  {n}" for n in sorted(all_nodes))
-        return body, None, None
+        return body, None
 
     if command == "help":
-        return HELP_TEXT, None, None
+        return HELP_TEXT, None
 
     if command == "status":
-        return fmt_status(cache), None, None
+        return fmt_status(cache), None
     if command == "soil":
-        return fmt_soil(cache), None, None
+        return fmt_soil(cache), None
     if command == "battery":
-        return fmt_battery(cache), None, None
+        return fmt_battery(cache), None
     if command == "position":
-        return fmt_position(cache), None, None
+        return fmt_position(cache), None
     if command == "link":
-        return fmt_link(cache), None, None
+        return fmt_link(cache), None
 
     if command == "map":
         all_nodes = cache.all_nodes()
         if not all_nodes:
-            return "No sensor data yet — field nodes may not have reported in.", None, None
+            return "No sensor data yet — field nodes may not have reported in.", None
 
         if target:
             if target not in all_nodes:
                 return (
                     f"Node '{target}' not found. Send 'nodes' to list all known nodes.",
-                    None, None,
+                    None,
                 )
             nodes = {target: all_nodes[target]}
         else:
             nodes = all_nodes
 
-        geojson     = build_geojson(nodes)
-        geojson_str = json.dumps(geojson, indent=2)
-        img_bytes   = render_map(nodes, cfg)
-
-        geo_nodes_count = sum(
-            1 for s in nodes.values() if s.lat is not None
-        )
-        no_gps_count = len(nodes) - geo_nodes_count
+        geo_nodes_count = sum(1 for s in nodes.values() if s.lat is not None)
+        no_gps_count    = len(nodes) - geo_nodes_count
 
         lines = [_header(f"🗺️  Navamesh Map  ({len(nodes)} node(s))")]
         for node_id, snap in sorted(nodes.items()):
@@ -526,22 +624,25 @@ def handle_command(
             lines.append("")
 
         if no_gps_count > 0:
-            lines.append(f"⚠️  {no_gps_count} node(s) have no GPS fix — omitted from map image.")
+            lines.append(f"⚠️  {no_gps_count} node(s) have no GPS fix — omitted from map.")
             lines.append("")
 
-        if not img_bytes:
+        img_bytes = render_map(nodes, cfg)
+
+        if img_bytes:
+            lines.append("📷 Map image follows as chunked messages (IMG:START…IMG:END).")
+            lines.append("   Reassemble chunks, base64-decode, open as JPEG.")
+        else:
             if not MAP_AVAILABLE:
                 lines.append("ℹ️  Map image unavailable — install staticmap+pillow on the Pi.")
             elif geo_nodes_count == 0:
                 lines.append("ℹ️  Map image unavailable — no nodes have GPS coordinates yet.")
             else:
                 lines.append("ℹ️  Map image unavailable — tile server unreachable.")
-            lines.append("    GeoJSON payload attached below.")
 
-        text_reply = "\n".join(lines)
-        return text_reply, img_bytes, geojson_str
+        return "\n".join(lines), img_bytes
 
-    return f"Unknown command: '{command}'\n\n{HELP_TEXT}", None, None
+    return f"Unknown command: '{command}'\n\n{HELP_TEXT}", None
 
 
 # ── LXMF gateway ─────────────────────────────────────────────────────────────
@@ -550,6 +651,9 @@ class LxmfGateway:
     """
     Registers an LXMF delivery identity, announces on Reticulum, and
     handles incoming messages by replying with sensor data.
+
+    Images are sent via the chunked text protocol instead of FIELD_IMAGE
+    to stay within RNS packet size limits and avoid crashing Sideband.
     """
 
     def __init__(
@@ -566,151 +670,75 @@ class LxmfGateway:
         self._lock = threading.Lock()
 
     def start(self) -> None:
-        try:
-            # STEP 1: Create storage directory
-            logger.info("STEP 1: Creating LXMF storage directory: %s", self._cfg.lxmf_storage_dir)
-            os.makedirs(self._cfg.lxmf_storage_dir, exist_ok=True)
-            logger.info("  ✓ Storage directory ready")
+        os.makedirs(self._cfg.lxmf_storage_dir, exist_ok=True)
 
-            # STEP 2: Load or generate identity
-            identity_path = os.path.join(self._cfg.lxmf_storage_dir, "identity")
-            logger.info("STEP 2: Loading/generating RNS identity from: %s", identity_path)
-            if os.path.exists(identity_path):
-                identity = RNS.Identity.from_file(identity_path)
-                logger.info("  ✓ Loaded existing RNS identity from %s", identity_path)
-            else:
-                logger.info("  → No existing identity found, generating new one...")
-                identity = RNS.Identity()
-                identity.to_file(identity_path)
-                logger.info("  ✓ Generated new RNS identity → %s", identity_path)
+        identity_path = os.path.join(self._cfg.lxmf_storage_dir, "identity")
+        if os.path.exists(identity_path):
+            identity = RNS.Identity.from_file(identity_path)
+            logger.info("Loaded RNS identity from %s", identity_path)
+        else:
+            identity = RNS.Identity()
+            identity.to_file(identity_path)
+            logger.info("Generated new RNS identity → %s", identity_path)
 
-            # STEP 3: Validate Reticulum config directory
-            logger.info("STEP 3: Validating Reticulum config directory: %s", self._cfg.rns_config_dir)
-            if not os.path.exists(self._cfg.rns_config_dir):
-                logger.error("  ✗ Reticulum config directory does not exist: %s", self._cfg.rns_config_dir)
-                logger.error("    Create it with: rnsd --config %s", self._cfg.rns_config_dir)
-                raise FileNotFoundError(f"Reticulum config dir missing: {self._cfg.rns_config_dir}")
+        RNS.Reticulum(self._cfg.rns_config_dir)
+        logger.info("Reticulum started (config: %s)", self._cfg.rns_config_dir)
 
-            config_file = os.path.join(self._cfg.rns_config_dir, "config")
-            if not os.path.exists(config_file):
-                logger.warning("  ⚠ Reticulum config file not found: %s", config_file)
-                logger.warning("    Reticulum will use defaults. This may cause issues.")
-            else:
-                logger.info("  ✓ Found Reticulum config file: %s", config_file)
-
-            # STEP 4: Start Reticulum stack
-            logger.info("STEP 4: Initializing Reticulum stack...")
-            try:
-                reticulum = RNS.Reticulum(self._cfg.rns_config_dir)
-                logger.info("  ✓ Reticulum started successfully")
-                logger.info("    RNS version: %s", RNS.version if hasattr(RNS, 'version') else "unknown")
-            except Exception as e:
-                logger.error("  ✗ Reticulum initialization FAILED: %s", e, exc_info=True)
-                raise
-
-            # STEP 5: Create LXMF router
-            logger.info("STEP 5: Creating LXMF router (storagepath=%s)...", self._cfg.lxmf_storage_dir)
-            try:
-                self._router = LXMF.LXMRouter(
-                    storagepath=self._cfg.lxmf_storage_dir,
-                    autopeer=False,
-                )
-                logger.info("  ✓ LXMF router created")
-            except Exception as e:
-                logger.error("  ✗ LXMF router creation FAILED: %s", e, exc_info=True)
-                raise
-
-            # STEP 6: Register delivery identity
-            logger.info("STEP 6: Registering delivery identity (name=%s)...", self._cfg.display_name)
-            try:
-                self._source = self._router.register_delivery_identity(
-                    identity,
-                    display_name=self._cfg.display_name,
-                )
-                logger.info("  ✓ Delivery identity registered")
-                logger.info("    Address: %s", RNS.prettyhexrep(self._source.hash))
-            except Exception as e:
-                logger.error("  ✗ Delivery identity registration FAILED: %s", e, exc_info=True)
-                raise
-
-            # STEP 7: Register message callback
-            logger.info("STEP 7: Registering delivery callback...")
-            try:
-                self._router.register_delivery_callback(self._on_message)
-                logger.info("  ✓ Delivery callback registered")
-            except Exception as e:
-                logger.error("  ✗ Delivery callback registration FAILED: %s", e, exc_info=True)
-                raise
-
-            # STEP 8: Send initial announce
-            logger.info("STEP 8: Sending initial announce...")
-            try:
-                self._router.announce(self._source.hash)
-                logger.info("  ✓ Initial announce sent")
-            except Exception as e:
-                logger.error("  ✗ Initial announce FAILED: %s", e, exc_info=True)
-                raise
-
-            logger.info("=" * 60)
-            logger.info("LXMF gateway READY")
-            logger.info("  Address:      %s", RNS.prettyhexrep(self._source.hash))
-            logger.info("  Display name: %s", self._cfg.display_name)
-            logger.info("  Storage:      %s", self._cfg.lxmf_storage_dir)
-            logger.info("  RNS config:   %s", self._cfg.rns_config_dir)
-            logger.info("=" * 60)
-            logger.info("Waiting for commands from farmer's Sideband app...")
-
-        except Exception as exc:
-            logger.error("=" * 60)
-            logger.error("FATAL ERROR during Reticulum bridge startup")
-            logger.error("Error type: %s", type(exc).__name__)
-            logger.error("Error message: %s", exc)
-            logger.error("=" * 60)
-            logger.error("Full traceback:", exc_info=True)
-            logger.error("=" * 60)
-            logger.error("Troubleshooting tips:")
-            logger.error("1. Check RNS config exists: %s/config", self._cfg.rns_config_dir)
-            logger.error("2. Check RNS config for syntax errors")
-            logger.error("3. Run 'rnsd --config %s' to test Reticulum config", self._cfg.rns_config_dir)
-            logger.error("4. Check permissions on storage dirs")
-            logger.error("5. Check for port conflicts (e.g., UDP 4242)")
-            logger.error("=" * 60)
-            raise
+        self._router = LXMF.LXMRouter(
+            storagepath=self._cfg.lxmf_storage_dir,
+            autopeer=False,
+        )
+        self._source = self._router.register_delivery_identity(
+            identity,
+            display_name=self._cfg.display_name,
+        )
+        self._router.register_delivery_callback(self._on_message)
+        self._router.announce(self._source.hash)
+        logger.info(
+            "LXMF gateway ready.  Address: %s  Name: %s",
+            RNS.prettyhexrep(self._source.hash),
+            self._cfg.display_name,
+        )
+        logger.info("Waiting for commands from the farmer's Sideband app.")
 
     def _on_message(self, message: Any) -> None:
         try:
             sender  = RNS.hexrep(message.source_hash, delimit=False)
             content = message.content.decode("utf-8").strip() if message.content else ""
-            title   = message.title.decode("utf-8").strip() if message.title else ""
+            title   = message.title.decode("utf-8").strip()   if message.title   else ""
             cmd     = content or title
             logger.info("Command from %s: %r", sender, cmd)
 
-            text_reply, img_bytes, geojson_str = handle_command(
-                cmd, self._cache, self._cfg
-            )
+            text_reply, img_bytes = handle_command(cmd, self._cache, self._cfg)
 
+            # 1. Send the text summary first
             self._send_text(message, text_reply)
 
+            # 2. Send image as chunked text messages (no FIELD_IMAGE)
             if img_bytes:
-                self._send_file(message, img_bytes, "navamesh_map.png")
+                self._send_image_chunked(message, img_bytes)
 
         except Exception as exc:
             logger.error("Error handling message: %s", exc, exc_info=True)
 
-    def _send_text(self, original: Any, text: str) -> None:
+    def _make_destination(self, original: Any) -> Any:
+        return RNS.Destination(
+            RNS.Identity.recall(original.source_hash),
+            RNS.Destination.OUT,
+            RNS.Destination.SINGLE,
+            "lxmf",
+            "delivery",
+        )
+
+    def _send_text(self, original: Any, text: str, title: str = "Navamesh") -> None:
+        """Send a plain-text LXMF reply."""
         with self._lock:
             try:
                 reply = LXMF.LXMessage(
-                    destination=RNS.Destination(
-                        RNS.Identity.recall(original.source_hash),
-                        RNS.Destination.OUT,
-                        RNS.Destination.SINGLE,
-                        "lxmf",
-                        "delivery",
-                    ),
+                    destination=self._make_destination(original),
                     source=self._source,
                     content=text,
-                    title="Navamesh",
+                    title=title,
                     desired_method=LXMF.LXMessage.DIRECT,
                 )
                 self._router.handle_outbound(reply)
@@ -721,75 +749,72 @@ class LxmfGateway:
             except Exception as exc:
                 logger.error("Failed to send text reply: %s", exc)
 
-    def _send_file(self, original: Any, data: bytes, filename: str) -> None:
-        # Recompress to JPEG to shrink size for LXMF transport
-        mime = "image/png"
-        try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=55, optimize=True)
-            data     = buf.getvalue()
-            filename = filename.replace(".png", ".jpg")
-            mime     = "image/jpeg"
-            logger.info("Recompressed map image to JPEG: %d bytes", len(data))
-        except Exception as e:
-            logger.warning("Image recompression failed, using original PNG: %s", e)
+    def _send_image_chunked(self, original: Any, img_bytes: bytes) -> None:
+        """
+        Transmit a JPEG image as a sequence of small plain-text LXMF messages.
 
-        MAX_IMAGE_BYTES = 40_000
-        if len(data) > MAX_IMAGE_BYTES:
-            logger.warning(
-                "Map image still too large after recompression (%d bytes > %d), skipping.",
-                len(data), MAX_IMAGE_BYTES,
-            )
-            self._send_text(
-                original,
-                f"⚠️ Map image too large to send over Reticulum ({len(data) // 1024}KB). "
-                f"GPS coordinates are in the text reply above."
-            )
-            return
+        Each message carries one line of the chunked transfer protocol so it
+        fits comfortably inside a single RNS packet (MTU ~500 bytes).
 
-        with self._lock:
-            try:
-                reply = LXMF.LXMessage(
-                    destination=RNS.Destination(
-                        RNS.Identity.recall(original.source_hash),
-                        RNS.Destination.OUT,
-                        RNS.Destination.SINGLE,
-                        "lxmf",
-                        "delivery",
-                    ),
-                    source=self._source,
-                    content=f"[Map image: {filename}]",
-                    title="Navamesh Map",
-                    desired_method=LXMF.LXMessage.DIRECT,
-                    fields={
-                        LXMF.FIELD_IMAGE: [
-                            mime,
-                            data,
-                        ]
-                    },
-                )
-                self._router.handle_outbound(reply)
-                logger.info(
-                    "Map image (%d bytes) queued to %s",
-                    len(data),
-                    RNS.hexrep(original.source_hash, delimit=False),
-                )
-            except Exception as exc:
-                logger.error("Failed to send map image: %s", exc)
+        The full sequence is:
+          IMG:START:<xfer_id>:<total>:navamesh_map.jpg:<sha256>
+          IMG:<xfer_id>:1/<total>:<base64_chunk>
+          IMG:<xfer_id>:2/<total>:<base64_chunk>
+          ...
+          IMG:END:<xfer_id>
+        """
+        xfer_id, messages = build_image_chunks(
+            img_bytes,
+            filename="navamesh_map.jpg",
+            chunk_b64_size=self._cfg.chunk_b64_size,
+        )
+        delay_s = self._cfg.chunk_delay_ms / 1000.0
+        logger.info(
+            "Sending image xfer_id=%s as %d chunk messages (delay=%.0fms each)",
+            xfer_id, len(messages) - 2, self._cfg.chunk_delay_ms,
+        )
+
+        for i, msg_text in enumerate(messages):
+            with self._lock:
+                try:
+                    chunk_msg = LXMF.LXMessage(
+                        destination=self._make_destination(original),
+                        source=self._source,
+                        content=msg_text,
+                        title="IMG",
+                        desired_method=LXMF.LXMessage.DIRECT,
+                    )
+                    self._router.handle_outbound(chunk_msg)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to send chunk %d/%d for xfer %s: %s",
+                        i + 1, len(messages), xfer_id, exc,
+                    )
+                    return
+
+            # Throttle: give Reticulum time to transmit each packet
+            if delay_s > 0 and i < len(messages) - 1:
+                time.sleep(delay_s)
+
+        logger.info("Image transfer complete: xfer_id=%s", xfer_id)
 
     def announce(self) -> None:
         if self._router and self._source:
             self._router.announce(self._source.hash)
-            logger.info("Reticulum announce sent.")
+            logger.debug("Reticulum announce sent.")
 
     def stop(self) -> None:
-        pass  # RNS GC handles cleanup
+        pass
 
 
 # ── MQTT subscriber ───────────────────────────────────────────────────────────
 
 class MqttCacheUpdater:
+    """
+    Subscribes to all clean Navamesh MQTT topics and keeps the SensorCache
+    up to date.
+    """
+
     def __init__(self, cfg: Any, cache: SensorCache, ignored_nodes: set):
         self._cfg     = cfg
         self._cache   = cache
@@ -907,8 +932,8 @@ class MqttCacheUpdater:
 
 class ReticulumBridge:
     def __init__(self) -> None:
-        self.cfg           = load_config()
-        self.rns_cfg       = load_rns_config()
+        self.cfg      = load_config()
+        self.rns_cfg  = load_rns_config()
         self.ignored_nodes = set(
             filter(None, os.getenv("IGNORED_NODES", "").split(","))
         )
@@ -941,10 +966,6 @@ class ReticulumBridge:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> int:
-    logger.info("=" * 60)
-    logger.info("Navamesh Reticulum Bridge v2 (DEBUGGED)")
-    logger.info("=" * 60)
-
     bridge = ReticulumBridge()
 
     def _shutdown(signum: int, frame: Any) -> None:
@@ -955,17 +976,12 @@ def main() -> int:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    try:
-        bridge.start()
-    except Exception as e:
-        logger.error("Bridge startup failed: %s", e, exc_info=True)
-        return 1
-
-    logger.info("=" * 60)
-    logger.info("Navamesh Reticulum bridge running")
-    logger.info("Farmer can send 'help' from Sideband to get started")
-    logger.info("Press Ctrl+C to stop")
-    logger.info("=" * 60)
+    bridge.start()
+    logger.info(
+        "Navamesh Reticulum bridge running. "
+        "Farmer can send 'help' from Sideband to get started. "
+        "Press Ctrl+C to stop."
+    )
 
     try:
         while not bridge._stop_event.is_set():
