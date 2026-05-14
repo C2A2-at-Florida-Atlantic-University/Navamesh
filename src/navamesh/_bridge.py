@@ -46,19 +46,35 @@ def main():
             if not _should_bridge(packet, cfg.private_channel_index):
                 return
 
+            # Raw packets — not retained (transient debug data)
             mqtt_pub.publish(topics.raw_rx(cfg.root_raw), packet)
 
+            # Link quality — retained so reticulum cache survives restarts
             link = extract_link(packet)
             if link:
-                mqtt_pub.publish(topics.node_link(cfg.root_nodes, link["fromId"]), link)
+                mqtt_pub.publish(
+                    topics.node_link(cfg.root_nodes, link["fromId"]),
+                    link,
+                    retain=True,
+                )
 
+            # Position — retained
             pos = extract_position(packet)
             if pos:
-                mqtt_pub.publish(topics.node_position(cfg.root_nodes, pos["fromId"]), pos)
+                mqtt_pub.publish(
+                    topics.node_position(cfg.root_nodes, pos["fromId"]),
+                    pos,
+                    retain=True,
+                )
 
+            # Battery (from TELEMETRY_APP) — retained
             battery = extract_battery(packet)
             if battery:
-                mqtt_pub.publish(topics.node_battery(cfg.root_nodes, battery["fromId"]), battery)
+                mqtt_pub.publish(
+                    topics.node_battery(cfg.root_nodes, battery["fromId"]),
+                    battery,
+                    retain=True,
+                )
 
             decoded = packet.get("decoded", {}) or {}
             if decoded.get("portnum") != "TEXT_MESSAGE_APP":
@@ -67,6 +83,7 @@ def main():
             if not _is_private_channel(packet, cfg.private_channel_index):
                 return
 
+            # Raw text — not retained
             mqtt_pub.publish(topics.raw_text(cfg.root_raw), packet)
 
             text    = decoded.get("text") or ""
@@ -78,9 +95,22 @@ def main():
                 if parsed is None:
                     return
                 soil_pl, bat_pl = make_status_mqtt_payloads(from_id, parsed)
-                mqtt_pub.publish(topics.soil_percent(cfg.root_sensors, from_id), soil_pl)
+
+                # Soil percent — retained
+                mqtt_pub.publish(
+                    topics.soil_percent(cfg.root_sensors, from_id),
+                    soil_pl,
+                    retain=True,
+                )
+
+                # Battery from text message — retained
                 if bat_pl is not None:
-                    mqtt_pub.publish(topics.node_battery(cfg.root_nodes, from_id), bat_pl)
+                    mqtt_pub.publish(
+                        topics.node_battery(cfg.root_nodes, from_id),
+                        bat_pl,
+                        retain=True,
+                    )
+
                 bat_str = "USB" if parsed["battery_usb"] else f"{parsed['battery_level']}%"
                 print(f"[SENSOR] {from_id} | soil={parsed['soil_percent']}% | "
                       f"bat={bat_str} | up={parsed['uptime_seconds']}s")
@@ -91,8 +121,18 @@ def main():
             if raw_val is None:
                 return
             raw_msg, pct_msg = make_soil_messages(from_id, raw_val, cfg.adc_dry, cfg.adc_wet)
-            mqtt_pub.publish(topics.soil_raw(cfg.root_sensors, from_id), raw_msg)
-            mqtt_pub.publish(topics.soil_percent(cfg.root_sensors, from_id), pct_msg)
+
+            # Soil raw + percent — retained
+            mqtt_pub.publish(
+                topics.soil_raw(cfg.root_sensors, from_id),
+                raw_msg,
+                retain=True,
+            )
+            mqtt_pub.publish(
+                topics.soil_percent(cfg.root_sensors, from_id),
+                pct_msg,
+                retain=True,
+            )
             print(f"[SENSOR] {from_id} | soil raw={raw_val} → {pct_msg['value']:.2f}%")
 
         except Exception as e:
