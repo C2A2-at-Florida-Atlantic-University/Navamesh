@@ -356,7 +356,7 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
         return None
 
     render_size = max(cfg.map_max_dimension * 2, 320)
-    smap = StaticMap(render_size, render_size, url_template=tile_url)
+    smap = StaticMap(render_size, render_size, url_template=tile_url, zoom=18)
     for node_id, snap in geo_nodes.items():
         smap.add_marker(CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), 12))
 
@@ -369,7 +369,7 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
 
     center_lon = sum(s.lon for s in geo_nodes.values()) / len(geo_nodes)
     center_lat = sum(s.lat for s in geo_nodes.values()) / len(geo_nodes)
-    zoom = getattr(smap, '_zoom', 17)
+    zoom = 18
 
     for node_id, snap in geo_nodes.items():
         px, py = _lonlat_to_pixel(
