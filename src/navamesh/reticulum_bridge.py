@@ -355,7 +355,7 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
     if not tile_url:
         return None
 
-    render_size = max(cfg.map_max_dimension * 2, 320)
+    render_size = 1024
     smap = StaticMap(render_size, render_size, url_template=tile_url)
     for node_id, snap in geo_nodes.items():
         smap.add_marker(CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), 12))
