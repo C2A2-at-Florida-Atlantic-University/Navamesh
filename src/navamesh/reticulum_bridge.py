@@ -405,7 +405,7 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
     center_lat = (min(lats_list) + max(lats_list)) / 2
 
     # Render at 2× so pins and text look decent before thumbnail shrink
-    render_size = max(cfg.map_max_dimension * 2, 320)
+    render_size = 1600
     zoom = _best_zoom(lats_list, lons_list, render_size)
 
     smap = StaticMap(render_size, render_size, url_template=tile_url)
