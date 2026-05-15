@@ -252,23 +252,19 @@ class PostgresWriter:
         if self._conn is None:
             return
         with self._conn.cursor() as cur:
-            try:
-                cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
-            except Exception as e:
-                logger.warning("Could not create postgis extension (may need superuser): %s", e)
-
+            # Core table — no PostGIS dependency
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mesh_nodes (
-                    node_id TEXT,
+                    node_id   TEXT,
                     last_seen TIMESTAMPTZ DEFAULT now(),
-                    lat DOUBLE PRECISION,
-                    lon DOUBLE PRECISION,
-                    geom geometry(Point, 4326),
-                    metadata JSONB
+                    lat       DOUBLE PRECISION,
+                    lon       DOUBLE PRECISION,
+                    metadata  JSONB
                 );
                 """
             )
+            # Ensure PRIMARY KEY exists (handles tables created by old schema)
             cur.execute(
                 """
                 DO $$ BEGIN
@@ -282,9 +278,28 @@ class PostgresWriter:
                 END $$;
                 """
             )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_mesh_nodes_geom ON mesh_nodes USING GIST (geom);"
-            )
+            # PostGIS geom column — optional, added only if extension is available
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+                cur.execute(
+                    """
+                    DO $$ BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = 'mesh_nodes' AND column_name = 'geom'
+                        ) THEN
+                            ALTER TABLE mesh_nodes ADD COLUMN geom geometry(Point, 4326);
+                        END IF;
+                    END $$;
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mesh_nodes_geom ON mesh_nodes USING GIST (geom);"
+                )
+                self._postgis = True
+            except Exception as e:
+                logger.info("PostGIS not available, geom column skipped: %s", e)
+                self._postgis = False
 
     def upsert_node(self, state: NodeState, location_name: str, node_type: str) -> None:
         if self._conn is None:
@@ -297,7 +312,7 @@ class PostgresWriter:
 
         try:
             with self._conn.cursor() as cur:
-                if has_coords:
+                if has_coords and getattr(self, "_postgis", False):
                     cur.execute(
                         """
                         INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, geom, metadata)
@@ -317,6 +332,19 @@ class PostgresWriter:
                             metadata  = EXCLUDED.metadata;
                         """,
                         (state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
+                    )
+                elif has_coords:
+                    cur.execute(
+                        """
+                        INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, metadata)
+                        VALUES (%s, to_timestamp(%s), %s, %s, %s::jsonb)
+                        ON CONFLICT (node_id) DO UPDATE SET
+                            last_seen = EXCLUDED.last_seen,
+                            lat       = EXCLUDED.lat,
+                            lon       = EXCLUDED.lon,
+                            metadata  = EXCLUDED.metadata;
+                        """,
+                        (state.node_id, ts, state.lat, state.lon, metadata_json),
                     )
                 else:
                     cur.execute(
