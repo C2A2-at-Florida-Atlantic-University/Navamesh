@@ -244,7 +244,7 @@ class PostgresWriter:
             logger.info("Postgres reconnected.")
             return True
         except Exception as e:
-            logger.debug("Postgres reconnect failed: %s", e)
+            logger.warning("Postgres reconnect failed: %s", e)
             self._conn = None
             return False
 
