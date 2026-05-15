@@ -49,3 +49,4 @@ mosquitto/
 cloud_sync_queue.db
 nohup.out
 tiles/
+data/
