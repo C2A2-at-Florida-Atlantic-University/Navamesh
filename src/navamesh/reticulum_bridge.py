@@ -362,11 +362,11 @@ def _best_zoom(lats, lons, px: int) -> int:
     dlon = (max(lons) - min(lons)) * (1 + pad) or 0.001
     dy   = abs(_merc_y(max(lats)) - _merc_y(min(lats))) * (1 + pad) or 0.001
     tiles = px / 256
-    for z in range(17, 5, -1):
+    for z in range(18, 13, -1):
         n = 2 ** z
         if dlon / 360 * n <= tiles and dy * n <= tiles:
             return z
-    return 6
+    return 14
 
 
 # Hard cap — LXMF over LoRa/HaLow reliably handles up to ~8 KB.
@@ -414,11 +414,13 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
 
     image = smap.render(zoom=zoom)
     draw  = ImageDraw.Draw(image)
+    font_size = max(28, render_size // 40)
     try:
-        font = ImageFont.load_default(size=14)
+        font = ImageFont.load_default(size=font_size)
     except TypeError:
         font = ImageFont.load_default()
 
+    placed = []
     for node_id, snap in geo_nodes.items():
         px, py = _lonlat_to_pixel(
             snap.lon, snap.lat, center_lon, center_lat,
@@ -429,10 +431,29 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
             f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "?"
         )
         label = f"{node_id[-4:]}\nS:{soil_str} B:{bat_str}"
-        lx, ly = px + 14, py - 26
-        bbox = draw.textbbox((lx, ly), label, font=font)
-        draw.rectangle([bbox[0]-2, bbox[1]-2, bbox[2]+2, bbox[3]+2], fill=(0, 0, 0, 180))
-        draw.text((lx, ly), label, fill="white", font=font)
+        pin_r = 18
+        margin = max(14, render_size // 80)
+        chosen_lx, chosen_ly, chosen_box = None, None, None
+        for sx, sy in [(1, 1), (-1, 1), (1, -1), (-1, -1)]:
+            lx = px + sx * (pin_r + margin)
+            ly = py - sy * (pin_r + margin)
+            b = draw.textbbox((lx, ly), label, font=font)
+            box = (b[0]-4, b[1]-4, b[2]+4, b[3]+4)
+            if not any(not(box[2]<p[0] or box[0]>p[2] or box[3]<p[1] or box[1]>p[3]) for p in placed):
+                chosen_lx, chosen_ly, chosen_box = lx, ly, box
+                break
+        if chosen_box is None:
+            lx = px + (pin_r + margin)
+            ly = py - (pin_r + margin)
+            b = draw.textbbox((lx, ly), label, font=font)
+            chosen_lx, chosen_ly = lx, ly
+            chosen_box = (b[0]-4, b[1]-4, b[2]+4, b[3]+4)
+        placed.append(chosen_box)
+        draw.rectangle(chosen_box, fill=(0, 0, 0, 200))
+        draw.text((chosen_lx, chosen_ly), label, fill="white", font=font)
+        cx = (chosen_box[0] + chosen_box[2]) // 2
+        cy = (chosen_box[1] + chosen_box[3]) // 2
+        draw.line([(px, py), (cx, cy)], fill=(255, 255, 255, 160), width=3)
 
     # Scale down — exactly as Sideband's view.py lora preset does it
     if image.mode in ("RGBA", "P"):
