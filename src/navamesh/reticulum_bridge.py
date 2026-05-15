@@ -1,12 +1,9 @@
 """
-reticulum_bridge.py — Navamesh LXMF command/response gateway (v3)
+reticulum_bridge.py — Navamesh LXMF command/response gateway (v4)
 ==================================================================
 
 Listens for incoming LXMF messages from the farmer's Sideband app and
-replies with live sensor data pulled from the local MQTT cache.
-
-All processing happens on the Pi — the farmer's Android only needs
-stock Sideband, no plugin required.
+replies with live sensor data pulled from Postgres.
 
 Supported commands (case-insensitive, send from Sideband):
   status       — full plain-text summary of all nodes
@@ -21,18 +18,20 @@ Supported commands (case-insensitive, send from Sideband):
 
 IMAGE SIZING
 ------------
-  Sideband's own "view" plugin defines a "lora" quality preset:
-      max dimension: 160 px   JPEG quality: 18
-  This produces images under ~3 KB — safe to send as a single LXMF
-  FIELD_IMAGE attachment even over LoRa/HaLow links.
+  Choose a link profile in .env:
 
-  For faster links (Wi-Fi HaLow direct) you can raise MAP_MAX_DIMENSION
-  and MAP_JPEG_QUALITY in .env, but 160/18 is the safe default.
+      MAP_LINK_PROFILE=lora    (default) — 200 px, quality 35, ~8 KB cap
+      MAP_LINK_PROFILE=halow             — 640 px, quality 72, ~120 KB cap
+      MAP_LINK_PROFILE=wifi              — 900 px, quality 78, ~220 KB cap
+
+  You can further override individual settings:
+      MAP_MAX_DIMENSION, MAP_JPEG_QUALITY, MAP_MAX_BYTES
 
 Required env vars (add to your .env):
   RNS_CONFIG_DIR          — path to Reticulum config dir (default: ~/.reticulum)
   LXMF_STORAGE_DIR        — where to store LXMF identity (default: ~/.navamesh_lxmf)
   LXMF_DISPLAY_NAME       — display name shown in Sideband (default: "Navamesh Gateway")
+  PG_DSN                  — Postgres connection string for node snapshots
 
 Optional env vars:
   LXMF_ANNOUNCE_INTERVAL  — seconds between RNS announces (default: 300)
@@ -40,17 +39,17 @@ Optional env vars:
   LOG_LEVEL               — logging level (default: INFO)
 
   # Map rendering (only needed for 'map' command)
+  MAP_LINK_PROFILE        — lora | halow | wifi  (default: lora)
   MAP_TILE_URL            — local tile server URL
   MAP_TILE_FALLBACK       — fallback tile URL (default: OSM)
-  MAP_MAX_DIMENSION       — longest side of map image in pixels (default: 160)
-                            160 = Sideband lora preset. Raise to 320 on fast links.
-  MAP_JPEG_QUALITY        — JPEG quality 1-95 (default: 18)
-                            18 = Sideband lora preset.
+  MAP_MAX_DIMENSION       — override longest side of map image in pixels
+  MAP_JPEG_QUALITY        — override JPEG quality 1-95
+  MAP_MAX_BYTES           — override max compressed size in bytes
   SOIL_WET_THRESHOLD      — soil % for blue pin (default: 60)
   SOIL_DRY_THRESHOLD      — soil % for red pin (default: 30)
 
 Dependencies:
-  pip install rns lxmf paho-mqtt python-dotenv
+  pip install rns lxmf paho-mqtt python-dotenv psycopg
   pip install staticmap pillow    # optional — only needed for map rendering
 """
 
@@ -105,6 +104,53 @@ if not MAP_AVAILABLE:
     )
 
 
+# ── Image transport profiles ──────────────────────────────────────────────────
+# Choose with MAP_LINK_PROFILE in .env.
+# LoRa must stay tiny. HaLow/Wi-Fi can handle much better map images.
+IMAGE_PROFILES = {
+    "lora": {
+        "max_dimension": 200,
+        "quality":       35,
+        "max_bytes":     12_000,
+    },
+    "halow": {
+        "max_dimension": 640,
+        "quality":       72,
+        "max_bytes":     120_000,
+    },
+    "wifi": {
+        "max_dimension": 900,
+        "quality":       78,
+        "max_bytes":     220_000,
+    },
+}
+
+# LXMF FIELD_IMAGE expects the type string "jpg" for JPEG.
+_FIELD_TYPE = "jpg"
+_MIME_TYPE  = "image/jpeg"
+
+
+def _image_profile() -> dict:
+    """
+    Pick image size/quality based on the expected link type.
+    Reads MAP_LINK_PROFILE from .env; defaults to "lora" (safest).
+    Individual settings can be further overridden with MAP_MAX_DIMENSION,
+    MAP_JPEG_QUALITY, MAP_MAX_BYTES.
+    """
+    name    = os.getenv("MAP_LINK_PROFILE", "lora").strip().lower()
+    profile = dict(IMAGE_PROFILES.get(name, IMAGE_PROFILES["lora"]))
+
+    # Allow per-key overrides without changing the profile name
+    if os.getenv("MAP_MAX_DIMENSION"):
+        profile["max_dimension"] = int(os.getenv("MAP_MAX_DIMENSION"))
+    if os.getenv("MAP_JPEG_QUALITY"):
+        profile["quality"] = int(os.getenv("MAP_JPEG_QUALITY"))
+    if os.getenv("MAP_MAX_BYTES"):
+        profile["max_bytes"] = int(os.getenv("MAP_MAX_BYTES"))
+
+    return profile
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -115,14 +161,17 @@ class ReticulumBridgeConfig:
     announce_interval: int
     map_tile_url: str
     map_tile_fallback: str
-    map_max_dimension: int
-    map_jpeg_quality: int
+    map_max_dimension: int   # resolved from profile at startup
+    map_jpeg_quality: int    # resolved from profile at startup
+    map_max_bytes: int       # resolved from profile at startup
     soil_wet_threshold: float
     soil_dry_threshold: float
     pg_dsn: str
 
 
 def load_rns_config() -> ReticulumBridgeConfig:
+    profile = _image_profile()
+
     def _int(name: str, default: int) -> int:
         v = os.getenv(name)
         return int(v) if v else default
@@ -146,8 +195,11 @@ def load_rns_config() -> ReticulumBridgeConfig:
             "MAP_TILE_FALLBACK",
             "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
         ),
-        map_max_dimension=_int("MAP_MAX_DIMENSION", 160),   # lora preset
-        map_jpeg_quality=_int("MAP_JPEG_QUALITY", 18),      # lora preset
+        # Resolved once at startup from the active profile; per-key .env
+        # overrides (MAP_MAX_DIMENSION etc.) are applied inside _image_profile().
+        map_max_dimension=profile["max_dimension"],
+        map_jpeg_quality=profile["quality"],
+        map_max_bytes=profile["max_bytes"],
         soil_wet_threshold=_float("SOIL_WET_THRESHOLD", 60.0),
         soil_dry_threshold=_float("SOIL_DRY_THRESHOLD", 30.0),
         pg_dsn=os.getenv("PG_DSN", ""),
@@ -198,7 +250,6 @@ def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
         snapshots[node_id] = NodeSnapshot(
             node_id=node_id,
             ts=int(ts) if ts is not None else None,
-            soil_raw=None,
             soil_percent=meta.get("soil_percent"),
             battery_level=meta.get("battery_level"),
             battery_usb=meta.get("battery_usb"),
@@ -206,7 +257,6 @@ def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
             uptime_seconds=meta.get("uptime_seconds"),
             lat=lat,
             lon=lon,
-            alt=None,
             rx_rssi=meta.get("rx_rssi"),
             rx_snr=meta.get("rx_snr"),
         )
@@ -336,10 +386,10 @@ def _resolve_tile_url(cfg: ReticulumBridgeConfig) -> Optional[str]:
 
 def _pin_color(snap: NodeSnapshot, cfg: ReticulumBridgeConfig) -> str:
     soil = snap.soil_percent
-    if soil is None:     return "#22cc44"
-    if soil >= cfg.soil_wet_threshold: return "#2255ff"
-    if soil <= cfg.soil_dry_threshold: return "#ff3322"
-    return "#22cc44"
+    if soil is None:                        return "#22cc44"   # green — no data
+    if soil >= cfg.soil_wet_threshold:      return "#2255ff"   # blue  — well watered
+    if soil <= cfg.soil_dry_threshold:      return "#ff3322"   # red   — needs water
+    return "#22cc44"                                           # green — ok
 
 def _lonlat_to_pixel(lon, lat, center_lon, center_lat, zoom, w, h):
     def to_tile(lat_d, lon_d, z):
@@ -369,24 +419,24 @@ def _best_zoom(lats, lons, px: int) -> int:
     return 14
 
 
-# Hard cap — LXMF over LoRa/HaLow reliably handles up to ~8 KB.
-# Above ~10 KB the transport layer can drop or crash the chat.
-_LXMF_LORA_MAX_BYTES = 8_000
-
-
-def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Optional[bytes]:
+def render_map(
+    nodes: Dict[str, NodeSnapshot],
+    cfg: ReticulumBridgeConfig,
+) -> Optional[Tuple[str, bytes, str]]:
     """
-    Render a JPEG map image safe for LXMF FIELD_IMAGE over LoRa/HaLow.
+    Render a JPEG map image sized for LXMF FIELD_IMAGE.
 
-    Strategy (mirrors Sideband's view.py lora preset):
-      1. Render at 2× target size so staticmap draws legible pins/labels
-      2. thumbnail() to scale down to map_max_dimension on the longest side
-      3. Save JPEG at map_jpeg_quality
-      4. If still > _LXMF_LORA_MAX_BYTES, iteratively reduce quality until
-         it fits — bottom floor is quality=5 to avoid total garbage.
+    Returns:
+        (field_type, image_bytes, mime_type)  e.g. ("jpg", b"...", "image/jpeg")
+        or None if rendering is not possible.
 
-    Safe defaults  →  MAP_MAX_DIMENSION=160  MAP_JPEG_QUALITY=18  (~2-3 KB)
-    Bumped defaults →  MAP_MAX_DIMENSION=320  MAP_JPEG_QUALITY=50  (~10-20 KB, risky)
+    Strategy:
+      1. Read the active link profile (lora / halow / wifi) from .env
+      2. Render at 2× target dimension so staticmap draws legible pins
+      3. thumbnail() down to max_dimension on the longest side
+      4. Save as JPEG — convert to RGB first (JPEG has no alpha channel)
+      5. If size > max_bytes, reduce quality in steps of 8 until it fits
+         (floor: quality=20 to avoid completely unusable output)
     """
     if not MAP_AVAILABLE:
         return None
@@ -399,14 +449,18 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
     if not tile_url:
         return None
 
+    max_dimension = cfg.map_max_dimension
+    quality       = cfg.map_jpeg_quality
+    max_bytes     = cfg.map_max_bytes
+
     lons_list  = [s.lon for s in geo_nodes.values()]
     lats_list  = [s.lat for s in geo_nodes.values()]
     center_lon = (min(lons_list) + max(lons_list)) / 2
     center_lat = (min(lats_list) + max(lats_list)) / 2
 
-    # Render at 2× so pins and text look decent before thumbnail shrink
-    render_size = 1600
-    zoom = _best_zoom(lats_list, lons_list, render_size)
+    # Render at 2× so pins and labels look decent before thumbnail shrink
+    render_size = max(max_dimension * 2, 480)
+    zoom        = _best_zoom(lats_list, lons_list, render_size)
 
     smap = StaticMap(render_size, render_size, url_template=tile_url)
     for snap in geo_nodes.values():
@@ -431,63 +485,61 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
             f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "?"
         )
         label = f"{node_id[-4:]}\nS:{soil_str} B:{bat_str}"
-        pin_r = 18
+        pin_r  = 18
         margin = max(14, render_size // 80)
+
         chosen_lx, chosen_ly, chosen_box = None, None, None
         for sx, sy in [(1, 1), (-1, 1), (1, -1), (-1, -1)]:
             lx = px + sx * (pin_r + margin)
             ly = py - sy * (pin_r + margin)
-            b = draw.textbbox((lx, ly), label, font=font)
-            box = (b[0]-4, b[1]-4, b[2]+4, b[3]+4)
-            if not any(not(box[2]<p[0] or box[0]>p[2] or box[3]<p[1] or box[1]>p[3]) for p in placed):
+            b  = draw.textbbox((lx, ly), label, font=font)
+            box = (b[0] - 4, b[1] - 4, b[2] + 4, b[3] + 4)
+            if not any(
+                not (box[2] < p[0] or box[0] > p[2] or box[3] < p[1] or box[1] > p[3])
+                for p in placed
+            ):
                 chosen_lx, chosen_ly, chosen_box = lx, ly, box
                 break
         if chosen_box is None:
             lx = px + (pin_r + margin)
             ly = py - (pin_r + margin)
-            b = draw.textbbox((lx, ly), label, font=font)
+            b  = draw.textbbox((lx, ly), label, font=font)
             chosen_lx, chosen_ly = lx, ly
-            chosen_box = (b[0]-4, b[1]-4, b[2]+4, b[3]+4)
+            chosen_box = (b[0] - 4, b[1] - 4, b[2] + 4, b[3] + 4)
+
         placed.append(chosen_box)
         draw.rectangle(chosen_box, fill=(0, 0, 0, 200))
         draw.text((chosen_lx, chosen_ly), label, fill="white", font=font)
-        cx = (chosen_box[0] + chosen_box[2]) // 2
-        cy = (chosen_box[1] + chosen_box[3]) // 2
-        draw.line([(px, py), (cx, cy)], fill=(255, 255, 255, 160), width=3)
+        cx_l = (chosen_box[0] + chosen_box[2]) // 2
+        cy_l = (chosen_box[1] + chosen_box[3]) // 2
+        draw.line([(px, py), (cx_l, cy_l)], fill=(255, 255, 255, 160), width=3)
 
-    # Scale down — exactly as Sideband's view.py lora preset does it
-    if image.mode in ("RGBA", "P"):
+    # JPEG requires RGB — drop any alpha/palette mode
+    if image.mode != "RGB":
         image = image.convert("RGB")
-    image.thumbnail((cfg.map_max_dimension, cfg.map_max_dimension))
 
-    # First attempt at configured quality
-    quality = cfg.map_jpeg_quality
-    buf = io.BytesIO()
-    image.save(buf, format="WEBP", quality=quality)
+    # Scale down to the target max_dimension
+    image.thumbnail((max_dimension, max_dimension))
 
-    # Safety net: re-compress at lower quality until under the hard cap
-    while buf.tell() > _LXMF_LORA_MAX_BYTES and quality > 5:
-        quality = max(5, quality - 10)
+    # Encode and iteratively reduce quality if over budget
+    while quality >= 20:
         buf = io.BytesIO()
-        image.save(buf, format="WEBP", quality=quality)
-        logger.warning(
-            "Image too large for LXMF — re-compressing at quality=%d (%d bytes)",
-            quality, buf.tell(),
-        )
+        image.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= max_bytes:
+            img_bytes = buf.getvalue()
+            logger.info(
+                "Map image ready: %d bytes  %dx%d px  quality=%d  profile=%s  nodes=%d",
+                len(img_bytes), image.width, image.height, quality,
+                os.getenv("MAP_LINK_PROFILE", "lora"), len(geo_nodes),
+            )
+            return _FIELD_TYPE, img_bytes, _MIME_TYPE
+        quality -= 8
 
-    final_bytes = buf.tell()
-    if final_bytes > _LXMF_LORA_MAX_BYTES:
-        logger.error(
-            "Map image still %d bytes after minimum quality — not sending to avoid crash",
-            final_bytes,
-        )
-        return None  # caller will fall back to text-only reply
-
-    logger.info(
-        "Map JPEG: %d bytes  %dx%d px  quality=%d  nodes=%d",
-        final_bytes, image.width, image.height, quality, len(geo_nodes),
+    logger.error(
+        "Map image could not be compressed below %d bytes — not sending image",
+        max_bytes,
     )
-    return buf.getvalue()
+    return None
 
 
 # ── Command handler ───────────────────────────────────────────────────────────
@@ -496,7 +548,12 @@ def handle_command(
     cmd: str,
     nodes: Dict[str, NodeSnapshot],
     cfg: ReticulumBridgeConfig,
-) -> Tuple[str, Optional[bytes]]:
+) -> Tuple[str, Optional[Tuple[str, bytes, str]]]:
+    """
+    Returns:
+        (text_reply, image_result_or_None)
+        image_result is (field_type, bytes, mime_type) when an image is available.
+    """
     parts   = cmd.strip().lower().split(None, 1)
     command = parts[0] if parts else ""
     target  = parts[1].strip() if len(parts) > 1 else None
@@ -522,12 +579,11 @@ def handle_command(
         else:
             map_nodes = nodes
 
-        geo_count = sum(1 for s in map_nodes.values() if s.lat is not None)
-        no_gps    = len(map_nodes) - geo_count
+        geo_count    = sum(1 for s in map_nodes.values() if s.lat is not None)
+        no_gps       = len(map_nodes) - geo_count
+        image_result = render_map(map_nodes, cfg)
 
-        img_bytes = render_map(map_nodes, cfg)
-
-        if img_bytes:
+        if image_result:
             # Keep text minimal when image is attached — total LXMF payload must stay small
             lines = [f"🗺️ Map: {geo_count} node(s) plotted"]
             if no_gps:
@@ -541,11 +597,13 @@ def handle_command(
                 bat_str  = "USB" if snap.battery_usb else (
                     f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "no data"
                 )
-                gps_str = f"{snap.lat:.5f}, {snap.lon:.5f}" if snap.lat is not None else "no GPS"
-                lines += [f"  {_fmt_node(node_id)} ({node_id})",
-                          f"    Soil:    {soil_str}",
-                          f"    Battery: {bat_str}",
-                          f"    GPS:     {gps_str}", ""]
+                gps_str  = f"{snap.lat:.5f}, {snap.lon:.5f}" if snap.lat is not None else "no GPS"
+                lines += [
+                    f"  {_fmt_node(node_id)} ({node_id})",
+                    f"    Soil:    {soil_str}",
+                    f"    Battery: {bat_str}",
+                    f"    GPS:     {gps_str}", "",
+                ]
             if no_gps:
                 lines.append(f"⚠️  {no_gps} node(s) have no GPS fix — omitted from map.")
             if not MAP_AVAILABLE:
@@ -556,7 +614,7 @@ def handle_command(
                 lines.append("ℹ️  Map unavailable — tile server unreachable.")
             text_reply = "\n".join(lines)
 
-        return text_reply, img_bytes
+        return text_reply, image_result
 
     return f"Unknown command: '{command}'\n\n{HELP_TEXT}", None
 
@@ -604,11 +662,11 @@ class LxmfGateway:
             cmd     = content or title
             logger.info("Command from %s: %r", sender, cmd)
 
-            nodes = _nodes_from_postgres(self._cfg.pg_dsn)
-            text_reply, img_bytes = handle_command(cmd, nodes, self._cfg)
+            nodes        = _nodes_from_postgres(self._cfg.pg_dsn)
+            text_reply, image_result = handle_command(cmd, nodes, self._cfg)
 
-            if img_bytes:
-                self._send_with_image(message, text_reply, img_bytes)
+            if image_result:
+                self._send_with_image(message, text_reply, image_result)
             else:
                 self._send_text(message, text_reply)
 
@@ -636,11 +694,33 @@ class LxmfGateway:
             except Exception as exc:
                 logger.error("Failed to send text reply: %s", exc)
 
-    def _send_with_image(self, original: Any, text: str, img_bytes: bytes) -> None:
+    def _send_with_image(
+        self,
+        original: Any,
+        text: str,
+        image_result: Tuple[str, bytes, str],
+    ) -> None:
         """
         Send text + JPEG image together as a single LXMF FIELD_IMAGE message.
-        Image is already sized to the lora preset (≤160px, quality 18, ~2-3 KB).
+
+        FIELD_IMAGE carries the inline image displayed by Sideband/MeshChat.
+        FIELD_FILE_ATTACHMENTS mirrors it as a saveable file for clients that
+        handle attachments more reliably than inline images.
         """
+        img_type, img_bytes, mime_type = image_result
+        filename = f"navamesh_map.{img_type}"
+
+        fields = {
+            # Sideband-compatible inline image field
+            LXMF.FIELD_IMAGE: [img_type, img_bytes],
+        }
+        # Compatibility fallback: clients that expose it as a downloadable file.
+        # Wrapped in try/except in case the installed LXMF version lacks this constant.
+        try:
+            fields[LXMF.FIELD_FILE_ATTACHMENTS] = [[filename, img_bytes, mime_type]]
+        except AttributeError:
+            pass
+
         with self._lock:
             try:
                 self._router.handle_outbound(LXMF.LXMessage(
@@ -649,14 +729,16 @@ class LxmfGateway:
                     content=text,
                     title="Navamesh Map",
                     desired_method=LXMF.LXMessage.DIRECT,
-                    fields={LXMF.FIELD_IMAGE: ["webp", img_bytes]},
+                    fields=fields,
                 ))
                 logger.info(
-                    "Map reply queued to %s  image=%d bytes",
-                    RNS.hexrep(original.source_hash, delimit=False), len(img_bytes),
+                    "Map reply queued to %s  image=%d bytes  type=%s  profile=%s",
+                    RNS.hexrep(original.source_hash, delimit=False),
+                    len(img_bytes), img_type,
+                    os.getenv("MAP_LINK_PROFILE", "lora"),
                 )
             except Exception as exc:
-                logger.error("Failed to send map reply: %s  — falling back to text", exc)
+                logger.error("Failed to send map reply: %s — falling back to text", exc)
                 self._send_text(original, text)
 
     def announce(self) -> None:
@@ -677,8 +759,15 @@ class ReticulumBridge:
         self._gateway    = LxmfGateway(self.rns_cfg, self.cfg)
 
     def start(self) -> None:
-        logger.info("Starting Reticulum LXMF gateway (DB-backed, pg_dsn=%s)...",
-                    "set" if self.rns_cfg.pg_dsn else "NOT SET")
+        logger.info(
+            "Starting Reticulum LXMF gateway — pg_dsn=%s  profile=%s  "
+            "max_dim=%d  quality=%d  max_bytes=%d",
+            "set" if self.rns_cfg.pg_dsn else "NOT SET",
+            os.getenv("MAP_LINK_PROFILE", "lora"),
+            self.rns_cfg.map_max_dimension,
+            self.rns_cfg.map_jpeg_quality,
+            self.rns_cfg.map_max_bytes,
+        )
         self._gateway.start()
         threading.Thread(target=self._announce_loop, daemon=True).start()
 
