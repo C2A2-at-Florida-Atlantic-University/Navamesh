@@ -442,13 +442,13 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
     # First attempt at configured quality
     quality = cfg.map_jpeg_quality
     buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=quality, optimize=True)
+    image.save(buf, format="WEBP", quality=quality)
 
     # Safety net: re-compress at lower quality until under the hard cap
     while buf.tell() > _LXMF_LORA_MAX_BYTES and quality > 5:
         quality = max(5, quality - 10)
         buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=quality, optimize=True)
+        image.save(buf, format="WEBP", quality=quality)
         logger.warning(
             "Image too large for LXMF — re-compressing at quality=%d (%d bytes)",
             quality, buf.tell(),
@@ -628,7 +628,7 @@ class LxmfGateway:
                     content=text,
                     title="Navamesh Map",
                     desired_method=LXMF.LXMessage.DIRECT,
-                    fields={LXMF.FIELD_IMAGE: ["image/jpeg", img_bytes]},
+                    fields={LXMF.FIELD_IMAGE: ["webp", img_bytes]},
                 ))
                 logger.info(
                     "Map reply queued to %s  image=%d bytes",
