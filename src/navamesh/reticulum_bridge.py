@@ -369,16 +369,24 @@ def _best_zoom(lats, lons, px: int) -> int:
     return 6
 
 
+# Hard cap — LXMF over LoRa/HaLow reliably handles up to ~8 KB.
+# Above ~10 KB the transport layer can drop or crash the chat.
+_LXMF_LORA_MAX_BYTES = 8_000
+
+
 def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Optional[bytes]:
     """
-    Render a JPEG map image sized to Sideband's lora quality preset.
+    Render a JPEG map image safe for LXMF FIELD_IMAGE over LoRa/HaLow.
 
-    Strategy (mirrors Sideband's view.py example plugin):
-      1. Render at 2x target size so staticmap draws legible pins
-      2. Call image.thumbnail((max_dim, max_dim)) to scale down
-      3. Save as JPEG at cfg.map_jpeg_quality
+    Strategy (mirrors Sideband's view.py lora preset):
+      1. Render at 2× target size so staticmap draws legible pins/labels
+      2. thumbnail() to scale down to map_max_dimension on the longest side
+      3. Save JPEG at map_jpeg_quality
+      4. If still > _LXMF_LORA_MAX_BYTES, iteratively reduce quality until
+         it fits — bottom floor is quality=5 to avoid total garbage.
 
-    Default: 160px / quality 18 → ~2-3 KB  (Sideband lora preset)
+    Safe defaults  →  MAP_MAX_DIMENSION=160  MAP_JPEG_QUALITY=18  (~2-3 KB)
+    Bumped defaults →  MAP_MAX_DIMENSION=320  MAP_JPEG_QUALITY=50  (~10-20 KB, risky)
     """
     if not MAP_AVAILABLE:
         return None
@@ -391,15 +399,17 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
     if not tile_url:
         return None
 
-    lons_list = [s.lon for s in geo_nodes.values()]
-    lats_list = [s.lat for s in geo_nodes.values()]
+    lons_list  = [s.lon for s in geo_nodes.values()]
+    lats_list  = [s.lat for s in geo_nodes.values()]
     center_lon = (min(lons_list) + max(lons_list)) / 2
     center_lat = (min(lats_list) + max(lats_list)) / 2
+
+    # Render at 2× so pins and text look decent before thumbnail shrink
     render_size = max(cfg.map_max_dimension * 2, 320)
     zoom = _best_zoom(lats_list, lons_list, render_size)
 
     smap = StaticMap(render_size, render_size, url_template=tile_url)
-    for node_id, snap in geo_nodes.items():
+    for snap in geo_nodes.values():
         smap.add_marker(CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), 18))
 
     image = smap.render(zoom=zoom)
@@ -424,16 +434,37 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
         draw.rectangle([bbox[0]-2, bbox[1]-2, bbox[2]+2, bbox[3]+2], fill=(0, 0, 0, 180))
         draw.text((lx, ly), label, fill="white", font=font)
 
-    # Scale down — exactly as Sideband's view.py does it
+    # Scale down — exactly as Sideband's view.py lora preset does it
     if image.mode in ("RGBA", "P"):
         image = image.convert("RGB")
     image.thumbnail((cfg.map_max_dimension, cfg.map_max_dimension))
 
+    # First attempt at configured quality
+    quality = cfg.map_jpeg_quality
     buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=cfg.map_jpeg_quality, optimize=True)
+    image.save(buf, format="JPEG", quality=quality, optimize=True)
+
+    # Safety net: re-compress at lower quality until under the hard cap
+    while buf.tell() > _LXMF_LORA_MAX_BYTES and quality > 5:
+        quality = max(5, quality - 10)
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=quality, optimize=True)
+        logger.warning(
+            "Image too large for LXMF — re-compressing at quality=%d (%d bytes)",
+            quality, buf.tell(),
+        )
+
+    final_bytes = buf.tell()
+    if final_bytes > _LXMF_LORA_MAX_BYTES:
+        logger.error(
+            "Map image still %d bytes after minimum quality — not sending to avoid crash",
+            final_bytes,
+        )
+        return None  # caller will fall back to text-only reply
+
     logger.info(
         "Map JPEG: %d bytes  %dx%d px  quality=%d  nodes=%d",
-        buf.tell(), image.width, image.height, cfg.map_jpeg_quality, len(geo_nodes),
+        final_bytes, image.width, image.height, quality, len(geo_nodes),
     )
     return buf.getvalue()
 
