@@ -251,12 +251,12 @@ class PostgresWriter:
     def ensure_schema(self) -> None:
         if self._conn is None:
             return
+        # Create core table with PK (IF NOT EXISTS is a no-op for existing tables)
         with self._conn.cursor() as cur:
-            # Core table — no PostGIS dependency
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mesh_nodes (
-                    node_id   TEXT,
+                    node_id   TEXT PRIMARY KEY,
                     last_seen TIMESTAMPTZ DEFAULT now(),
                     lat       DOUBLE PRECISION,
                     lon       DOUBLE PRECISION,
@@ -264,21 +264,36 @@ class PostgresWriter:
                 );
                 """
             )
-            # Ensure PRIMARY KEY exists (handles tables created by old schema)
-            cur.execute(
-                """
-                DO $$ BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_constraint c
-                        JOIN pg_class t ON c.conrelid = t.oid
-                        WHERE c.contype = 'p' AND t.relname = 'mesh_nodes'
-                    ) THEN
-                        ALTER TABLE mesh_nodes ADD PRIMARY KEY (node_id);
-                    END IF;
-                END $$;
-                """
-            )
-            # PostGIS geom column — optional, added only if extension is available
+        # Add PRIMARY KEY if table was created by an old schema without one
+        with self._conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    DO $$ BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint c
+                            JOIN pg_class t ON c.conrelid = t.oid
+                            WHERE c.contype = 'p' AND t.relname = 'mesh_nodes'
+                        ) THEN
+                            ALTER TABLE mesh_nodes ADD PRIMARY KEY (node_id);
+                        END IF;
+                    END $$;
+                    """
+                )
+            except Exception as e:
+                logger.warning("Could not add PRIMARY KEY to mesh_nodes: %s", e)
+        # Belt-and-suspenders: unique index guarantees ON CONFLICT (node_id) works
+        # even if the PRIMARY KEY migration above failed.
+        with self._conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_nodes_node_id"
+                    " ON mesh_nodes (node_id);"
+                )
+            except Exception as e:
+                logger.warning("Could not create unique index on mesh_nodes.node_id: %s", e)
+        # PostGIS geom column — optional, separate cursor so its failure is isolated
+        with self._conn.cursor() as cur:
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
                 cur.execute(
