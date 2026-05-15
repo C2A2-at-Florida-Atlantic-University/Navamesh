@@ -504,31 +504,38 @@ def handle_command(
         geo_count = sum(1 for s in map_nodes.values() if s.lat is not None)
         no_gps    = len(map_nodes) - geo_count
 
-        lines = [_header(f"🗺️  Navamesh Map  ({len(map_nodes)} node(s))")]
-        for node_id, snap in sorted(map_nodes.items()):
-            soil_str = f"{snap.soil_percent:.1f}%" if snap.soil_percent is not None else "no data"
-            bat_str  = "USB" if snap.battery_usb else (
-                f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "no data"
-            )
-            gps_str = f"{snap.lat:.5f}, {snap.lon:.5f}" if snap.lat is not None else "no GPS"
-            lines += [f"  {_fmt_node(node_id)} ({node_id})",
-                      f"    Soil:    {soil_str}",
-                      f"    Battery: {bat_str}",
-                      f"    GPS:     {gps_str}", ""]
-
-        if no_gps:
-            lines.append(f"⚠️  {no_gps} node(s) have no GPS fix — omitted from map.")
-
         img_bytes = render_map(map_nodes, cfg)
-        if not img_bytes:
+
+        if img_bytes:
+            # Keep text minimal when image is attached — total LXMF payload must stay small
+            lines = [f"🗺️ Map: {geo_count} node(s) plotted"]
+            if no_gps:
+                lines.append(f"⚠️ {no_gps} node(s) missing GPS")
+            text_reply = "\n".join(lines)
+        else:
+            # No image — send the full summary as text fallback
+            lines = [_header(f"🗺️  Navamesh Map  ({len(map_nodes)} node(s))")]
+            for node_id, snap in sorted(map_nodes.items()):
+                soil_str = f"{snap.soil_percent:.1f}%" if snap.soil_percent is not None else "no data"
+                bat_str  = "USB" if snap.battery_usb else (
+                    f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "no data"
+                )
+                gps_str = f"{snap.lat:.5f}, {snap.lon:.5f}" if snap.lat is not None else "no GPS"
+                lines += [f"  {_fmt_node(node_id)} ({node_id})",
+                          f"    Soil:    {soil_str}",
+                          f"    Battery: {bat_str}",
+                          f"    GPS:     {gps_str}", ""]
+            if no_gps:
+                lines.append(f"⚠️  {no_gps} node(s) have no GPS fix — omitted from map.")
             if not MAP_AVAILABLE:
                 lines.append("ℹ️  Map unavailable — install staticmap+pillow on the Pi.")
             elif geo_count == 0:
                 lines.append("ℹ️  Map unavailable — no nodes have GPS coordinates yet.")
             else:
                 lines.append("ℹ️  Map unavailable — tile server unreachable.")
+            text_reply = "\n".join(lines)
 
-        return "\n".join(lines), img_bytes
+        return text_reply, img_bytes
 
     return f"Unknown command: '{command}'\n\n{HELP_TEXT}", None
 
