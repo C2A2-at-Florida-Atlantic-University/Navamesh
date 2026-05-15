@@ -57,14 +57,12 @@ Dependencies:
 from __future__ import annotations
 
 import io
-import json
 import logging
 import math
 import os
 import signal
 import sys
 import threading
-import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -72,7 +70,10 @@ from typing import Any, Dict, Optional, Tuple
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(usecwd=True))
 
-import paho.mqtt.client as mqtt
+try:
+    import psycopg as _psycopg
+except ImportError:
+    _psycopg = None
 
 try:
     import RNS
@@ -118,6 +119,7 @@ class ReticulumBridgeConfig:
     map_jpeg_quality: int
     soil_wet_threshold: float
     soil_dry_threshold: float
+    pg_dsn: str
 
 
 def load_rns_config() -> ReticulumBridgeConfig:
@@ -148,10 +150,11 @@ def load_rns_config() -> ReticulumBridgeConfig:
         map_jpeg_quality=_int("MAP_JPEG_QUALITY", 18),      # lora preset
         soil_wet_threshold=_float("SOIL_WET_THRESHOLD", 60.0),
         soil_dry_threshold=_float("SOIL_DRY_THRESHOLD", 30.0),
+        pg_dsn=os.getenv("PG_DSN", ""),
     )
 
 
-# ── Sensor cache ──────────────────────────────────────────────────────────────
+# ── Node snapshot + DB reader ─────────────────────────────────────────────────
 
 @dataclass
 class NodeSnapshot:
@@ -170,25 +173,45 @@ class NodeSnapshot:
     rx_snr: Optional[float] = None
 
 
-class SensorCache:
-    def __init__(self):
-        self._data: Dict[str, NodeSnapshot] = {}
-        self._lock = threading.Lock()
+def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
+    """Query local Postgres for the latest snapshot of every node."""
+    if not dsn or _psycopg is None:
+        if _psycopg is None:
+            logger.warning("psycopg not installed — install it to enable DB reads")
+        return {}
+    try:
+        with _psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT node_id, EXTRACT(EPOCH FROM last_seen)::bigint, lat, lon, metadata "
+                    "FROM mesh_nodes ORDER BY last_seen DESC"
+                )
+                rows = cur.fetchall()
+    except Exception as exc:
+        logger.warning("DB query for node snapshots failed: %s", exc)
+        return {}
 
-    def update(self, node_id: str, **kwargs) -> None:
-        with self._lock:
-            snap = self._data.setdefault(node_id, NodeSnapshot(node_id=node_id))
-            for k, v in kwargs.items():
-                if hasattr(snap, k) and v is not None:
-                    setattr(snap, k, v)
-
-    def all_nodes(self) -> Dict[str, NodeSnapshot]:
-        with self._lock:
-            return dict(self._data)
-
-    def node(self, node_id: str) -> Optional[NodeSnapshot]:
-        with self._lock:
-            return self._data.get(node_id)
+    snapshots: Dict[str, NodeSnapshot] = {}
+    for node_id, ts, lat, lon, meta in rows:
+        if meta is None:
+            meta = {}
+        snapshots[node_id] = NodeSnapshot(
+            node_id=node_id,
+            ts=int(ts) if ts is not None else None,
+            soil_raw=None,
+            soil_percent=meta.get("soil_percent"),
+            battery_level=meta.get("battery_level"),
+            battery_usb=meta.get("battery_usb"),
+            voltage=meta.get("voltage"),
+            uptime_seconds=meta.get("uptime_seconds"),
+            lat=lat,
+            lon=lon,
+            alt=None,
+            rx_rssi=meta.get("rx_rssi"),
+            rx_snr=meta.get("rx_snr"),
+        )
+    logger.debug("Loaded %d node(s) from Postgres.", len(snapshots))
+    return snapshots
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
@@ -217,10 +240,9 @@ def _fmt_uptime(seconds: Optional[int]) -> str:
 def _header(title: str) -> str:
     return f"{'─'*30}\n{title}\n{'─'*30}\n"
 
-def fmt_status(cache: SensorCache) -> str:
-    nodes = cache.all_nodes()
+def fmt_status(nodes: Dict[str, NodeSnapshot]) -> str:
     if not nodes:
-        return "No node data received yet. Are field nodes transmitting?"
+        return "No node data in database yet. Are field nodes transmitting?"
     lines = [_header("🌱 Navamesh Status")]
     for node_id, snap in sorted(nodes.items()):
         lines.append(f"[ {_fmt_node(node_id)} ]  {node_id}")
@@ -242,9 +264,8 @@ def fmt_status(cache: SensorCache) -> str:
         lines.append("")
     return "\n".join(lines)
 
-def fmt_soil(cache: SensorCache) -> str:
-    nodes = cache.all_nodes()
-    if not nodes: return "No soil data received yet."
+def fmt_soil(nodes: Dict[str, NodeSnapshot]) -> str:
+    if not nodes: return "No soil data in database yet."
     lines = [_header("🌱 Soil Moisture")]
     for node_id, snap in sorted(nodes.items()):
         if snap.soil_percent is not None:
@@ -255,9 +276,8 @@ def fmt_soil(cache: SensorCache) -> str:
             lines.append(f"{_fmt_node(node_id)}: no soil data yet")
     return "\n".join(lines)
 
-def fmt_battery(cache: SensorCache) -> str:
-    nodes = cache.all_nodes()
-    if not nodes: return "No battery data received yet."
+def fmt_battery(nodes: Dict[str, NodeSnapshot]) -> str:
+    if not nodes: return "No battery data in database yet."
     lines = [_header("🔋 Battery")]
     for node_id, snap in sorted(nodes.items()):
         bat = "USB (charging)" if snap.battery_usb else (
@@ -268,9 +288,8 @@ def fmt_battery(cache: SensorCache) -> str:
         lines.append(f"{_fmt_node(node_id)}: {bat}{volt}{up}  ({_fmt_ts(snap.ts)})")
     return "\n".join(lines)
 
-def fmt_position(cache: SensorCache) -> str:
-    nodes = cache.all_nodes()
-    if not nodes: return "No position data received yet."
+def fmt_position(nodes: Dict[str, NodeSnapshot]) -> str:
+    if not nodes: return "No position data in database yet."
     lines = [_header("📍 Position")]
     for node_id, snap in sorted(nodes.items()):
         if snap.lat is not None:
@@ -280,9 +299,8 @@ def fmt_position(cache: SensorCache) -> str:
             lines.append(f"{_fmt_node(node_id)}: no GPS fix yet")
     return "\n".join(lines)
 
-def fmt_link(cache: SensorCache) -> str:
-    nodes = cache.all_nodes()
-    if not nodes: return "No link data received yet."
+def fmt_link(nodes: Dict[str, NodeSnapshot]) -> str:
+    if not nodes: return "No link data in database yet."
     lines = [_header("📡 Link Quality")]
     for node_id, snap in sorted(nodes.items()):
         if snap.rx_rssi is not None:
@@ -333,6 +351,24 @@ def _lonlat_to_pixel(lon, lat, center_lon, center_lat, zoom, w, h):
     return int((px - cx) * 256 + w / 2), int((py - cy) * 256 + h / 2)
 
 
+def _best_zoom(lats, lons, px: int) -> int:
+    """Largest zoom where all nodes fit inside a px×px tile image with 25% padding."""
+    if len(lats) < 2:
+        return 17
+    pad = 0.25
+    def _merc_y(lat_d):
+        r = math.radians(lat_d)
+        return (1.0 - math.asinh(math.tan(r)) / math.pi) / 2.0
+    dlon = (max(lons) - min(lons)) * (1 + pad) or 0.001
+    dy   = abs(_merc_y(max(lats)) - _merc_y(min(lats))) * (1 + pad) or 0.001
+    tiles = px / 256
+    for z in range(17, 5, -1):
+        n = 2 ** z
+        if dlon / 360 * n <= tiles and dy * n <= tiles:
+            return z
+    return 6
+
+
 def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Optional[bytes]:
     """
     Render a JPEG map image sized to Sideband's lora quality preset.
@@ -355,21 +391,23 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
     if not tile_url:
         return None
 
-    render_size = 1024
-    smap = StaticMap(render_size, render_size, url_template=tile_url)
-    for node_id, snap in geo_nodes.items():
-        smap.add_marker(CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), 12))
+    lons_list = [s.lon for s in geo_nodes.values()]
+    lats_list = [s.lat for s in geo_nodes.values()]
+    center_lon = (min(lons_list) + max(lons_list)) / 2
+    center_lat = (min(lats_list) + max(lats_list)) / 2
+    render_size = max(cfg.map_max_dimension * 2, 320)
+    zoom = _best_zoom(lats_list, lons_list, render_size)
 
-    image = smap.render(zoom=18)
+    smap = StaticMap(render_size, render_size, url_template=tile_url, zoom=zoom)
+    for node_id, snap in geo_nodes.items():
+        smap.add_marker(CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), 18))
+
+    image = smap.render()
     draw  = ImageDraw.Draw(image)
     try:
+        font = ImageFont.load_default(size=14)
+    except TypeError:
         font = ImageFont.load_default()
-    except Exception:
-        font = None
-
-    center_lon = sum(s.lon for s in geo_nodes.values()) / len(geo_nodes)
-    center_lat = sum(s.lat for s in geo_nodes.values()) / len(geo_nodes)
-    zoom = 18
 
     for node_id, snap in geo_nodes.items():
         px, py = _lonlat_to_pixel(
@@ -381,7 +419,7 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
             f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "?"
         )
         label = f"{node_id[-4:]}\nS:{soil_str} B:{bat_str}"
-        lx, ly = px + 10, py - 20
+        lx, ly = px + 14, py - 26
         bbox = draw.textbbox((lx, ly), label, font=font)
         draw.rectangle([bbox[0]-2, bbox[1]-2, bbox[2]+2, bbox[3]+2], fill=(0, 0, 0, 180))
         draw.text((lx, ly), label, fill="white", font=font)
@@ -392,7 +430,7 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
     image.thumbnail((cfg.map_max_dimension, cfg.map_max_dimension))
 
     buf = io.BytesIO()
-    image.save(buf, format="WEBP", quality=cfg.map_jpeg_quality)
+    image.save(buf, format="JPEG", quality=cfg.map_jpeg_quality, optimize=True)
     logger.info(
         "Map JPEG: %d bytes  %dx%d px  quality=%d  nodes=%d",
         buf.tell(), image.width, image.height, cfg.map_jpeg_quality, len(geo_nodes),
@@ -404,7 +442,7 @@ def render_map(nodes: Dict[str, NodeSnapshot], cfg: ReticulumBridgeConfig) -> Op
 
 def handle_command(
     cmd: str,
-    cache: SensorCache,
+    nodes: Dict[str, NodeSnapshot],
     cfg: ReticulumBridgeConfig,
 ) -> Tuple[str, Optional[bytes]]:
     parts   = cmd.strip().lower().split(None, 1)
@@ -412,33 +450,31 @@ def handle_command(
     target  = parts[1].strip() if len(parts) > 1 else None
 
     if command == "nodes":
-        all_nodes = cache.all_nodes()
-        if not all_nodes: return "No nodes seen yet.", None
-        return "Known field nodes:\n" + "\n".join(f"  {n}" for n in sorted(all_nodes)), None
+        if not nodes: return "No nodes in database yet.", None
+        return "Known field nodes:\n" + "\n".join(f"  {n}" for n in sorted(nodes)), None
     if command == "help":     return HELP_TEXT, None
-    if command == "status":   return fmt_status(cache), None
-    if command == "soil":     return fmt_soil(cache), None
-    if command == "battery":  return fmt_battery(cache), None
-    if command == "position": return fmt_position(cache), None
-    if command == "link":     return fmt_link(cache), None
+    if command == "status":   return fmt_status(nodes), None
+    if command == "soil":     return fmt_soil(nodes), None
+    if command == "battery":  return fmt_battery(nodes), None
+    if command == "position": return fmt_position(nodes), None
+    if command == "link":     return fmt_link(nodes), None
 
     if command == "map":
-        all_nodes = cache.all_nodes()
-        if not all_nodes:
-            return "No sensor data yet — field nodes may not have reported in.", None
+        if not nodes:
+            return "No sensor data in database yet — field nodes may not have reported in.", None
 
         if target:
-            if target not in all_nodes:
+            if target not in nodes:
                 return f"Node '{target}' not found. Send 'nodes' to list all known nodes.", None
-            nodes = {target: all_nodes[target]}
+            map_nodes = {target: nodes[target]}
         else:
-            nodes = all_nodes
+            map_nodes = nodes
 
-        geo_count  = sum(1 for s in nodes.values() if s.lat is not None)
-        no_gps     = len(nodes) - geo_count
+        geo_count = sum(1 for s in map_nodes.values() if s.lat is not None)
+        no_gps    = len(map_nodes) - geo_count
 
-        lines = [_header(f"🗺️  Navamesh Map  ({len(nodes)} node(s))")]
-        for node_id, snap in sorted(nodes.items()):
+        lines = [_header(f"🗺️  Navamesh Map  ({len(map_nodes)} node(s))")]
+        for node_id, snap in sorted(map_nodes.items()):
             soil_str = f"{snap.soil_percent:.1f}%" if snap.soil_percent is not None else "no data"
             bat_str  = "USB" if snap.battery_usb else (
                 f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "no data"
@@ -452,7 +488,7 @@ def handle_command(
         if no_gps:
             lines.append(f"⚠️  {no_gps} node(s) have no GPS fix — omitted from map.")
 
-        img_bytes = render_map(nodes, cfg)
+        img_bytes = render_map(map_nodes, cfg)
         if not img_bytes:
             if not MAP_AVAILABLE:
                 lines.append("ℹ️  Map unavailable — install staticmap+pillow on the Pi.")
@@ -469,9 +505,8 @@ def handle_command(
 # ── LXMF gateway ─────────────────────────────────────────────────────────────
 
 class LxmfGateway:
-    def __init__(self, cfg: ReticulumBridgeConfig, cache: SensorCache, navamesh_cfg: Any):
+    def __init__(self, cfg: ReticulumBridgeConfig, navamesh_cfg: Any):
         self._cfg          = cfg
-        self._cache        = cache
         self._navamesh_cfg = navamesh_cfg
         self._router: Optional[LXMF.LXMRouter] = None
         self._source: Optional[Any] = None
@@ -510,7 +545,8 @@ class LxmfGateway:
             cmd     = content or title
             logger.info("Command from %s: %r", sender, cmd)
 
-            text_reply, img_bytes = handle_command(cmd, self._cache, self._cfg)
+            nodes = _nodes_from_postgres(self._cfg.pg_dsn)
+            text_reply, img_bytes = handle_command(cmd, nodes, self._cfg)
 
             if img_bytes:
                 self._send_with_image(message, text_reply, img_bytes)
@@ -554,7 +590,7 @@ class LxmfGateway:
                     content=text,
                     title="Navamesh Map",
                     desired_method=LXMF.LXMessage.DIRECT,
-                    fields={LXMF.FIELD_IMAGE: ["webp", img_bytes]},
+                    fields={LXMF.FIELD_IMAGE: ["image/jpeg", img_bytes]},
                 ))
                 logger.info(
                     "Map reply queued to %s  image=%d bytes",
@@ -572,113 +608,23 @@ class LxmfGateway:
         pass
 
 
-# ── MQTT subscriber ───────────────────────────────────────────────────────────
-
-class MqttCacheUpdater:
-    def __init__(self, cfg: Any, cache: SensorCache, ignored_nodes: set):
-        self._cfg, self._cache, self._ignored = cfg, cache, ignored_nodes
-        try:
-            self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-        except AttributeError:
-            self._client = mqtt.Client()
-        self._client.on_connect    = self._on_connect
-        self._client.on_message    = self._on_message
-        self._client.on_disconnect = self._on_disconnect
-        self._topics = {
-            "soil_raw":     f"{cfg.root_sensors}/soil/+/raw",
-            "soil_percent": f"{cfg.root_sensors}/soil/+/percent",
-            "position":     f"{cfg.root_nodes}/+/position",
-            "battery":      f"{cfg.root_nodes}/+/battery",
-            "link":         f"{cfg.root_nodes}/+/link",
-        }
-
-    def start(self) -> None:
-        self._client.connect(self._cfg.mqtt_host, self._cfg.mqtt_port, 60)
-        self._client.loop_start()
-
-    def stop(self) -> None:
-        try: self._client.loop_stop(); self._client.disconnect()
-        except Exception: pass
-
-    def _on_connect(self, client, userdata, flags, rc, properties=None) -> None:
-        if rc != 0: logger.error("MQTT connect failed rc=%s", rc); return
-        logger.info("MQTT connected")
-        for name, topic in self._topics.items():
-            client.subscribe(topic)
-            logger.info("  %s → %s", name, topic)
-
-    def _on_disconnect(self, client, userdata, rc, properties=None) -> None:
-        if rc != 0: logger.warning("MQTT unexpected disconnect rc=%s", rc)
-
-    def _on_message(self, client, userdata, msg: mqtt.MQTTMessage) -> None:
-        try:
-            payload = json.loads(msg.payload.decode("utf-8"))
-        except Exception as exc:
-            logger.error("JSON decode error on %s: %s", msg.topic, exc); return
-
-        kind, node_id = self._classify(msg.topic)
-        if not kind or not node_id or node_id in self._ignored:
-            return
-
-        ts = payload.get("ts")
-        if kind == "soil_raw":
-            self._cache.update(node_id, ts=ts, soil_raw=payload.get("value"))
-        elif kind == "soil_percent":
-            self._cache.update(node_id, ts=ts, soil_percent=payload.get("value"))
-        elif kind == "battery":
-            self._cache.update(node_id, ts=ts,
-                battery_level=payload.get("batteryLevel"),
-                battery_usb=payload.get("batteryUsb"),
-                voltage=payload.get("voltage"),
-                uptime_seconds=payload.get("uptimeSeconds"),
-            )
-        elif kind == "position":
-            self._cache.update(node_id, ts=ts,
-                lat=payload.get("lat"), lon=payload.get("lon"), alt=payload.get("alt"),
-            )
-        elif kind == "link":
-            self._cache.update(node_id, ts=ts,
-                rx_rssi=payload.get("rxRssi"), rx_snr=payload.get("rxSnr"),
-            )
-
-    def _classify(self, topic: str) -> Tuple[Optional[str], Optional[str]]:
-        soil_pfx = f"{self._cfg.root_sensors}/soil/"
-        node_pfx = f"{self._cfg.root_nodes}/"
-        if topic.startswith(soil_pfx):
-            parts = topic[len(soil_pfx):].split("/")
-            if len(parts) != 2: return None, None
-            node_id, metric = parts
-            return ("soil_raw" if metric == "raw" else "soil_percent"), node_id
-        if topic.startswith(node_pfx):
-            parts = topic[len(node_pfx):].split("/")
-            if len(parts) != 2: return None, None
-            node_id, metric = parts
-            if metric in {"position", "battery", "link"}: return metric, node_id
-        return None, None
-
-
 # ── Main bridge ───────────────────────────────────────────────────────────────
 
 class ReticulumBridge:
     def __init__(self) -> None:
-        self.cfg           = load_config()
-        self.rns_cfg       = load_rns_config()
-        self.ignored_nodes = set(filter(None, os.getenv("IGNORED_NODES", "").split(",")))
-        self._stop_event   = threading.Event()
-        self._cache        = SensorCache()
-        self._gateway      = LxmfGateway(self.rns_cfg, self._cache, self.cfg)
-        self._mqtt         = MqttCacheUpdater(self.cfg, self._cache, self.ignored_nodes)
+        self.cfg         = load_config()
+        self.rns_cfg     = load_rns_config()
+        self._stop_event = threading.Event()
+        self._gateway    = LxmfGateway(self.rns_cfg, self.cfg)
 
     def start(self) -> None:
-        logger.info("Starting Reticulum LXMF gateway...")
+        logger.info("Starting Reticulum LXMF gateway (DB-backed, pg_dsn=%s)...",
+                    "set" if self.rns_cfg.pg_dsn else "NOT SET")
         self._gateway.start()
-        logger.info("Starting MQTT cache updater...")
-        self._mqtt.start()
         threading.Thread(target=self._announce_loop, daemon=True).start()
 
     def stop(self) -> None:
         self._stop_event.set()
-        self._mqtt.stop()
         self._gateway.stop()
 
     def _announce_loop(self) -> None:

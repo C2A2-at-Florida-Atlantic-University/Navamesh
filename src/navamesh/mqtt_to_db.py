@@ -39,6 +39,7 @@ logging.basicConfig(
 logger = logging.getLogger("mqtt_to_db")
 
 # Gateway node IDs to exclude from DB writes
+GATEWAY_NODE_IDS = {"!97dc7857"}
 
 CLOUD_RETRY_INTERVAL = int(os.getenv("CLOUD_RETRY_INTERVAL", "30"))
 
@@ -60,13 +61,11 @@ class DatabaseConfig:
 
     location_name: str
     node_type: str
-    farm_id: str
 
 
 @dataclass
 class NodeState:
     node_id: str
-    farm_id: str
     last_seen_ts: Optional[int] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
@@ -84,7 +83,6 @@ class NodeState:
 
     def metadata(self, location_name: str, node_type: str) -> Dict[str, Any]:
         return {
-            "farm_id": self.farm_id,
             "location": location_name,
             "type": node_type,
             "status": "online",
@@ -106,7 +104,6 @@ class NodeState:
 def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "") -> dict:
     return {
         "node_id": state.node_id,
-        "farm_id": state.farm_id,
         "last_seen_ts": state.last_seen_ts,
         "lat": state.lat,
         "lon": state.lon,
@@ -129,7 +126,6 @@ def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "
 def _state_from_dict(d: dict) -> NodeState:
     return NodeState(
         node_id=d["node_id"],
-        farm_id=d.get("farm_id", "farm_1"),
         last_seen_ts=d.get("last_seen_ts"),
         lat=d.get("lat"),
         lon=d.get("lon"),
@@ -222,7 +218,10 @@ class PostgresWriter:
             logger.warning("Postgres disabled: psycopg is not installed.")
             self._enabled = False
             return
-        self._conn = psycopg.connect(self._dsn)
+        self._conn = psycopg.connect(
+            self._dsn,
+            keepalives=1, keepalives_idle=60, keepalives_interval=10, keepalives_count=5,
+        )
         self._conn.autocommit = True
         self.ensure_schema()
         logger.info("Connected to Postgres/PostGIS.")
@@ -236,7 +235,10 @@ class PostgresWriter:
                     self._conn.close()
                 except Exception:
                     pass
-            self._conn = psycopg.connect(self._dsn)
+            self._conn = psycopg.connect(
+                self._dsn,
+                keepalives=1, keepalives_idle=60, keepalives_interval=10, keepalives_count=5,
+            )
             self._conn.autocommit = True
             self.ensure_schema()
             logger.info("Postgres reconnected.")
@@ -254,22 +256,17 @@ class PostgresWriter:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mesh_nodes (
-                    farm_id  TEXT NOT NULL,
-                    node_id  TEXT NOT NULL,
+                    node_id TEXT PRIMARY KEY,
                     last_seen TIMESTAMPTZ DEFAULT now(),
-                    lat      DOUBLE PRECISION,
-                    lon      DOUBLE PRECISION,
-                    geom     geometry(Point, 4326),
-                    metadata JSONB,
-                    PRIMARY KEY (farm_id, node_id)
+                    lat DOUBLE PRECISION,
+                    lon DOUBLE PRECISION,
+                    geom geometry(Point, 4326),
+                    metadata JSONB
                 );
                 """
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mesh_nodes_geom ON mesh_nodes USING GIST (geom);"
-            )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_mesh_nodes_farm_id ON mesh_nodes (farm_id);"
             )
 
     def upsert_node(self, state: NodeState, location_name: str, node_type: str) -> None:
@@ -286,9 +283,8 @@ class PostgresWriter:
                 if has_coords:
                     cur.execute(
                         """
-                        INSERT INTO mesh_nodes (farm_id,node_id, last_seen, lat, lon, geom, metadata)
+                        INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, geom, metadata)
                         VALUES (
-                            %s,
                             %s,
                             to_timestamp(%s),
                             %s,
@@ -296,25 +292,25 @@ class PostgresWriter:
                             ST_SetSRID(ST_MakePoint(%s, %s), 4326),
                             %s::jsonb
                         )
-                        ON CONFLICT (farm_id, node_id) DO UPDATE SET
+                        ON CONFLICT (node_id) DO UPDATE SET
                             last_seen = EXCLUDED.last_seen,
                             lat       = EXCLUDED.lat,
                             lon       = EXCLUDED.lon,
                             geom      = EXCLUDED.geom,
                             metadata  = EXCLUDED.metadata;
                         """,
-                        (state.farm_id, state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
+                        (state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
                     )
                 else:
                     cur.execute(
                         """
-                        INSERT INTO mesh_nodes (farm_id,node_id, last_seen, metadata)
-                        VALUES (%s, %s, to_timestamp(%s), %s::jsonb)
-                        ON CONFLICT (farm_id, node_id) DO UPDATE SET
+                        INSERT INTO mesh_nodes (node_id, last_seen, metadata)
+                        VALUES (%s, to_timestamp(%s), %s::jsonb)
+                        ON CONFLICT (node_id) DO UPDATE SET
                             last_seen = EXCLUDED.last_seen,
                             metadata  = EXCLUDED.metadata;
                         """,
-                        (state.farm_id, state.node_id, ts, metadata_json),
+                        (state.node_id, ts, metadata_json),
                     )
             logger.info("Upserted mesh_nodes row for %s (coords=%s).", state.node_id, has_coords)
         except Exception:
@@ -335,7 +331,6 @@ class InfluxWriter:
         self._bucket = bucket
         self._client = None
         self._write_api = None
-        self.farm_id = os.getenv("FARM_ID", "farm_1")
         self._enabled = bool(url and token and org and bucket)
 
     @property
@@ -358,7 +353,7 @@ class InfluxWriter:
         if self._write_api is None:
             return
         ts = datetime.fromtimestamp(state.last_seen_ts or int(datetime.now().timestamp()), tz=timezone.utc)
-        point = Point("soil_moisture").tag("node_id", state.node_id).tag("farm_id", state.farm_id)
+        point = Point("soil_moisture").tag("node_id", state.node_id)
         if state.soil_raw is not None:
             point = point.field("raw", float(state.soil_raw))
         if state.soil_percent is not None:
@@ -452,7 +447,6 @@ class MqttToDbIngestor:
         self.cache: Dict[str, NodeState] = {}
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.ignored_nodes = set(filter(None, os.getenv("IGNORED_NODES", "").split(",")))
 
         # Local writers — primary, always write
         self.pg = PostgresWriter(self.db_cfg.pg_dsn)
@@ -515,7 +509,6 @@ class MqttToDbIngestor:
             influx_cloud_bucket=os.getenv("INFLUX_CLOUD_BUCKET", ""),
             location_name=os.getenv("LOCATION_NAME", "FAU Garden"),
             node_type=os.getenv("NODE_TYPE", "field-node"),
-            farm_id=os.getenv("FARM_ID", "farm_1"),
         )
 
     def start(self) -> None:
@@ -569,8 +562,7 @@ class MqttToDbIngestor:
             client.subscribe(topic)
             logger.info("Subscribed to %s -> %s", name, topic)
 
-    def on_disconnect(self, client: mqtt.Client, userdata: Any, *args) -> None:
-        rc = args[0] if args else 0
+    def on_disconnect(self, client: mqtt.Client, userdata: Any, rc: int, properties=None) -> None:
         if rc != 0:
             logger.warning("Unexpected MQTT disconnect rc=%s", rc)
         else:
@@ -593,13 +585,10 @@ class MqttToDbIngestor:
                 return
 
             # Skip gateway node's own data
-            if node_id in self.ignored_nodes:
+            if node_id in GATEWAY_NODE_IDS:
                 return
 
-            cache_key = f"{self.cfg.farm_id}:{node_id}"
-            if cache_key not in self.cache:
-                self.cache[cache_key] = NodeState(node_id=node_id, farm_id=self.cfg.farm_id)
-            state = self.cache[cache_key]
+            state = self.cache.setdefault(node_id, NodeState(node_id=node_id))
             self.apply_payload(state, kind, payload)
             self.write_outputs(state, kind)
 
@@ -661,9 +650,15 @@ class MqttToDbIngestor:
     def write_outputs(self, state: NodeState, kind: str) -> None:
         # --- Local (primary — always write) ---
         if kind in {"soil_raw", "soil_percent", "battery"} and self.influx.enabled:
-            self.influx.write_soil(state)
+            try:
+                self.influx.write_soil(state)
+            except Exception as e:
+                logger.warning("Local InfluxDB write failed: %s", e)
         if self.pg.enabled:
-            self.pg.upsert_node(state, self.db_cfg.location_name, self.db_cfg.node_type)
+            try:
+                self.pg.upsert_node(state, self.db_cfg.location_name, self.db_cfg.node_type)
+            except Exception as e:
+                logger.warning("Local Postgres write failed: %s", e)
 
         # --- Cloud (secondary — best-effort, queue on failure) ---
         if kind in {"soil_raw", "soil_percent", "battery"} and self.influx_cloud.enabled:
