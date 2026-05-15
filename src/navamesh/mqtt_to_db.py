@@ -252,17 +252,34 @@ class PostgresWriter:
         if self._conn is None:
             return
         with self._conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+            except Exception as e:
+                logger.warning("Could not create postgis extension (may need superuser): %s", e)
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mesh_nodes (
-                    node_id TEXT PRIMARY KEY,
+                    node_id TEXT,
                     last_seen TIMESTAMPTZ DEFAULT now(),
                     lat DOUBLE PRECISION,
                     lon DOUBLE PRECISION,
                     geom geometry(Point, 4326),
                     metadata JSONB
                 );
+                """
+            )
+            cur.execute(
+                """
+                DO $$ BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint c
+                        JOIN pg_class t ON c.conrelid = t.oid
+                        WHERE c.contype = 'p' AND t.relname = 'mesh_nodes'
+                    ) THEN
+                        ALTER TABLE mesh_nodes ADD PRIMARY KEY (node_id);
+                    END IF;
+                END $$;
                 """
             )
             cur.execute(
