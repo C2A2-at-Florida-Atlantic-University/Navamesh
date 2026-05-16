@@ -251,7 +251,7 @@ class PostgresWriter:
     def ensure_schema(self) -> None:
         if self._conn is None:
             return
-        # Create core table with PK (IF NOT EXISTS is a no-op for existing tables)
+        # Create core table (IF NOT EXISTS is a no-op for existing tables)
         with self._conn.cursor() as cur:
             cur.execute(
                 """
@@ -292,7 +292,7 @@ class PostgresWriter:
                 )
             except Exception as e:
                 logger.warning("Could not create unique index on mesh_nodes.node_id: %s", e)
-        # PostGIS geom column — optional, separate cursor so its failure is isolated
+        # PostGIS geom column — optional, isolated so its failure doesn't break the rest
         with self._conn.cursor() as cur:
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
@@ -412,7 +412,10 @@ class InfluxWriter:
     def write_soil(self, state: NodeState) -> None:
         if self._write_api is None:
             return
-        ts = datetime.fromtimestamp(state.last_seen_ts or int(datetime.now().timestamp()), tz=timezone.utc)
+        ts = datetime.fromtimestamp(
+            state.last_seen_ts or int(datetime.now(tz=timezone.utc).timestamp()),
+            tz=timezone.utc,
+        )
         point = Point("soil_moisture").tag("node_id", state.node_id)
         if state.soil_raw is not None:
             point = point.field("raw", float(state.soil_raw))
@@ -433,6 +436,48 @@ class InfluxWriter:
         point = point.time(ts, WritePrecision.S)
         self._write_api.write(bucket=self._bucket, org=self._org, record=point)
         logger.info("Wrote InfluxDB soil point for %s.", state.node_id)
+
+    def write_link(self, state: NodeState) -> None:
+        """Write RSSI/SNR link quality as a time-series measurement."""
+        if self._write_api is None:
+            return
+        if state.rx_rssi is None and state.rx_snr is None:
+            return
+        ts = datetime.fromtimestamp(
+            state.last_seen_ts or int(datetime.now(tz=timezone.utc).timestamp()),
+            tz=timezone.utc,
+        )
+        point = Point("link_quality").tag("node_id", state.node_id)
+        if state.rx_rssi is not None:
+            point = point.field("rssi", float(state.rx_rssi))
+        if state.rx_snr is not None:
+            point = point.field("snr", float(state.rx_snr))
+        point = point.time(ts, WritePrecision.S)
+        self._write_api.write(bucket=self._bucket, org=self._org, record=point)
+        logger.info("Wrote InfluxDB link point for %s (rssi=%s snr=%s).", state.node_id, state.rx_rssi, state.rx_snr)
+
+    def write_position(self, state: NodeState) -> None:
+        """Write GPS position as a time-series measurement."""
+        if self._write_api is None:
+            return
+        if state.lat is None or state.lon is None:
+            return
+        ts = datetime.fromtimestamp(
+            state.last_seen_ts or int(datetime.now(tz=timezone.utc).timestamp()),
+            tz=timezone.utc,
+        )
+        point = Point("position").tag("node_id", state.node_id)
+        point = point.field("lat", float(state.lat))
+        point = point.field("lon", float(state.lon))
+        if state.alt is not None:
+            point = point.field("alt", float(state.alt))
+        if state.sats is not None:
+            point = point.field("sats", float(state.sats))
+        if state.hdop is not None:
+            point = point.field("hdop", float(state.hdop))
+        point = point.time(ts, WritePrecision.S)
+        self._write_api.write(bucket=self._bucket, org=self._org, record=point)
+        logger.info("Wrote InfluxDB position point for %s (lat=%s lon=%s).", state.node_id, state.lat, state.lon)
 
     def close(self) -> None:
         if self._client is not None:
@@ -491,6 +536,10 @@ class CloudSyncWorker:
                     )
                 elif target == "influx":
                     self._influx.write_soil(state)
+                elif target == "influx_link":
+                    self._influx.write_link(state)
+                elif target == "influx_position":
+                    self._influx.write_position(state)
                 flushed.append(row_id)
             except Exception as e:
                 logger.debug("Flush failed for queue id=%d target=%s: %s", row_id, target, e)
@@ -613,18 +662,52 @@ class MqttToDbIngestor:
         self.influx_cloud.close()
         self.sync_queue.close()
 
-    def on_connect(self, client: mqtt.Client, userdata: Any, flags: Dict[str, Any], rc: int, properties=None) -> None:
-        if rc != 0:
-            logger.error("MQTT connect failed with rc=%s", rc)
+    # FIX: paho-mqtt v2 passes a ReasonCode object as the 4th arg, not a plain
+    # int. Using hasattr("is_failure") handles both v1 (plain int) and v2
+    # (ReasonCode) without breaking on either version.
+    def on_connect(
+        self,
+        client: mqtt.Client,
+        userdata: Any,
+        connect_flags: Any,
+        reason_code: Any,
+        properties: Any = None,
+    ) -> None:
+        failed = (
+            reason_code.is_failure
+            if hasattr(reason_code, "is_failure")
+            else reason_code != 0
+        )
+        if failed:
+            logger.error("MQTT connect failed: %s", reason_code)
             return
         logger.info("Connected to MQTT broker.")
         for name, topic in self.topic_patterns.items():
             client.subscribe(topic)
             logger.info("Subscribed to %s -> %s", name, topic)
 
-    def on_disconnect(self, client: mqtt.Client, userdata: Any, disconnect_flags=None, rc: int = 0, properties=None) -> None:
-        if rc != 0:
-            logger.warning("Unexpected MQTT disconnect rc=%s", rc)
+    # FIX: paho-mqtt v2 passes disconnect_flags as a ReasonCode object; the
+    # plain rc int is always 0 in v2. Check disconnect_flags first.
+    def on_disconnect(
+        self,
+        client: mqtt.Client,
+        userdata: Any,
+        disconnect_flags: Any = None,
+        rc: int = 0,
+        properties: Any = None,
+    ) -> None:
+        reason = (
+            disconnect_flags
+            if hasattr(disconnect_flags, "is_failure")
+            else rc
+        )
+        is_failure = (
+            reason.is_failure
+            if hasattr(reason, "is_failure")
+            else reason != 0
+        )
+        if is_failure:
+            logger.warning("Unexpected MQTT disconnect: %s", reason)
         else:
             logger.info("Disconnected from MQTT broker.")
 
@@ -709,11 +792,23 @@ class MqttToDbIngestor:
 
     def write_outputs(self, state: NodeState, kind: str) -> None:
         # --- Local (primary — always write) ---
-        if kind in {"soil_raw", "soil_percent", "battery"} and self.influx.enabled:
-            try:
-                self.influx.write_soil(state)
-            except Exception as e:
-                logger.warning("Local InfluxDB write failed: %s", e)
+        if self.influx.enabled:
+            if kind in {"soil_raw", "soil_percent", "battery"}:
+                try:
+                    self.influx.write_soil(state)
+                except Exception as e:
+                    logger.warning("Local InfluxDB soil write failed: %s", e)
+            elif kind == "link":
+                try:
+                    self.influx.write_link(state)
+                except Exception as e:
+                    logger.warning("Local InfluxDB link write failed: %s", e)
+            elif kind == "position":
+                try:
+                    self.influx.write_position(state)
+                except Exception as e:
+                    logger.warning("Local InfluxDB position write failed: %s", e)
+
         if self.pg.enabled:
             try:
                 self.pg.upsert_node(state, self.db_cfg.location_name, self.db_cfg.node_type)
@@ -721,12 +816,25 @@ class MqttToDbIngestor:
                 logger.warning("Local Postgres write failed: %s", e)
 
         # --- Cloud (secondary — best-effort, queue on failure) ---
-        if kind in {"soil_raw", "soil_percent", "battery"} and self.influx_cloud.enabled:
-            try:
-                self.influx_cloud.write_soil(state)
-            except Exception as e:
-                logger.warning("Cloud InfluxDB write failed, queuing: %s", e)
-                self.sync_queue.enqueue("influx", _state_to_dict(state))
+        if self.influx_cloud.enabled:
+            if kind in {"soil_raw", "soil_percent", "battery"}:
+                try:
+                    self.influx_cloud.write_soil(state)
+                except Exception as e:
+                    logger.warning("Cloud InfluxDB soil write failed, queuing: %s", e)
+                    self.sync_queue.enqueue("influx", _state_to_dict(state))
+            elif kind == "link":
+                try:
+                    self.influx_cloud.write_link(state)
+                except Exception as e:
+                    logger.warning("Cloud InfluxDB link write failed, queuing: %s", e)
+                    self.sync_queue.enqueue("influx_link", _state_to_dict(state))
+            elif kind == "position":
+                try:
+                    self.influx_cloud.write_position(state)
+                except Exception as e:
+                    logger.warning("Cloud InfluxDB position write failed, queuing: %s", e)
+                    self.sync_queue.enqueue("influx_position", _state_to_dict(state))
 
         if self.pg_cloud.enabled:
             try:
@@ -760,10 +868,11 @@ class MqttToDbIngestor:
 def main() -> int:
     ingestor = MqttToDbIngestor()
 
+    # FIX: set stop_event instead of calling sys.exit() so the finally block
+    # below always runs and all connections are closed cleanly on SIGINT/SIGTERM.
     def _shutdown(signum: int, frame: Any) -> None:
         logger.info("Shutting down on signal %s...", signum)
-        ingestor.stop()
-        sys.exit(0)
+        ingestor.stop_event.set()
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
