@@ -39,7 +39,11 @@ logging.basicConfig(
 logger = logging.getLogger("mqtt_to_db")
 
 # Gateway node IDs to exclude from DB writes
-GATEWAY_NODE_IDS = {"!97dc7857"}
+def _load_ignored_nodes() -> frozenset:
+    raw = os.getenv("IGNORED_NODES", "")
+    return frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+GATEWAY_NODE_IDS = _load_ignored_nodes()
 
 CLOUD_RETRY_INTERVAL = int(os.getenv("CLOUD_RETRY_INTERVAL", "30"))
 
