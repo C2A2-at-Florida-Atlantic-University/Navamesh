@@ -622,7 +622,7 @@ class MqttToDbIngestor:
             client.subscribe(topic)
             logger.info("Subscribed to %s -> %s", name, topic)
 
-    def on_disconnect(self, client: mqtt.Client, userdata: Any, rc: int, properties=None) -> None:
+    def on_disconnect(self, client: mqtt.Client, userdata: Any, disconnect_flags=None, rc: int = 0, properties=None) -> None:
         if rc != 0:
             logger.warning("Unexpected MQTT disconnect rc=%s", rc)
         else:
