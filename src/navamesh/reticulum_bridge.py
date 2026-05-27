@@ -34,7 +34,7 @@ Required env vars (add to your .env):
   PG_DSN                  — Postgres connection string for node snapshots
 
 Optional env vars:
-  LXMF_ANNOUNCE_INTERVAL  — seconds between RNS announces (default: 300)
+  LXMF_ANNOUNCE_INTERVAL  — seconds between RNS announces (default: 180)
   IGNORED_NODES           — comma-separated node IDs to ignore
   LOG_LEVEL               — logging level (default: INFO)
 
@@ -62,6 +62,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -105,8 +106,6 @@ if not MAP_AVAILABLE:
 
 
 # ── Image transport profiles ──────────────────────────────────────────────────
-# Choose with MAP_LINK_PROFILE in .env.
-# LoRa must stay tiny. HaLow/Wi-Fi can handle much better map images.
 IMAGE_PROFILES = {
     "lora": {
         "max_dimension": 200,
@@ -125,29 +124,19 @@ IMAGE_PROFILES = {
     },
 }
 
-# LXMF FIELD_IMAGE expects the type string "jpg" for JPEG.
 _FIELD_TYPE = "jpg"
 _MIME_TYPE  = "image/jpeg"
 
 
 def _image_profile() -> dict:
-    """
-    Pick image size/quality based on the expected link type.
-    Reads MAP_LINK_PROFILE from .env; defaults to "lora" (safest).
-    Individual settings can be further overridden with MAP_MAX_DIMENSION,
-    MAP_JPEG_QUALITY, MAP_MAX_BYTES.
-    """
     name    = os.getenv("MAP_LINK_PROFILE", "lora").strip().lower()
     profile = dict(IMAGE_PROFILES.get(name, IMAGE_PROFILES["lora"]))
-
-    # Allow per-key overrides without changing the profile name
     if os.getenv("MAP_MAX_DIMENSION"):
         profile["max_dimension"] = int(os.getenv("MAP_MAX_DIMENSION"))
     if os.getenv("MAP_JPEG_QUALITY"):
         profile["quality"] = int(os.getenv("MAP_JPEG_QUALITY"))
     if os.getenv("MAP_MAX_BYTES"):
         profile["max_bytes"] = int(os.getenv("MAP_MAX_BYTES"))
-
     return profile
 
 
@@ -161,9 +150,9 @@ class ReticulumBridgeConfig:
     announce_interval: int
     map_tile_url: str
     map_tile_fallback: str
-    map_max_dimension: int   # resolved from profile at startup
-    map_jpeg_quality: int    # resolved from profile at startup
-    map_max_bytes: int       # resolved from profile at startup
+    map_max_dimension: int
+    map_jpeg_quality: int
+    map_max_bytes: int
     soil_wet_threshold: float
     soil_dry_threshold: float
     pg_dsn: str
@@ -186,7 +175,7 @@ def load_rns_config() -> ReticulumBridgeConfig:
             os.getenv("LXMF_STORAGE_DIR", "~/.navamesh_lxmf")
         ),
         display_name=os.getenv("LXMF_DISPLAY_NAME", "Navamesh Gateway"),
-        announce_interval=_int("LXMF_ANNOUNCE_INTERVAL", 300),
+        announce_interval=_int("LXMF_ANNOUNCE_INTERVAL", 180),
         map_tile_url=os.getenv(
             "MAP_TILE_URL",
             "http://127.0.0.1:8080/data/florida/{z}/{x}/{y}.png",
@@ -226,7 +215,6 @@ class NodeSnapshot:
 
 
 def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
-    """Query local Postgres for the latest snapshot of every node."""
     if not dsn or _psycopg is None:
         if _psycopg is None:
             logger.warning("psycopg not installed — install it to enable DB reads")
@@ -386,10 +374,10 @@ def _resolve_tile_url(cfg: ReticulumBridgeConfig) -> Optional[str]:
 
 def _pin_color(snap: NodeSnapshot, cfg: ReticulumBridgeConfig) -> str:
     soil = snap.soil_percent
-    if soil is None:                        return "#22cc44"   # green — no data
-    if soil >= cfg.soil_wet_threshold:      return "#2255ff"   # blue  — well watered
-    if soil <= cfg.soil_dry_threshold:      return "#ff3322"   # red   — needs water
-    return "#22cc44"                                           # green — ok
+    if soil is None:                        return "#22cc44"
+    if soil >= cfg.soil_wet_threshold:      return "#2255ff"
+    if soil <= cfg.soil_dry_threshold:      return "#ff3322"
+    return "#22cc44"
 
 def _lonlat_to_pixel(lon, lat, center_lon, center_lat, zoom, w, h):
     def to_tile(lat_d, lon_d, z):
@@ -402,7 +390,6 @@ def _lonlat_to_pixel(lon, lat, center_lon, center_lat, zoom, w, h):
 
 
 def _best_zoom(lats, lons, px: int) -> int:
-    """Largest zoom where all nodes fit inside a px×px tile image with 25% padding."""
     if len(lats) < 2:
         return 17
     pad = 0.25
@@ -423,21 +410,6 @@ def render_map(
     nodes: Dict[str, NodeSnapshot],
     cfg: ReticulumBridgeConfig,
 ) -> Optional[Tuple[str, bytes, str]]:
-    """
-    Render a JPEG map image sized for LXMF FIELD_IMAGE.
-
-    Returns:
-        (field_type, image_bytes, mime_type)  e.g. ("jpg", b"...", "image/jpeg")
-        or None if rendering is not possible.
-
-    Strategy:
-      1. Read the active link profile (lora / halow / wifi) from .env
-      2. Render at 2× target dimension so staticmap draws legible pins
-      3. thumbnail() down to max_dimension on the longest side
-      4. Save as JPEG — convert to RGB first (JPEG has no alpha channel)
-      5. If size > max_bytes, reduce quality in steps of 8 until it fits
-         (floor: quality=20 to avoid completely unusable output)
-    """
     if not MAP_AVAILABLE:
         return None
 
@@ -458,7 +430,6 @@ def render_map(
     center_lon = (min(lons_list) + max(lons_list)) / 2
     center_lat = (min(lats_list) + max(lats_list)) / 2
 
-    # Render at 2× so pins and labels look decent before thumbnail shrink
     render_size = max(max_dimension * 2, 480)
     zoom        = _best_zoom(lats_list, lons_list, render_size)
 
@@ -514,14 +485,11 @@ def render_map(
         cy_l = (chosen_box[1] + chosen_box[3]) // 2
         draw.line([(px, py), (cx_l, cy_l)], fill=(255, 255, 255, 160), width=3)
 
-    # JPEG requires RGB — drop any alpha/palette mode
     if image.mode != "RGB":
         image = image.convert("RGB")
 
-    # Scale down to the target max_dimension
     image.thumbnail((max_dimension, max_dimension))
 
-    # Encode and iteratively reduce quality if over budget
     while quality >= 20:
         buf = io.BytesIO()
         image.save(buf, format="JPEG", quality=quality, optimize=True)
@@ -549,11 +517,6 @@ def handle_command(
     nodes: Dict[str, NodeSnapshot],
     cfg: ReticulumBridgeConfig,
 ) -> Tuple[str, Optional[Tuple[str, bytes, str]]]:
-    """
-    Returns:
-        (text_reply, image_result_or_None)
-        image_result is (field_type, bytes, mime_type) when an image is available.
-    """
     parts   = cmd.strip().lower().split(None, 1)
     command = parts[0] if parts else ""
     target  = parts[1].strip() if len(parts) > 1 else None
@@ -584,13 +547,11 @@ def handle_command(
         image_result = render_map(map_nodes, cfg)
 
         if image_result:
-            # Keep text minimal when image is attached — total LXMF payload must stay small
             lines = [f"🗺️ Map: {geo_count} node(s) plotted"]
             if no_gps:
                 lines.append(f"⚠️ {no_gps} node(s) missing GPS")
             text_reply = "\n".join(lines)
         else:
-            # No image — send the full summary as text fallback
             lines = [_header(f"🗺️  Navamesh Map  ({len(map_nodes)} node(s))")]
             for node_id, snap in sorted(map_nodes.items()):
                 soil_str = f"{snap.soil_percent:.1f}%" if snap.soil_percent is not None else "no data"
@@ -648,7 +609,6 @@ class LxmfGateway:
             identity, display_name=self._cfg.display_name
         )
         self._router.register_delivery_callback(self._on_message)
-        self._router.announce(self._source.hash)
         logger.info(
             "LXMF gateway ready.  Address: %s  Name: %s",
             RNS.prettyhexrep(self._source.hash), self._cfg.display_name,
@@ -674,8 +634,26 @@ class LxmfGateway:
             logger.error("Error handling message: %s", exc, exc_info=True)
 
     def _dest(self, original: Any) -> Any:
+        identity = RNS.Identity.recall(original.source_hash)
+        if identity is None:
+            logger.info(
+                "Identity not cached for %s — requesting path...",
+                RNS.hexrep(original.source_hash, delimit=False),
+            )
+            RNS.Transport.request_path(original.source_hash)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                identity = RNS.Identity.recall(original.source_hash)
+                if identity is not None:
+                    logger.info("Path resolved for %s", RNS.hexrep(original.source_hash, delimit=False))
+                    break
+                time.sleep(0.2)
+        if identity is None:
+            raise RuntimeError(
+                f"Cannot resolve identity for {RNS.hexrep(original.source_hash)} — path unknown"
+            )
         return RNS.Destination(
-            RNS.Identity.recall(original.source_hash),
+            identity,
             RNS.Destination.OUT, RNS.Destination.SINGLE,
             "lxmf", "delivery",
         )
@@ -683,16 +661,35 @@ class LxmfGateway:
     def _send_text(self, original: Any, text: str, title: str = "Navamesh") -> None:
         with self._lock:
             try:
-                self._router.handle_outbound(LXMF.LXMessage(
-                    destination=self._dest(original),
-                    source=self._source,
-                    content=text,
-                    title=title,
-                    desired_method=LXMF.LXMessage.DIRECT,
-                ))
-                logger.info("Text reply queued to %s", RNS.hexrep(original.source_hash, delimit=False))
-            except Exception as exc:
-                logger.error("Failed to send text reply: %s", exc)
+                dest = self._dest(original)
+            except RuntimeError as exc:
+                logger.error("Cannot build destination: %s", exc)
+                return
+            for method in (LXMF.LXMessage.DIRECT, LXMF.LXMessage.PROPAGATED):
+                try:
+                    self._router.handle_outbound(LXMF.LXMessage(
+                        destination=dest,
+                        source=self._source,
+                        content=text,
+                        title=title,
+                        desired_method=method,
+                    ))
+                    logger.info(
+                        "Reply queued via %s to %s",
+                        "DIRECT" if method == LXMF.LXMessage.DIRECT else "PROPAGATED",
+                        RNS.hexrep(original.source_hash, delimit=False),
+                    )
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "Send via %s failed: %s — trying next",
+                        "DIRECT" if method == LXMF.LXMessage.DIRECT else "PROPAGATED",
+                        exc,
+                    )
+            logger.error(
+                "All delivery methods failed for %s",
+                RNS.hexrep(original.source_hash, delimit=False),
+            )
 
     def _send_with_image(
         self,
@@ -700,50 +697,53 @@ class LxmfGateway:
         text: str,
         image_result: Tuple[str, bytes, str],
     ) -> None:
-        """
-        Send text + JPEG image together as a single LXMF FIELD_IMAGE message.
-
-        FIELD_IMAGE carries the inline image displayed by Sideband/MeshChat.
-        FIELD_FILE_ATTACHMENTS mirrors it as a saveable file for clients that
-        handle attachments more reliably than inline images.
-        """
         img_type, img_bytes, mime_type = image_result
         filename = f"navamesh_map.{img_type}"
-
-        fields = {
-            # Sideband-compatible inline image field
-            LXMF.FIELD_IMAGE: [img_type, img_bytes],
-        }
-        # Compatibility fallback: clients that expose it as a downloadable file.
-        # Wrapped in try/except in case the installed LXMF version lacks this constant.
+        fields = {LXMF.FIELD_IMAGE: [img_type, img_bytes]}
         try:
             fields[LXMF.FIELD_FILE_ATTACHMENTS] = [[filename, img_bytes, mime_type]]
         except AttributeError:
             pass
-
         with self._lock:
             try:
-                self._router.handle_outbound(LXMF.LXMessage(
-                    destination=self._dest(original),
-                    source=self._source,
-                    content=text,
-                    title="Navamesh Map",
-                    desired_method=LXMF.LXMessage.DIRECT,
-                    fields=fields,
-                ))
-                logger.info(
-                    "Map reply queued to %s  image=%d bytes  type=%s  profile=%s",
-                    RNS.hexrep(original.source_hash, delimit=False),
-                    len(img_bytes), img_type,
-                    os.getenv("MAP_LINK_PROFILE", "lora"),
-                )
-            except Exception as exc:
-                logger.error("Failed to send map reply: %s — falling back to text", exc)
+                dest = self._dest(original)
+            except RuntimeError as exc:
+                logger.error("Cannot build destination: %s — falling back to text", exc)
                 self._send_text(original, text)
+                return
+            for method in (LXMF.LXMessage.DIRECT, LXMF.LXMessage.PROPAGATED):
+                try:
+                    self._router.handle_outbound(LXMF.LXMessage(
+                        destination=dest,
+                        source=self._source,
+                        content=text,
+                        title="Navamesh Map",
+                        desired_method=method,
+                        fields=fields,
+                    ))
+                    logger.info(
+                        "Map reply queued via %s  image=%d bytes  type=%s  profile=%s",
+                        "DIRECT" if method == LXMF.LXMessage.DIRECT else "PROPAGATED",
+                        len(img_bytes), img_type,
+                        os.getenv("MAP_LINK_PROFILE", "lora"),
+                    )
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "Map send via %s failed: %s — trying next",
+                        "DIRECT" if method == LXMF.LXMessage.DIRECT else "PROPAGATED",
+                        exc,
+                    )
+            logger.error("All map delivery methods failed — sending text only")
+            self._send_text(original, text)
 
     def announce(self) -> None:
         if self._router and self._source:
-            self._router.announce(self._source.hash)
+            try:
+                self._source.announce()
+                logger.info("Announce sent for %s", RNS.prettyhexrep(self._source.hash))
+            except Exception as exc:
+                logger.warning("Announce failed: %s", exc)
 
     def stop(self) -> None:
         pass
@@ -769,6 +769,8 @@ class ReticulumBridge:
             self.rns_cfg.map_max_bytes,
         )
         self._gateway.start()
+        self._gateway.announce()
+        threading.Timer(15.0, self._gateway.announce).start()
         threading.Thread(target=self._announce_loop, daemon=True).start()
 
     def stop(self) -> None:
@@ -777,7 +779,10 @@ class ReticulumBridge:
 
     def _announce_loop(self) -> None:
         while not self._stop_event.wait(self.rns_cfg.announce_interval):
-            self._gateway.announce()
+            try:
+                self._gateway.announce()
+            except Exception as exc:
+                logger.warning("Announce loop error: %s", exc)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
