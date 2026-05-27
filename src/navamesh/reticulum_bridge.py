@@ -652,6 +652,11 @@ class LxmfGateway:
             raise RuntimeError(
                 f"Cannot resolve identity for {RNS.hexrep(original.source_hash)} — path unknown"
             )
+        if not RNS.Transport.has_path(original.source_hash):
+            logger.warning(
+                "No RNS path cached for %s — DIRECT delivery will likely fail",
+                RNS.hexrep(original.source_hash, delimit=False),
+            )
         return RNS.Destination(
             identity,
             RNS.Destination.OUT, RNS.Destination.SINGLE,
@@ -665,31 +670,38 @@ class LxmfGateway:
             except RuntimeError as exc:
                 logger.error("Cannot build destination: %s", exc)
                 return
-            for method in (LXMF.LXMessage.DIRECT, LXMF.LXMessage.PROPAGATED):
-                try:
-                    self._router.handle_outbound(LXMF.LXMessage(
-                        destination=dest,
-                        source=self._source,
-                        content=text,
-                        title=title,
-                        desired_method=method,
-                    ))
-                    logger.info(
-                        "Reply queued via %s to %s",
-                        "DIRECT" if method == LXMF.LXMessage.DIRECT else "PROPAGATED",
-                        RNS.hexrep(original.source_hash, delimit=False),
-                    )
+            source_hex = RNS.hexrep(original.source_hash, delimit=False)
+
+            def _on_fail(m: Any) -> None:
+                if m.state != LXMF.LXMessage.FAILED:
                     return
-                except Exception as exc:
-                    logger.warning(
-                        "Send via %s failed: %s — trying next",
-                        "DIRECT" if method == LXMF.LXMessage.DIRECT else "PROPAGATED",
-                        exc,
-                    )
-            logger.error(
-                "All delivery methods failed for %s",
-                RNS.hexrep(original.source_hash, delimit=False),
+                logger.warning(
+                    "DIRECT delivery failed for %s — retrying via OPPORTUNISTIC", source_hex
+                )
+                with self._lock:
+                    try:
+                        fallback = LXMF.LXMessage(
+                            destination=dest,
+                            source=self._source,
+                            content=text,
+                            title=title,
+                            desired_method=LXMF.LXMessage.OPPORTUNISTIC,
+                        )
+                        self._router.handle_outbound(fallback)
+                        logger.info("Reply re-queued via OPPORTUNISTIC for %s", source_hex)
+                    except Exception as exc2:
+                        logger.error("OPPORTUNISTIC fallback also failed: %s", exc2)
+
+            msg = LXMF.LXMessage(
+                destination=dest,
+                source=self._source,
+                content=text,
+                title=title,
+                desired_method=LXMF.LXMessage.DIRECT,
             )
+            msg.register_delivery_callback(_on_fail)
+            self._router.handle_outbound(msg)
+            logger.info("Reply queued via DIRECT to %s", source_hex)
 
     def _send_with_image(
         self,
@@ -711,31 +723,44 @@ class LxmfGateway:
                 logger.error("Cannot build destination: %s — falling back to text", exc)
                 self._send_text(original, text)
                 return
-            for method in (LXMF.LXMessage.DIRECT, LXMF.LXMessage.PROPAGATED):
-                try:
-                    self._router.handle_outbound(LXMF.LXMessage(
-                        destination=dest,
-                        source=self._source,
-                        content=text,
-                        title="Navamesh Map",
-                        desired_method=method,
-                        fields=fields,
-                    ))
-                    logger.info(
-                        "Map reply queued via %s  image=%d bytes  type=%s  profile=%s",
-                        "DIRECT" if method == LXMF.LXMessage.DIRECT else "PROPAGATED",
-                        len(img_bytes), img_type,
-                        os.getenv("MAP_LINK_PROFILE", "lora"),
-                    )
+            source_hex = RNS.hexrep(original.source_hash, delimit=False)
+
+            def _on_fail(m: Any) -> None:
+                if m.state != LXMF.LXMessage.FAILED:
                     return
-                except Exception as exc:
-                    logger.warning(
-                        "Map send via %s failed: %s — trying next",
-                        "DIRECT" if method == LXMF.LXMessage.DIRECT else "PROPAGATED",
-                        exc,
-                    )
-            logger.error("All map delivery methods failed — sending text only")
-            self._send_text(original, text)
+                logger.warning(
+                    "DIRECT map delivery failed for %s — retrying via OPPORTUNISTIC", source_hex
+                )
+                with self._lock:
+                    try:
+                        fallback = LXMF.LXMessage(
+                            destination=dest,
+                            source=self._source,
+                            content=text,
+                            title="Navamesh Map",
+                            desired_method=LXMF.LXMessage.OPPORTUNISTIC,
+                            fields=fields,
+                        )
+                        self._router.handle_outbound(fallback)
+                        logger.info("Map re-queued via OPPORTUNISTIC for %s", source_hex)
+                    except Exception as exc2:
+                        logger.error("OPPORTUNISTIC map fallback also failed: %s", exc2)
+                        self._send_text(original, text)
+
+            msg = LXMF.LXMessage(
+                destination=dest,
+                source=self._source,
+                content=text,
+                title="Navamesh Map",
+                desired_method=LXMF.LXMessage.DIRECT,
+                fields=fields,
+            )
+            msg.register_delivery_callback(_on_fail)
+            self._router.handle_outbound(msg)
+            logger.info(
+                "Map reply queued via DIRECT  image=%d bytes  type=%s  profile=%s",
+                len(img_bytes), img_type, os.getenv("MAP_LINK_PROFILE", "lora"),
+            )
 
     def announce(self) -> None:
         if self._router and self._source:
