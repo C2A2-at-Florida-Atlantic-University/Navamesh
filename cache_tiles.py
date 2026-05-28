@@ -20,13 +20,13 @@ import urllib.request
 # ─── BOUNDING BOX ─────────────────────────────────────────────────────────────
 # FAU Community Garden → FAU Engineering East, Boca Raton FL
 # Adjust these if deploying to a different farm area
-LAT_MIN = 26.3720
-LAT_MAX = 26.3785
-LON_MIN = -80.1000
+LAT_MIN = 26.3700
+LAT_MAX = 26.3820
+LON_MIN = -80.1020
 LON_MAX = -80.0920
 
 # Zoom levels to cache (14=neighborhood, 18=building-level, 19=max detail)
-ZOOM_MIN = 14
+ZOOM_MIN = 16
 ZOOM_MAX = 19
 
 TILE_SERVER = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
