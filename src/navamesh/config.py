@@ -13,9 +13,6 @@ class Config:
     root_sensors: str
     root_nodes: str
 
-    adc_dry: int
-    adc_wet: int
-    
     farm_id: str
 
 def load_config() -> Config:
@@ -34,7 +31,5 @@ def load_config() -> Config:
         root_sensors=os.getenv("ROOT_SENSORS", "farm/sensors"),
         root_nodes=os.getenv("ROOT_NODES", "farm/nodes"),
 
-        adc_dry=getenv_int("ADC_DRY", 3500),
-        adc_wet=getenv_int("ADC_WET", 1200),
         farm_id=os.getenv("FARM_ID", "farm_1"),
     )

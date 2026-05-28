@@ -11,8 +11,6 @@ from navamesh.bridge import MeshBridge
 from navamesh import topics
 
 from navamesh.processors.soil_text import (
-    parse_moisture_raw,
-    make_soil_messages,
     is_status_message,
     parse_status_message,
     make_status_mqtt_payloads,
@@ -116,24 +114,6 @@ def main():
                       f"bat={bat_str} | up={parsed['uptime_seconds']}s")
                 return
 
-            # FORMAT A: MOISTURE_RAW=585
-            raw_val = parse_moisture_raw(text)
-            if raw_val is None:
-                return
-            raw_msg, pct_msg = make_soil_messages(from_id, raw_val, cfg.adc_dry, cfg.adc_wet)
-
-            # Soil raw + percent — retained
-            mqtt_pub.publish(
-                topics.soil_raw(cfg.root_sensors, from_id),
-                raw_msg,
-                retain=True,
-            )
-            mqtt_pub.publish(
-                topics.soil_percent(cfg.root_sensors, from_id),
-                pct_msg,
-                retain=True,
-            )
-            print(f"[SENSOR] {from_id} | soil raw={raw_val} → {pct_msg['value']:.2f}%")
 
         except Exception as e:
             print("[ERR] on_receive:", e)

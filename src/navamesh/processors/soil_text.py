@@ -1,72 +1,14 @@
 """
 soil_text.py — Parse soil/battery/uptime from Meshtastic text messages.
 
-Two supported message formats:
-
-  FORMAT A (legacy ADC):
-      "MOISTURE_RAW=585"
-      Yields a raw ADC integer; caller must convert to % using adc_to_percent().
-
-  FORMAT B (device status string from RAK4631 firmware):
-      "Soil: 47% | Bat: 82% | Up: 1h 23m"
-      "Soil: 0%  | Bat: USB | Up: 0h 3m"
-      Yields soil %, battery % (USB → 100), and uptime in seconds directly.
-      No ADC calibration needed — the device already computed the percentage.
+Format B (RAK4631 firmware):
+    "Soil: 47% | Bat: 82% | Up: 1h 23m"
+    "Soil: 0%  | Bat: USB | Up: 0h 3m"
 """
 
 import re
 import time
 from typing import Optional, Tuple
-
-# ---------------------------------------------------------------------------
-# FORMAT A  — legacy: raw ADC integer
-# ---------------------------------------------------------------------------
-
-# Matches:  MOISTURE_RAW=585  or  moisture_raw = 585
-MOISTURE_RAW_RE = re.compile(r"MOISTURE_RAW\s*=\s*(\d+)", re.IGNORECASE)
-
-
-def parse_moisture_raw(text: str) -> Optional[int]:
-    """Return the raw ADC integer from a FORMAT A message, or None."""
-    m = MOISTURE_RAW_RE.search(text or "")
-    if not m:
-        return None
-    return int(m.group(1))
-
-
-def adc_to_percent(adc: int, adc_dry: int, adc_wet: int) -> float:
-    """
-    Convert a raw ADC reading to a 0-100 moisture percentage.
-
-    Supports both polarities:
-      - Capacitive sensors where dry > wet (higher ADC = drier soil)
-      - Resistive sensors where wet > dry (lower ADC = drier soil)
-    Result is clamped to [0.0, 100.0].
-    """
-    if adc_dry == adc_wet:
-        return 0.0
-    if adc_dry > adc_wet:
-        pct = (adc_dry - adc) / (adc_dry - adc_wet) * 100.0
-    else:
-        pct = (adc - adc_dry) / (adc_wet - adc_dry) * 100.0
-    return max(0.0, min(100.0, pct))
-
-
-def make_soil_messages(
-    from_id: str, raw_val: int, adc_dry: int, adc_wet: int
-) -> Tuple[dict, dict]:
-    """
-    Build the two MQTT payloads for FORMAT A messages.
-
-    Returns:
-        (raw_msg, percent_msg)  — both include fromId and ts.
-    """
-    ts = int(time.time())
-    pct = adc_to_percent(raw_val, adc_dry, adc_wet)
-    raw_msg = {"value": raw_val, "fromId": from_id, "ts": ts}
-    pct_msg = {"value": round(pct, 2), "fromId": from_id, "ts": ts}
-    return raw_msg, pct_msg
-
 
 # ---------------------------------------------------------------------------
 # FORMAT B  — device status string (RAK4631 firmware)
