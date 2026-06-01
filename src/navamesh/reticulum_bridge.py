@@ -362,9 +362,33 @@ HELP_TEXT = """🌱 Navamesh Gateway — Commands
 
 # ── Map renderer ──────────────────────────────────────────────────────────────
 
-def _resolve_tile_url(cfg: ReticulumBridgeConfig) -> Optional[str]:
+def _resolve_tile_url(cfg: ReticulumBridgeConfig, geo_nodes: dict) -> Optional[str]:
+    """
+    Probe the local tile server using a tile derived from actual node coordinates.
+    Falls back to OSM if unreachable. Fully location-agnostic — no hardcoded coords.
+    """
+    import math
+
+    if geo_nodes:
+        # Pick any node with a GPS fix to derive a real tile coordinate
+        snap = next(iter(geo_nodes.values()))
+        lat, lon = snap.lat, snap.lon
+    else:
+        # No nodes with GPS yet — can't probe, go straight to fallback
+        if cfg.map_tile_fallback:
+            logger.warning("No GPS nodes available to probe tile server — falling back to OSM")
+            return cfg.map_tile_fallback
+        return None
+
+    z = 14
+    n = 2 ** z
+    x = int((lon + 180.0) / 360.0 * n)
+    lat_r = math.radians(lat)
+    y = int((1.0 - math.log(math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * n)
+    test_url = cfg.map_tile_url.format(z=z, x=x, y=y)
+
     try:
-        urllib.request.urlopen("http://127.0.0.1:8080/", timeout=2)
+        urllib.request.urlopen(test_url, timeout=2)
         return cfg.map_tile_url
     except Exception:
         if cfg.map_tile_fallback:
@@ -417,7 +441,7 @@ def render_map(
     if not geo_nodes:
         return None
 
-    tile_url = _resolve_tile_url(cfg)
+    tile_url = _resolve_tile_url(cfg, geo_nodes)
     if not tile_url:
         return None
 
