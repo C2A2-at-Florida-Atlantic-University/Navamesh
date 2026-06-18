@@ -48,6 +48,12 @@ Optional env vars:
   SOIL_WET_THRESHOLD      — soil % for blue pin (default: 60)
   SOIL_DRY_THRESHOLD      — soil % for red pin (default: 30)
 
+  # Map outlier guardrail (keeps a far-away cluster from zooming out the farm map)
+  MAP_OUTLIER_GUARD_ENABLED        — true/false (default: true)
+  MAP_MESH_NEIGHBOR_RADIUS_METERS  — link two nodes if within this (default: 800)
+  MAP_OUTLIER_MIN_NODES            — min main-mesh size to enable filtering (default: 3)
+  MAP_SEPARATE_FARM_DISTANCE_METERS— omit clusters at least this far away (default: 3000)
+
 Dependencies:
   pip install rns lxmf paho-mqtt python-dotenv psycopg
   pip install staticmap pillow    # optional — only needed for map rendering
@@ -65,7 +71,7 @@ import threading
 import time
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(usecwd=True))
@@ -155,6 +161,10 @@ class ReticulumBridgeConfig:
     map_max_bytes: int
     soil_wet_threshold: float
     soil_dry_threshold: float
+    map_outlier_guard_enabled: bool
+    map_mesh_neighbor_radius_m: float
+    map_outlier_min_nodes: int
+    map_separate_farm_distance_m: float
     pg_dsn: str
 
 
@@ -168,6 +178,12 @@ def load_rns_config() -> ReticulumBridgeConfig:
     def _float(name: str, default: float) -> float:
         v = os.getenv(name)
         return float(v) if v else default
+
+    def _bool(name: str, default: bool) -> bool:
+        v = os.getenv(name)
+        if v is None or v == "":
+            return default
+        return v.strip().lower() in {"1", "true", "yes", "on"}
 
     return ReticulumBridgeConfig(
         rns_config_dir=os.getenv("RNS_CONFIG_DIR", os.path.expanduser("~/.reticulum")),
@@ -191,6 +207,10 @@ def load_rns_config() -> ReticulumBridgeConfig:
         map_max_bytes=profile["max_bytes"],
         soil_wet_threshold=_float("SOIL_WET_THRESHOLD", 60.0),
         soil_dry_threshold=_float("SOIL_DRY_THRESHOLD", 30.0),
+        map_outlier_guard_enabled=_bool("MAP_OUTLIER_GUARD_ENABLED", True),
+        map_mesh_neighbor_radius_m=_float("MAP_MESH_NEIGHBOR_RADIUS_METERS", 800.0),
+        map_outlier_min_nodes=_int("MAP_OUTLIER_MIN_NODES", 3),
+        map_separate_farm_distance_m=_float("MAP_SEPARATE_FARM_DISTANCE_METERS", 3000.0),
         pg_dsn=os.getenv("PG_DSN", ""),
     )
 
@@ -212,6 +232,20 @@ class NodeSnapshot:
     alt: Optional[float] = None
     rx_rssi: Optional[float] = None
     rx_snr: Optional[float] = None
+
+
+@dataclass
+class MeshSelection:
+    """Result of splitting GPS nodes into a main mesh + separated outlier clusters."""
+    plotted: Dict[str, NodeSnapshot]
+    omitted: List[Dict[str, NodeSnapshot]]
+    nearest_omitted_m: Optional[float] = None
+    # (node_id, distance from that node's component to the main mesh, in meters)
+    omitted_detail: List[Tuple[str, float]] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.omitted_detail is None:
+            self.omitted_detail = []
 
 
 def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
@@ -430,6 +464,115 @@ def _best_zoom(lats, lons, px: int) -> int:
     return 14
 
 
+# ── Connected-cluster outlier guardrail ──────────────────────────────────────
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points, in meters."""
+    R = 6_371_000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _connected_components(
+    geo_nodes: Dict[str, NodeSnapshot],
+    radius_m: float,
+) -> List[Dict[str, NodeSnapshot]]:
+    """
+    Group GPS nodes into connected components. Two nodes are connected if their
+    haversine distance is <= radius_m. Connectivity is transitive, so a long
+    A-B-C-D chain stays a single component even if A and D are far apart.
+    Returns components as node-id->snapshot dicts, sorted largest-first.
+    """
+    ids = list(geo_nodes.keys())
+    visited: set = set()
+    components: List[Dict[str, NodeSnapshot]] = []
+
+    for start in ids:
+        if start in visited:
+            continue
+        # BFS over neighbours within radius
+        comp_ids = []
+        queue = [start]
+        visited.add(start)
+        while queue:
+            cur = queue.pop()
+            comp_ids.append(cur)
+            cs = geo_nodes[cur]
+            for other in ids:
+                if other in visited:
+                    continue
+                os_ = geo_nodes[other]
+                if _haversine_m(cs.lat, cs.lon, os_.lat, os_.lon) <= radius_m:
+                    visited.add(other)
+                    queue.append(other)
+        components.append({nid: geo_nodes[nid] for nid in comp_ids})
+
+    components.sort(key=len, reverse=True)
+    return components
+
+
+def _select_main_mesh(
+    geo_nodes: Dict[str, NodeSnapshot],
+    cfg: ReticulumBridgeConfig,
+) -> MeshSelection:
+    """
+    Split GPS nodes into a rendered set (main farm mesh + nearby stragglers) and
+    clearly-separated outlier clusters that should be omitted from the normal map.
+
+    Guard is skipped (everything plotted) when disabled, when there are fewer than
+    map_outlier_min_nodes GPS nodes, or when the largest component itself is smaller
+    than map_outlier_min_nodes (no real mesh — never hide most nodes).
+    """
+    if (
+        not cfg.map_outlier_guard_enabled
+        or len(geo_nodes) < cfg.map_outlier_min_nodes
+    ):
+        return MeshSelection(plotted=dict(geo_nodes), omitted=[])
+
+    components = _connected_components(geo_nodes, cfg.map_mesh_neighbor_radius_m)
+    main = components[0]
+    if len(main) < cfg.map_outlier_min_nodes:
+        return MeshSelection(plotted=dict(geo_nodes), omitted=[])
+
+    plotted: Dict[str, NodeSnapshot] = dict(main)
+    omitted: List[Dict[str, NodeSnapshot]] = []
+    omitted_detail: List[Tuple[str, float]] = []
+
+    for comp in components[1:]:
+        # Min distance from this component to the current main mesh.
+        comp_dist = min(
+            _haversine_m(cs.lat, cs.lon, ms.lat, ms.lon)
+            for cs in comp.values()
+            for ms in main.values()
+        )
+        if comp_dist >= cfg.map_separate_farm_distance_m:
+            omitted.append(comp)
+            for nid in comp:
+                omitted_detail.append((nid, comp_dist))
+        else:
+            # Nearby straggler — fold into the plotted set.
+            plotted.update(comp)
+
+    nearest_omitted_m: Optional[float] = None
+    if omitted:
+        nearest_omitted_m = min(
+            _haversine_m(os_.lat, os_.lon, ps.lat, ps.lon)
+            for comp in omitted
+            for os_ in comp.values()
+            for ps in plotted.values()
+        )
+
+    return MeshSelection(
+        plotted=plotted,
+        omitted=omitted,
+        nearest_omitted_m=nearest_omitted_m,
+        omitted_detail=omitted_detail,
+    )
+
+
 def render_map(
     nodes: Dict[str, NodeSnapshot],
     cfg: ReticulumBridgeConfig,
@@ -469,39 +612,98 @@ def render_map(
     except TypeError:
         font = ImageFont.load_default()
 
-    placed = []
+    pin_r  = 18
+    margin = max(14, render_size // 80)
+
+    # Pixel center + collision box for every pin, so labels can avoid covering
+    # pins other than the one they belong to.
+    pin_centers: Dict[str, Tuple[int, int]] = {}
+    pin_boxes: Dict[str, Tuple[int, int, int, int]] = {}
     for node_id, snap in geo_nodes.items():
         px, py = _lonlat_to_pixel(
             snap.lon, snap.lat, center_lon, center_lat,
             zoom, render_size, render_size,
         )
+        pin_centers[node_id] = (px, py)
+        pin_boxes[node_id] = (px - pin_r, py - pin_r, px + pin_r, py + pin_r)
+
+    def _overlap_area(a, b) -> float:
+        dx = min(a[2], b[2]) - max(a[0], b[0])
+        dy = min(a[3], b[3]) - max(a[1], b[1])
+        return dx * dy if dx > 0 and dy > 0 else 0.0
+
+    def _out_of_bounds(box) -> float:
+        """Area of the box falling outside the image rectangle."""
+        total = (box[2] - box[0]) * (box[3] - box[1])
+        inside = _overlap_area(box, (0, 0, render_size, render_size))
+        return max(0.0, total - inside)
+
+    # 8 compass directions, tried at increasing distances.
+    DIRECTIONS = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
+    placed: List[Tuple[int, int, int, int]] = []
+
+    for node_id, snap in geo_nodes.items():
+        px, py = pin_centers[node_id]
         soil_str = f"{snap.soil_percent:.0f}%" if snap.soil_percent is not None else "?"
         bat_str  = "USB" if snap.battery_usb else (
             f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "?"
         )
         label = f"{node_id[-4:]}\nS:{soil_str} B:{bat_str}"
-        pin_r  = 18
-        margin = max(14, render_size // 80)
 
-        chosen_lx, chosen_ly, chosen_box = None, None, None
-        for sx, sy in [(1, 1), (-1, 1), (1, -1), (-1, -1)]:
-            lx = px + sx * (pin_r + margin)
-            ly = py - sy * (pin_r + margin)
-            b  = draw.textbbox((lx, ly), label, font=font)
-            box = (b[0] - 4, b[1] - 4, b[2] + 4, b[3] + 4)
-            if not any(
-                not (box[2] < p[0] or box[0] > p[2] or box[3] < p[1] or box[1] > p[3])
-                for p in placed
-            ):
-                chosen_lx, chosen_ly, chosen_box = lx, ly, box
+        b0 = draw.textbbox((0, 0), label, font=font)
+        lw = b0[2] - b0[0]
+        lh = b0[3] - b0[1]
+        other_pins = [box for nid, box in pin_boxes.items() if nid != node_id]
+
+        def _anchor_for(dirx, diry, dist):
+            if dirx > 0:   ax = px + dist
+            elif dirx < 0: ax = px - dist - lw
+            else:          ax = px - lw / 2
+            if diry > 0:   ay = py + dist
+            elif diry < 0: ay = py - dist - lh
+            else:          ay = py - lh / 2
+            # Clamp inside the image so labels are never clipped at the edge.
+            # (4 px keeps the box's padding inside; if the label is wider/taller
+            # than the image the range collapses and _out_of_bounds catches it.)
+            max_x = render_size - lw - 4
+            max_y = render_size - lh - 4
+            if max_x >= 4: ax = min(max(ax, 4), max_x)
+            if max_y >= 4: ay = min(max(ay, 4), max_y)
+            return int(ax), int(ay)
+
+        def _box_for(ax, ay):
+            return (ax - 4, ay - 4, ax + lw + 4, ay + lh + 4)
+
+        chosen = None
+        candidates = []
+        for mult in (1, 2, 3):
+            dist = mult * (pin_r + margin)
+            for dirx, diry in DIRECTIONS:
+                ax, ay = _anchor_for(dirx, diry, dist)
+                box = _box_for(ax, ay)
+                label_ov = sum(_overlap_area(box, p) for p in placed)
+                pin_ov   = sum(_overlap_area(box, p) for p in other_pins)
+                oob      = _out_of_bounds(box)
+                candidates.append((ax, ay, box, label_ov, pin_ov, oob))
+                if label_ov == 0 and pin_ov == 0 and oob == 0:
+                    chosen = (ax, ay, box)
+                    break
+            if chosen:
                 break
-        if chosen_box is None:
-            lx = px + (pin_r + margin)
-            ly = py - (pin_r + margin)
-            b  = draw.textbbox((lx, ly), label, font=font)
-            chosen_lx, chosen_ly = lx, ly
-            chosen_box = (b[0] - 4, b[1] - 4, b[2] + 4, b[3] + 4)
 
+        if chosen is None:
+            # No clean spot — pick the least-bad candidate. Area/penalty terms are
+            # weighted to dominate the small distance-from-pin tie-breaker.
+            def _score(c):
+                ax, ay, box, label_ov, pin_ov, oob = c
+                cx = (box[0] + box[2]) / 2
+                cy = (box[1] + box[3]) / 2
+                dist = math.hypot(cx - px, cy - py)
+                return 10.0 * (label_ov + pin_ov + oob) + dist
+            best = min(candidates, key=_score)
+            chosen = (best[0], best[1], best[2])
+
+        chosen_lx, chosen_ly, chosen_box = chosen
         placed.append(chosen_box)
         draw.rectangle(chosen_box, fill=(0, 0, 0, 200))
         draw.text((chosen_lx, chosen_ly), label, fill="white", font=font)
@@ -566,34 +768,73 @@ def handle_command(
         else:
             map_nodes = nodes
 
-        geo_count    = sum(1 for s in map_nodes.values() if s.lat is not None)
-        no_gps       = len(map_nodes) - geo_count
-        image_result = render_map(map_nodes, cfg)
+        geo = {nid: s for nid, s in map_nodes.items()
+               if s.lat is not None and s.lon is not None}
+        no_gps = len(map_nodes) - len(geo)
+
+        if target:
+            # Explicitly requested node — never filter; render even if far away.
+            sel = MeshSelection(plotted=dict(geo), omitted=[])
+        else:
+            sel = _select_main_mesh(geo, cfg)
+            if sel.omitted:
+                logger.info(
+                    "Map outlier guard omitted %d node(s): %s",
+                    len(sel.omitted_detail),
+                    ", ".join(
+                        f"{nid} ({dist / 1000:.1f} km)" for nid, dist in sel.omitted_detail
+                    ),
+                )
+
+        plotted       = sel.plotted
+        omitted_count = sum(len(c) for c in sel.omitted)
+        image_result  = render_map(plotted, cfg)
+
+        def _sep_str(m: float) -> str:
+            return f"{m / 1000:.1f} km" if m >= 1000 else f"{m:.0f} m"
 
         if image_result:
-            lines = [f"🗺️ Map: {geo_count} node(s) plotted"]
+            lines = [f"🗺️ Map: {len(plotted)} GPS node(s) plotted"]
+            if sel.omitted and sel.nearest_omitted_m is not None:
+                lines.append(
+                    f"⚠️ {omitted_count} GPS node(s) omitted as separate cluster, "
+                    f"nearest {_sep_str(sel.nearest_omitted_m)} from main mesh"
+                )
             if no_gps:
                 lines.append(f"⚠️ {no_gps} node(s) missing GPS")
             text_reply = "\n".join(lines)
         else:
-            lines = [_header(f"🗺️  Navamesh Map  ({len(map_nodes)} node(s))")]
-            for node_id, snap in sorted(map_nodes.items()):
+            # Text fallback: list only the nodes intended for the image so the reply
+            # never implies omitted-cluster nodes were drawn. For 'map <id>' show the
+            # requested node even when it has no GPS fix.
+            listed = map_nodes if target else plotted
+            lines = [_header(f"🗺️  Navamesh Map  ({len(listed)} node(s))")]
+            for node_id, snap in sorted(listed.items()):
                 soil_str = f"{snap.soil_percent:.1f}%" if snap.soil_percent is not None else "no data"
                 bat_str  = "USB" if snap.battery_usb else (
                     f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "no data"
                 )
-                gps_str  = f"{snap.lat:.5f}, {snap.lon:.5f}" if snap.lat is not None else "no GPS"
+                gps_str  = (
+                    f"{snap.lat:.5f}, {snap.lon:.5f}"
+                    if snap.lat is not None and snap.lon is not None
+                    else "no GPS"
+                )
                 lines += [
                     f"  {_fmt_node(node_id)} ({node_id})",
                     f"    Soil:    {soil_str}",
                     f"    Battery: {bat_str}",
                     f"    GPS:     {gps_str}", "",
                 ]
+            if sel.omitted and sel.nearest_omitted_m is not None:
+                lines.append(
+                    f"⚠️  {omitted_count} GPS node(s) omitted as separate cluster, "
+                    f"nearest {_sep_str(sel.nearest_omitted_m)} from main mesh."
+                )
             if no_gps:
                 lines.append(f"⚠️  {no_gps} node(s) have no GPS fix — omitted from map.")
             if not MAP_AVAILABLE:
                 lines.append("ℹ️  Map unavailable — install staticmap+pillow on the Pi.")
-            elif geo_count == 0:
+            elif len(geo) == 0:
                 lines.append("ℹ️  Map unavailable — no nodes have GPS coordinates yet.")
             else:
                 lines.append("ℹ️  Map unavailable — tile server unreachable.")
