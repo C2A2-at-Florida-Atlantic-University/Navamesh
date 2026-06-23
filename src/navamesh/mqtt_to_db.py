@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -46,6 +47,136 @@ def _load_ignored_nodes() -> frozenset:
 GATEWAY_NODE_IDS = _load_ignored_nodes()
 
 CLOUD_RETRY_INTERVAL = int(os.getenv("CLOUD_RETRY_INTERVAL", "30"))
+# After this many consecutive failed flush attempts, an UNKNOWN (unclassifiable)
+# error is dead-lettered so it can't block the head of the queue forever. Known
+# connectivity/429/5xx outages are never capped — they stay queued to avoid data loss.
+CLOUD_QUEUE_MAX_ATTEMPTS = int(os.getenv("CLOUD_QUEUE_MAX_ATTEMPTS", "50"))
+# Max length of an error body stored/logged for a dead-lettered row (defensive cap).
+CLOUD_ERROR_BODY_MAX = int(os.getenv("CLOUD_ERROR_BODY_MAX", "2000"))
+
+
+# --- Cloud-sync failure classification ------------------------------------------------
+TRANSIENT = "transient"            # keep queued, retry later, preserve FIFO
+DROP_RETENTION = "drop_retention"  # timestamp aged out of retention — drop the row
+PERMANENT = "permanent"            # will never succeed — dead-letter with diagnostics
+UNKNOWN = "unknown"                # unclassifiable — retry, but cap to avoid blocking
+
+_RETENTION_MARKERS = ("retention period", "outside the retention")
+
+# (pattern, replacement) pairs that scrub secrets from error text before it is
+# logged or persisted.
+_SECRET_PATTERNS = [
+    (re.compile(r"(token=)[^&\s\"']+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(password=)[^&\s\"']+", re.IGNORECASE), r"\1***"),
+    # Mask the ENTIRE Authorization header value (e.g. "Bearer SECRET"), up to EOL.
+    (re.compile(r"(authorization\s*[:=]\s*)[^\r\n]+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(bearer\s+)\S+", re.IGNORECASE), r"\1***"),
+    # Mask the password component of a URI-style DSN: scheme://user:PASSWORD@host
+    (re.compile(r"(://[^:/@\s]+:)[^@\s]+(@)"), r"\1***\2"),
+]
+# Env vars whose literal values must never appear in logs/dead-letter rows.
+_SECRET_ENV_VARS = (
+    "INFLUX_TOKEN", "INFLUX_CLOUD_TOKEN", "PG_DSN", "PG_CLOUD_DSN",
+)
+
+
+def _redact_text(text: str) -> str:
+    """Mask credentials in arbitrary error text before logging or persisting."""
+    if not text:
+        return ""
+    for pat, repl in _SECRET_PATTERNS:
+        text = pat.sub(repl, text)
+    for var in _SECRET_ENV_VARS:
+        val = os.getenv(var, "")
+        if val and val in text:
+            text = text.replace(val, "***")
+    return text
+
+
+def _redact_and_cap(text: object) -> str:
+    """Redact secrets then length-cap a single diagnostic component."""
+    out = _redact_text(str(text))
+    if len(out) > CLOUD_ERROR_BODY_MAX:
+        out = out[:CLOUD_ERROR_BODY_MAX] + "…(truncated)"
+    return out
+
+
+def _redact_error(exc: Exception) -> str:
+    """Build a fully-redacted, length-capped one-line diagnostic for an exception.
+
+    Every component (reason, body/message) is independently redacted and capped.
+    """
+    parts: List[str] = []
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        parts.append(f"HTTP {status}")
+    reason = getattr(exc, "reason", None)
+    if reason:
+        parts.append(_redact_and_cap(reason))
+    body = getattr(exc, "body", None) or getattr(exc, "message", None) or str(exc)
+    parts.append(f"{type(exc).__name__}: {_redact_and_cap(body)}")
+    return " | ".join(parts)
+
+
+def _mentions_retention(exc: Exception) -> bool:
+    text = " ".join(
+        str(getattr(exc, attr, "") or "") for attr in ("body", "message")
+    )
+    text = (text + " " + str(exc)).lower()
+    return any(marker in text for marker in _RETENTION_MARKERS)
+
+
+def _is_network_error(exc: Exception) -> bool:
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    module = type(exc).__module__ or ""
+    name = type(exc).__name__
+    if module.startswith("urllib3"):
+        return True
+    return "Timeout" in name or "Connection" in name
+
+
+def classify_cloud_failure(exc: Exception, target: str) -> str:
+    """Classify a cloud-write failure to decide retry vs drop vs dead-letter.
+
+    Duck-typed on ``.status`` so it works whether or not influxdb-client is
+    installed (e.g. an ``ApiException`` exposes ``.status``/``.body``).
+    """
+    status = getattr(exc, "status", None)
+    if isinstance(status, bool):
+        status = None
+    if isinstance(status, int):
+        if status == 429 or 500 <= status < 600:
+            return TRANSIENT
+        if status == 400 and _mentions_retention(exc):
+            return DROP_RETENTION
+        if 400 <= status < 500:
+            return PERMANENT
+
+    if _is_network_error(exc):
+        return TRANSIENT
+
+    if psycopg is not None:
+        transient_pg = tuple(
+            c for c in (
+                getattr(psycopg, "OperationalError", None),
+                getattr(psycopg, "InterfaceError", None),
+            ) if c is not None
+        )
+        permanent_pg = tuple(
+            c for c in (
+                getattr(psycopg, "DataError", None),
+                getattr(psycopg, "IntegrityError", None),
+                getattr(psycopg, "ProgrammingError", None),
+                getattr(psycopg, "NotSupportedError", None),
+            ) if c is not None
+        )
+        if transient_pg and isinstance(exc, transient_pg):
+            return TRANSIENT
+        if permanent_pg and isinstance(exc, permanent_pg):
+            return PERMANENT
+
+    return UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -165,7 +296,30 @@ class CloudSyncQueue:
                     id        INTEGER PRIMARY KEY AUTOINCREMENT,
                     queued_at INTEGER NOT NULL,
                     target    TEXT    NOT NULL,
-                    payload   TEXT    NOT NULL
+                    payload   TEXT    NOT NULL,
+                    attempts  INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            # Backward-compatible migration: a pre-existing queue.db created by an
+            # older schema has no `attempts` column. Add it so the already-stuck
+            # row is processed on deploy without manually deleting the database.
+            cols = {row[1] for row in self._conn.execute("PRAGMA table_info(sync_queue)")}
+            if "attempts" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE sync_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            # Dead-letter store for entries that will never succeed (additive).
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sync_dead_letter (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    orig_id   INTEGER,
+                    queued_at INTEGER,
+                    failed_at INTEGER NOT NULL,
+                    target    TEXT    NOT NULL,
+                    payload   TEXT    NOT NULL,
+                    error     TEXT
                 )
                 """
             )
@@ -180,13 +334,15 @@ class CloudSyncQueue:
             self._conn.commit()
         logger.debug("Queued failed %s write (queue size=%d).", target, self.size())
 
-    def peek(self, limit: int = 100) -> List[Tuple[int, str, dict]]:
+    def peek(self, limit: int = 100) -> List[Tuple[int, str, str, int]]:
+        # Return the raw payload string (not parsed) so a single corrupt JSON
+        # payload cannot raise here and block flushing of the whole queue.
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, target, payload FROM sync_queue ORDER BY id LIMIT ?",
+                "SELECT id, target, payload, attempts FROM sync_queue ORDER BY id LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [(row[0], row[1], json.loads(row[2])) for row in rows]
+        return [(row[0], row[1], row[2], row[3]) for row in rows]
 
     def delete(self, ids: List[int]) -> None:
         if not ids:
@@ -195,6 +351,69 @@ class CloudSyncQueue:
             placeholders = ",".join("?" * len(ids))
             self._conn.execute(f"DELETE FROM sync_queue WHERE id IN ({placeholders})", ids)
             self._conn.commit()
+
+    def bump_attempts(self, row_id: int) -> int:
+        """Increment the retry counter for a row and return the new value."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sync_queue SET attempts = attempts + 1 WHERE id = ?", (row_id,)
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT attempts FROM sync_queue WHERE id = ?", (row_id,)
+            ).fetchone()
+        return row[0] if row else 0
+
+    def dead_letter(self, row_id: int, error: str) -> None:
+        """Atomically move a queue row to the dead-letter table.
+
+        Reads the original row (preserving its queued_at), inserts a dead-letter
+        record, and deletes the queue row in a single locked transaction.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT queued_at, target, payload FROM sync_queue WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+            if row is None:
+                return
+            queued_at, target, payload = row
+            self._conn.execute(
+                """
+                INSERT INTO sync_dead_letter
+                    (orig_id, queued_at, failed_at, target, payload, error)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (row_id, queued_at, int(time.time()), target, payload, error),
+            )
+            self._conn.execute("DELETE FROM sync_queue WHERE id = ?", (row_id,))
+            self._conn.commit()
+
+    def list_dead_letters(self, limit: int = 100) -> List[Tuple]:
+        """Return dead-lettered rows as
+        (id, orig_id, queued_at, failed_at, target, error, payload)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, orig_id, queued_at, failed_at, target, error, payload "
+                "FROM sync_dead_letter ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [tuple(r) for r in rows]
+
+    def count_dead_letters(self) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM sync_dead_letter"
+            ).fetchone()[0]
+
+    def purge_dead_letters(self) -> int:
+        with self._lock:
+            n = self._conn.execute(
+                "SELECT COUNT(*) FROM sync_dead_letter"
+            ).fetchone()[0]
+            self._conn.execute("DELETE FROM sync_dead_letter")
+            self._conn.commit()
+        return n
 
     def size(self) -> int:
         with self._lock:
@@ -401,6 +620,11 @@ class InfluxWriter:
     def enabled(self) -> bool:
         return self._enabled and InfluxDBClient is not None
 
+    @property
+    def connected(self) -> bool:
+        """True only when a live write API exists (so writes won't silently no-op)."""
+        return self._write_api is not None
+
     def connect(self) -> None:
         if not self._enabled:
             logger.warning("InfluxDB disabled: missing INFLUX_* environment variables.")
@@ -529,7 +753,20 @@ class CloudSyncWorker:
     def _flush(self) -> None:
         rows = self._queue.peek(limit=100)
         flushed = []
-        for row_id, target, payload in rows:
+        for row_id, target, payload_str, attempts in rows:
+            # Parse per row so one corrupt payload cannot abort the whole flush.
+            try:
+                payload = json.loads(payload_str)
+            except Exception as e:
+                logger.error(
+                    "Cloud sync: dead-lettering row id=%d with malformed payload: %s",
+                    row_id, type(e).__name__,
+                )
+                self._queue.dead_letter(
+                    row_id, f"malformed payload JSON: {type(e).__name__}"
+                )
+                continue
+
             try:
                 state = _state_from_dict(payload)
                 if target == "pg":
@@ -538,19 +775,66 @@ class CloudSyncWorker:
                         payload.get("location_name", ""),
                         payload.get("node_type", ""),
                     )
-                elif target == "influx":
-                    self._influx.write_soil(state)
-                elif target == "influx_link":
-                    self._influx.write_link(state)
-                elif target == "influx_position":
-                    self._influx.write_position(state)
+                elif target in ("influx", "influx_link", "influx_position"):
+                    # Never count a write as flushed when the destination is down:
+                    # InfluxWriter.write_*() silently no-ops if _write_api is None,
+                    # which would delete the row without persisting it. Treat an
+                    # unconnected writer as a transient failure so the row is kept.
+                    if not self._influx.connected:
+                        raise ConnectionError("cloud InfluxDB not connected")
+                    if target == "influx":
+                        self._influx.write_soil(state)
+                    elif target == "influx_link":
+                        self._influx.write_link(state)
+                    else:
+                        self._influx.write_position(state)
+                else:
+                    # Never silently mark an unsupported target as flushed.
+                    logger.error(
+                        "Cloud sync: dead-lettering row id=%d with unknown target=%r",
+                        row_id, target,
+                    )
+                    self._queue.dead_letter(row_id, f"unknown target: {target!r}")
+                    continue
                 flushed.append(row_id)
             except Exception as e:
-                logger.debug("Flush failed for queue id=%d target=%s: %s", row_id, target, e)
-                break  # cloud still unreachable — stop and wait for next interval
+                category = classify_cloud_failure(e, target)
+                diag = _redact_error(e)
+                # Track attempts on every failed write for observability...
+                attempt_count = self._queue.bump_attempts(row_id)
+
+                if category == DROP_RETENTION:
+                    logger.warning(
+                        "Cloud sync: dropping stale row id=%d (outside retention): %s",
+                        row_id, diag,
+                    )
+                    self._queue.delete([row_id])
+                    continue
+                if category == PERMANENT:
+                    logger.error(
+                        "Cloud sync: dead-lettering row id=%d target=%s (permanent): %s",
+                        row_id, target, diag,
+                    )
+                    self._queue.dead_letter(row_id, diag)
+                    continue
+                # ...but only UNKNOWN errors are capped. Known connectivity/429/5xx
+                # outages stay queued indefinitely so we never lose data.
+                if category == UNKNOWN and attempt_count >= CLOUD_QUEUE_MAX_ATTEMPTS:
+                    logger.error(
+                        "Cloud sync: dead-lettering row id=%d after %d attempts (unknown): %s",
+                        row_id, attempt_count, diag,
+                    )
+                    self._queue.dead_letter(row_id, diag)
+                    continue
+
+                logger.info(
+                    "Cloud sync: transient failure on id=%d (attempt %d), will retry: %s",
+                    row_id, attempt_count, diag,
+                )
+                break  # preserve FIFO — stop and wait for the next interval
         if flushed:
             self._queue.delete(flushed)
-            logger.info("Cloud sync: flushed %d/%d queued writes.", len(flushed), len(rows))
+            logger.info("Cloud sync: flushed %d queued writes.", len(flushed))
 
 
 class MqttToDbIngestor:

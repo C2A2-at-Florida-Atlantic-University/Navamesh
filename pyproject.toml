@@ -19,10 +19,18 @@ db = [
     "psycopg[binary]",
     "influxdb-client",
 ]
+test = [
+    "pytest",
+]
 
 [project.scripts]
 navamesh-bridge  = "navamesh._bridge:main"
 navamesh-ingest  = "navamesh.mqtt_to_db:main"
+navamesh-sync-admin = "navamesh.sync_admin:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
