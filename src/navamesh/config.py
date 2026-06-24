@@ -1,6 +1,22 @@
 import os
 from dataclasses import dataclass
 
+FARM_ID_ALIASES = {
+    "farm1": "farm1",
+    "farm_1": "farm1",
+    "farm2": "farm2",
+    "farm_2": "farm2",
+}
+
+
+def normalize_farm_id(value: str) -> str:
+    """Return the canonical farm ID, rejecting unconfigured farms."""
+    normalized = FARM_ID_ALIASES.get(value.strip().lower())
+    if normalized is None:
+        allowed = ", ".join(sorted(FARM_ID_ALIASES))
+        raise ValueError(f"Unknown FARM_ID {value!r}; expected one of: {allowed}")
+    return normalized
+
 @dataclass(frozen=True)
 class Config:
     serial_port: str
@@ -31,5 +47,5 @@ def load_config() -> Config:
         root_sensors=os.getenv("ROOT_SENSORS", "farm/sensors"),
         root_nodes=os.getenv("ROOT_NODES", "farm/nodes"),
 
-        farm_id=os.getenv("FARM_ID", "farm_1"),
+        farm_id=normalize_farm_id(os.getenv("FARM_ID", "farm1")),
     )

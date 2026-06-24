@@ -18,6 +18,12 @@ import paho.mqtt.client as mqtt
 
 from navamesh.config import load_config
 
+POSTGRES_TABLES = frozenset({"mesh_nodes", "mesh_nodes_farm1", "mesh_nodes_farm2"})
+FARM_CLOUD_TABLES = {
+    "farm1": "mesh_nodes_farm1",
+    "farm2": "mesh_nodes_farm2",
+}
+
 try:
     import psycopg
 except Exception:  # pragma: no cover
@@ -424,8 +430,11 @@ class CloudSyncQueue:
 
 
 class PostgresWriter:
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, table_name: str = "mesh_nodes"):
+        if table_name not in POSTGRES_TABLES:
+            raise ValueError(f"Postgres table is not allowlisted: {table_name!r}")
         self._dsn = dsn
+        self._table_name = table_name
         self._conn = None
         self._enabled = bool(dsn)
 
@@ -474,11 +483,16 @@ class PostgresWriter:
     def ensure_schema(self) -> None:
         if self._conn is None:
             return
+        # The constructor strictly allowlists this identifier; no environment or
+        # request value can be interpolated into these statements.
+        table = self._table_name
+        node_index = f"idx_{table}_node_id"
+        geom_index = f"idx_{table}_geom"
         # Create core table (IF NOT EXISTS is a no-op for existing tables)
         with self._conn.cursor() as cur:
             cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS mesh_nodes (
+                f"""
+                CREATE TABLE IF NOT EXISTS {table} (
                     node_id   TEXT PRIMARY KEY,
                     last_seen TIMESTAMPTZ DEFAULT now(),
                     lat       DOUBLE PRECISION,
@@ -491,48 +505,49 @@ class PostgresWriter:
         with self._conn.cursor() as cur:
             try:
                 cur.execute(
-                    """
+                    f"""
                     DO $$ BEGIN
                         IF NOT EXISTS (
                             SELECT 1 FROM pg_constraint c
                             JOIN pg_class t ON c.conrelid = t.oid
-                            WHERE c.contype = 'p' AND t.relname = 'mesh_nodes'
+                            WHERE c.contype = 'p' AND t.relname = '{table}'
                         ) THEN
-                            ALTER TABLE mesh_nodes ADD PRIMARY KEY (node_id);
+                            ALTER TABLE {table} ADD PRIMARY KEY (node_id);
                         END IF;
                     END $$;
                     """
                 )
             except Exception as e:
-                logger.warning("Could not add PRIMARY KEY to mesh_nodes: %s", e)
+                logger.warning("Could not add PRIMARY KEY to %s: %s", table, e)
         # Belt-and-suspenders: unique index guarantees ON CONFLICT (node_id) works
         # even if the PRIMARY KEY migration above failed.
         with self._conn.cursor() as cur:
             try:
                 cur.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_mesh_nodes_node_id"
-                    " ON mesh_nodes (node_id);"
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {node_index}"
+                    f" ON {table} (node_id);"
                 )
             except Exception as e:
-                logger.warning("Could not create unique index on mesh_nodes.node_id: %s", e)
+                logger.warning("Could not create unique index on %s.node_id: %s", table, e)
         # PostGIS geom column — optional, isolated so its failure doesn't break the rest
         with self._conn.cursor() as cur:
             try:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
                 cur.execute(
-                    """
+                    f"""
                     DO $$ BEGIN
                         IF NOT EXISTS (
                             SELECT 1 FROM information_schema.columns
-                            WHERE table_name = 'mesh_nodes' AND column_name = 'geom'
+                            WHERE table_schema = 'public'
+                              AND table_name = '{table}' AND column_name = 'geom'
                         ) THEN
-                            ALTER TABLE mesh_nodes ADD COLUMN geom geometry(Point, 4326);
+                            ALTER TABLE {table} ADD COLUMN geom geometry(Point, 4326);
                         END IF;
                     END $$;
                     """
                 )
                 cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_mesh_nodes_geom ON mesh_nodes USING GIST (geom);"
+                    f"CREATE INDEX IF NOT EXISTS {geom_index} ON {table} USING GIST (geom);"
                 )
                 self._postgis = True
             except Exception as e:
@@ -547,13 +562,14 @@ class PostgresWriter:
         ts = state.last_seen_ts or int(datetime.now(tz=timezone.utc).timestamp())
         metadata_json = json.dumps(state.metadata(location_name, node_type))
         has_coords = state.lat is not None and state.lon is not None
+        table = self._table_name
 
         try:
             with self._conn.cursor() as cur:
                 if has_coords and getattr(self, "_postgis", False):
                     cur.execute(
-                        """
-                        INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, geom, metadata)
+                        f"""
+                        INSERT INTO {table} (node_id, last_seen, lat, lon, geom, metadata)
                         VALUES (
                             %s,
                             to_timestamp(%s),
@@ -573,8 +589,8 @@ class PostgresWriter:
                     )
                 elif has_coords:
                     cur.execute(
-                        """
-                        INSERT INTO mesh_nodes (node_id, last_seen, lat, lon, metadata)
+                        f"""
+                        INSERT INTO {table} (node_id, last_seen, lat, lon, metadata)
                         VALUES (%s, to_timestamp(%s), %s, %s, %s::jsonb)
                         ON CONFLICT (node_id) DO UPDATE SET
                             last_seen = EXCLUDED.last_seen,
@@ -586,8 +602,8 @@ class PostgresWriter:
                     )
                 else:
                     cur.execute(
-                        """
-                        INSERT INTO mesh_nodes (node_id, last_seen, metadata)
+                        f"""
+                        INSERT INTO {table} (node_id, last_seen, metadata)
                         VALUES (%s, to_timestamp(%s), %s::jsonb)
                         ON CONFLICT (node_id) DO UPDATE SET
                             last_seen = EXCLUDED.last_seen,
@@ -595,7 +611,7 @@ class PostgresWriter:
                         """,
                         (state.node_id, ts, metadata_json),
                     )
-            logger.info("Upserted mesh_nodes row for %s (coords=%s).", state.node_id, has_coords)
+            logger.info("Upserted %s row for %s (coords=%s).", table, state.node_id, has_coords)
         except Exception:
             self._conn = None  # mark stale so next call reconnects
             raise
@@ -846,7 +862,7 @@ class MqttToDbIngestor:
         self.stop_event = threading.Event()
 
         # Local writers — primary, always write
-        self.pg = PostgresWriter(self.db_cfg.pg_dsn)
+        self.pg = PostgresWriter(self.db_cfg.pg_dsn, "mesh_nodes")
         self.influx = InfluxWriter(
             url=self.db_cfg.influx_url,
             token=self.db_cfg.influx_token,
@@ -855,7 +871,10 @@ class MqttToDbIngestor:
         )
 
         # Cloud writers — secondary, best-effort
-        self.pg_cloud = PostgresWriter(self.db_cfg.pg_cloud_dsn)
+        self.pg_cloud = PostgresWriter(
+            self.db_cfg.pg_cloud_dsn,
+            FARM_CLOUD_TABLES[self.cfg.farm_id],
+        )
         self.influx_cloud = InfluxWriter(
             url=self.db_cfg.influx_cloud_url,
             token=self.db_cfg.influx_cloud_token,

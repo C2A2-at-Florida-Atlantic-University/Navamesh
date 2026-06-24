@@ -8,6 +8,9 @@ This repo contains the modular Python bridge that:
 - Publishes into Mosquitto on `127.0.0.1:1883`
 - Outputs clean MQTT topics for downstream storage and dashboards
 
+Farm-specific cloud PostgreSQL isolation and the safe rollout procedure are
+documented in [docs/farm-isolation-deployment.md](docs/farm-isolation-deployment.md).
+
 ---
 
 ## Architecture
@@ -155,7 +158,6 @@ Stop the bridge, then:
 Verify:
 
 -`mosquitto_sub -h 127.0.0.1 -p 1883 -t "#" -v`
-
 
 
 
