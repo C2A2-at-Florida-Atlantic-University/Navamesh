@@ -165,6 +165,16 @@ class ReticulumBridgeConfig:
     map_mesh_neighbor_radius_m: float
     map_outlier_min_nodes: int
     map_separate_farm_distance_m: float
+    # Offline tile-cache bounds (shared with cache_tiles.py). When all four
+    # lat/lon bounds are set, the map renderer constrains itself to the cached
+    # farm extent instead of recentering on individual nodes. Optional — None
+    # when unset, in which case the legacy node-centered behavior is preserved.
+    cache_lat_min: Optional[float]
+    cache_lat_max: Optional[float]
+    cache_lon_min: Optional[float]
+    cache_lon_max: Optional[float]
+    cache_zoom_min: Optional[int]
+    cache_zoom_max: Optional[int]
     pg_dsn: str
 
 
@@ -184,6 +194,24 @@ def load_rns_config() -> ReticulumBridgeConfig:
         if v is None or v == "":
             return default
         return v.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _opt_float(name: str) -> Optional[float]:
+        v = os.getenv(name)
+        if v in (None, ""):
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+
+    def _opt_int(name: str) -> Optional[int]:
+        v = os.getenv(name)
+        if v in (None, ""):
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            return None
 
     return ReticulumBridgeConfig(
         rns_config_dir=os.getenv("RNS_CONFIG_DIR", os.path.expanduser("~/.reticulum")),
@@ -211,6 +239,12 @@ def load_rns_config() -> ReticulumBridgeConfig:
         map_mesh_neighbor_radius_m=_float("MAP_MESH_NEIGHBOR_RADIUS_METERS", 800.0),
         map_outlier_min_nodes=_int("MAP_OUTLIER_MIN_NODES", 3),
         map_separate_farm_distance_m=_float("MAP_SEPARATE_FARM_DISTANCE_METERS", 3000.0),
+        cache_lat_min=_opt_float("CACHE_LAT_MIN"),
+        cache_lat_max=_opt_float("CACHE_LAT_MAX"),
+        cache_lon_min=_opt_float("CACHE_LON_MIN"),
+        cache_lon_max=_opt_float("CACHE_LON_MAX"),
+        cache_zoom_min=_opt_int("CACHE_ZOOM_MIN"),
+        cache_zoom_max=_opt_int("CACHE_ZOOM_MAX"),
         pg_dsn=os.getenv("PG_DSN", ""),
     )
 
@@ -464,6 +498,135 @@ def _best_zoom(lats, lons, px: int) -> int:
     return 14
 
 
+# ── Offline tile-cache bounds + tile-range guard ──────────────────────────────
+#
+# The lat/lon cache box is NOT sufficient on its own: the render viewport is a
+# square of render_size px and _best_zoom() adds padding, so the actual tiles
+# StaticMap requests can spill a row/column past the configured CACHE_* box. The
+# real invariant is "only render if every tile the viewport needs lives inside
+# the cached tile range" — the cache is the authority, node placement secondary.
+
+def _cache_bounds(
+    cfg: ReticulumBridgeConfig,
+) -> Optional[Tuple[float, float, float, float]]:
+    """(lat_min, lat_max, lon_min, lon_max) if all four bounds are configured,
+    else None. Min/max are normalized so swapped values still work."""
+    vals = (cfg.cache_lat_min, cfg.cache_lat_max, cfg.cache_lon_min, cfg.cache_lon_max)
+    if any(v is None for v in vals):
+        return None
+    return (
+        min(cfg.cache_lat_min, cfg.cache_lat_max),
+        max(cfg.cache_lat_min, cfg.cache_lat_max),
+        min(cfg.cache_lon_min, cfg.cache_lon_max),
+        max(cfg.cache_lon_min, cfg.cache_lon_max),
+    )
+
+
+def _within_bounds(
+    lat: Optional[float],
+    lon: Optional[float],
+    bounds: Optional[Tuple[float, float, float, float]],
+) -> bool:
+    if lat is None or lon is None or bounds is None:
+        return False
+    lat_min, lat_max, lon_min, lon_max = bounds
+    return lat_min <= lat <= lat_max and lon_min <= lon <= lon_max
+
+
+def _deg2tile(lat: float, lon: float, zoom: int) -> Tuple[float, float]:
+    """Fractional (x, y) tile coordinate for a lat/lon at zoom (Web Mercator)."""
+    n = 2 ** zoom
+    x = (lon + 180.0) / 360.0 * n
+    lat_r = math.radians(lat)
+    y = (1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n
+    return x, y
+
+
+def _tile_range_for_bounds(
+    bounds: Tuple[float, float, float, float],
+    zoom: int,
+) -> Tuple[int, int, int, int]:
+    """Integer (x_min, x_max, y_min, y_max) tile range covering a lat/lon box,
+    matching exactly the tiles cache_tiles.py downloads for the same CACHE_*
+    bounds at this zoom. cache_tiles.py computes
+        x_min, y_max = deg2tile(LAT_MIN, LON_MIN); x_max, y_min = deg2tile(LAT_MAX, LON_MAX)
+    and iterates the inclusive box; we reproduce that mapping here. (Its deg2tile
+    uses log(tan + 1/cos), which is identical to our asinh(tan); both floor via
+    int(), which equals math.floor() for the always-positive tile indices in
+    valid lat/lon range.) Note: y is inverted — larger lat → smaller y."""
+    lat_min, lat_max, lon_min, lon_max = bounds
+    n = 2 ** zoom
+    def _clamp(v: float) -> int:
+        return max(0, min(n - 1, int(math.floor(v))))
+    x0, _ = _deg2tile(lat_min, lon_min, zoom)   # west edge  → x_min
+    x1, _ = _deg2tile(lat_max, lon_max, zoom)   # east edge  → x_max
+    _, y0 = _deg2tile(lat_max, lon_max, zoom)   # top edge (max lat) → y_min
+    _, y1 = _deg2tile(lat_min, lon_min, zoom)   # bottom edge (min lat) → y_max
+    return _clamp(x0), _clamp(x1), _clamp(y0), _clamp(y1)
+
+
+def _tile_range_for_view(
+    center_lat: float,
+    center_lon: float,
+    zoom: int,
+    render_size: int,
+    tile_size: int = 256,
+) -> Tuple[int, int, int, int]:
+    """Integer tile range the square render viewport will request from the tile
+    server, including the half-viewport spill in every direction.
+
+    Conservative at tile edges: floor() for the min indices, ceil() for the max
+    indices, so a viewport that pokes even slightly into the next tile row/column
+    counts that tile. Erring outward here can only make the cache-containment
+    gate stricter (fall back to text), never let a needed edge tile slip past it
+    and 404 at render time."""
+    fx, fy = _deg2tile(center_lat, center_lon, zoom)
+    half = (render_size / 2.0) / tile_size          # half-viewport in tiles
+    n = 2 ** zoom
+    def _lo(v: float) -> int:
+        return max(0, min(n - 1, int(math.floor(v))))
+    def _hi(v: float) -> int:
+        return max(0, min(n - 1, int(math.ceil(v))))
+    return _lo(fx - half), _hi(fx + half), _lo(fy - half), _hi(fy + half)
+
+
+def _tile_range_contains(
+    cache_range: Tuple[int, int, int, int],
+    render_range: Tuple[int, int, int, int],
+) -> bool:
+    """True iff the render tile range is fully inside the cached tile range."""
+    cx0, cx1, cy0, cy1 = cache_range
+    rx0, rx1, ry0, ry1 = render_range
+    return rx0 >= cx0 and rx1 <= cx1 and ry0 >= cy0 and ry1 <= cy1
+
+
+def _preflight_tile_urls(
+    tile_url_template: str,
+    tile_range: Tuple[int, int, int, int],
+    zoom: int,
+    limit: int = 64,
+) -> List[Tuple[int, int, int]]:
+    """Probe the local tile server for the tiles the render needs. Returns a
+    list of missing/unreachable (z, x, y) tiles; short-circuits on the first
+    miss so a missing tile costs one request, and caps total probes at `limit`
+    so a huge extent never floods the server."""
+    x0, x1, y0, y1 = tile_range
+    missing: List[Tuple[int, int, int]] = []
+    probed = 0
+    for x in range(x0, x1 + 1):
+        for y in range(y0, y1 + 1):
+            if probed >= limit:
+                return missing          # too many tiles to preflight — caller decides
+            probed += 1
+            url = tile_url_template.format(z=zoom, x=x, y=y)
+            try:
+                urllib.request.urlopen(url, timeout=2)
+            except Exception:
+                missing.append((zoom, x, y))
+                return missing          # one miss is enough — bail early
+    return missing
+
+
 # ── Connected-cluster outlier guardrail ──────────────────────────────────────
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -576,7 +739,18 @@ def _select_main_mesh(
 def render_map(
     nodes: Dict[str, NodeSnapshot],
     cfg: ReticulumBridgeConfig,
+    bounds: Optional[Tuple[float, float, float, float]] = None,
+    highlight_node_id: Optional[str] = None,
 ) -> Optional[Tuple[str, bytes, str]]:
+    """Render a node map to a JPEG. When ``bounds`` is given the map is locked to
+    that fixed cached-farm extent (center and zoom derived from the bounds, not
+    the nodes) and is rendered only if every required tile lives inside the
+    offline cache — the cache is the authority, node placement secondary. When
+    ``bounds`` is None the legacy node-centered behavior is preserved.
+
+    ``highlight_node_id`` draws that node's marker larger so a requested node
+    stands out. Returns None (so callers fall back to text) on any failure,
+    including missing/uncached tiles."""
     if not MAP_AVAILABLE:
         return None
 
@@ -584,27 +758,74 @@ def render_map(
     if not geo_nodes:
         return None
 
-    tile_url = _resolve_tile_url(cfg, geo_nodes)
-    if not tile_url:
-        return None
-
     max_dimension = cfg.map_max_dimension
     quality       = cfg.map_jpeg_quality
     max_bytes     = cfg.map_max_bytes
 
-    lons_list  = [s.lon for s in geo_nodes.values()]
-    lats_list  = [s.lat for s in geo_nodes.values()]
-    center_lon = (min(lons_list) + max(lons_list)) / 2
-    center_lat = (min(lats_list) + max(lats_list)) / 2
-
     render_size = max(max_dimension * 2, 480)
-    zoom        = _best_zoom(lats_list, lons_list, render_size)
+
+    if bounds is not None:
+        # Fixed cached-farm extent — center/zoom come from the bounds, never the
+        # nodes, so a single requested node can't recenter or over-zoom the map.
+        lat_min, lat_max, lon_min, lon_max = bounds
+        center_lon = (lon_min + lon_max) / 2
+        center_lat = (lat_min + lat_max) / 2
+        zoom = _best_zoom([lat_min, lat_max], [lon_min, lon_max], render_size)
+        if cfg.cache_zoom_max is not None:
+            zoom = min(zoom, cfg.cache_zoom_max)
+        if cfg.cache_zoom_min is not None:
+            zoom = max(zoom, cfg.cache_zoom_min)
+
+        # Tile-range containment gate: refuse to render if the square viewport
+        # needs any tile outside the cached tile range (catches the padding /
+        # square-aspect spill that lat/lon bounds alone don't cover).
+        view_range  = _tile_range_for_view(center_lat, center_lon, zoom, render_size)
+        cache_range = _tile_range_for_bounds(bounds, zoom)
+        if not _tile_range_contains(cache_range, view_range):
+            logger.warning(
+                "Render tile range %s exceeds cache range %s at z%d — text fallback",
+                view_range, cache_range, zoom,
+            )
+            return None
+
+        # Use the local/offline tiles directly and preflight the real render
+        # tiles: a passing zoom-14 probe never implies the chosen-zoom tiles exist.
+        if cfg.map_tile_url:
+            missing = _preflight_tile_urls(cfg.map_tile_url, view_range, zoom)
+            if missing:
+                logger.warning(
+                    "Required local tile(s) missing (e.g. %s) — text fallback", missing[0]
+                )
+                return None
+            tile_url = cfg.map_tile_url
+        else:
+            tile_url = _resolve_tile_url(cfg, geo_nodes)
+            if not tile_url:
+                return None
+    else:
+        # Legacy node-centered path — unchanged.
+        tile_url = _resolve_tile_url(cfg, geo_nodes)
+        if not tile_url:
+            return None
+
+        lons_list  = [s.lon for s in geo_nodes.values()]
+        lats_list  = [s.lat for s in geo_nodes.values()]
+        center_lon = (min(lons_list) + max(lons_list)) / 2
+        center_lat = (min(lats_list) + max(lats_list)) / 2
+        zoom       = _best_zoom(lats_list, lons_list, render_size)
 
     smap = StaticMap(render_size, render_size, url_template=tile_url)
-    for snap in geo_nodes.values():
-        smap.add_marker(CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), 18))
+    for node_id, snap in geo_nodes.items():
+        radius = 26 if node_id == highlight_node_id else 18
+        smap.add_marker(CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), radius))
 
-    image = smap.render(zoom=zoom)
+    try:
+        image = smap.render(zoom=zoom)
+    except RuntimeError as e:
+        # Missing/uncached tiles raise "could not download N tiles" — never let
+        # that crash the command handler; fall back to text instead.
+        logger.error("Map tile render failed (%s) — falling back to text", e)
+        return None
     draw  = ImageDraw.Draw(image)
     font_size = max(28, render_size // 40)
     try:
@@ -772,9 +993,56 @@ def handle_command(
                if s.lat is not None and s.lon is not None}
         no_gps = len(map_nodes) - len(geo)
 
+        # When the offline tile cache is configured, the cached farm box is the
+        # authority: maps render that fixed extent and only plot in-bounds nodes.
+        bounds        = _cache_bounds(cfg)
+        outside_count = 0            # GPS nodes outside offline cache coverage
+        render_bounds: Optional[Tuple[float, float, float, float]] = None
+        highlight: Optional[str]    = None
+
         if target:
-            # Explicitly requested node — never filter; render even if far away.
+            snap = nodes[target]
+            if (
+                bounds is not None
+                and snap.lat is not None
+                and snap.lon is not None
+                and not _within_bounds(snap.lat, snap.lon, bounds)
+            ):
+                # Outside cached coverage — don't render (would pull uncached tiles).
+                return (
+                    f"Node {target} is outside offline map coverage. "
+                    f"GPS: {snap.lat:.5f}, {snap.lon:.5f}",
+                    None,
+                )
+            # Explicitly requested node — never cluster-filter. Plot it onto the
+            # cached farm extent when configured, else legacy single-node render.
             sel = MeshSelection(plotted=dict(geo), omitted=[])
+            if bounds is not None:
+                render_bounds = bounds
+                highlight     = target
+        elif bounds is not None:
+            # Plain `map` with a cache configured: plot in-bounds nodes onto the
+            # fixed farm extent; out-of-bounds nodes are reported, not drawn. The
+            # bounds filter replaces the cluster outlier guard here.
+            in_bounds = {
+                nid: s for nid, s in geo.items()
+                if _within_bounds(s.lat, s.lon, bounds)
+            }
+            outside_count = len(geo) - len(in_bounds)
+            if outside_count:
+                logger.info(
+                    "Map: %d GPS node(s) outside offline cache coverage", outside_count
+                )
+            if geo and not in_bounds:
+                # Every GPS node lies outside coverage — nothing to draw on the
+                # cached farm map. Say so plainly instead of rendering an empty map.
+                return (
+                    f"No GPS nodes are inside offline map coverage. "
+                    f"{outside_count} GPS node(s) outside coverage.",
+                    None,
+                )
+            sel           = MeshSelection(plotted=in_bounds, omitted=[])
+            render_bounds = bounds
         else:
             sel = _select_main_mesh(geo, cfg)
             if sel.omitted:
@@ -788,7 +1056,26 @@ def handle_command(
 
         plotted       = sel.plotted
         omitted_count = sum(len(c) for c in sel.omitted)
-        image_result  = render_map(plotted, cfg)
+        image_result  = render_map(
+            plotted, cfg, bounds=render_bounds, highlight_node_id=highlight
+        )
+
+        if (
+            target
+            and render_bounds is not None
+            and image_result is None
+            and MAP_AVAILABLE
+            and target in geo
+        ):
+            # Requested node is inside the cache box, but the render extent still
+            # needs tiles the offline cache lacks (or preflight failed). Explain
+            # that specifically rather than emitting a normal no-image summary.
+            snap = geo[target]
+            return (
+                f"Map image unavailable because required offline tiles are missing "
+                f"or outside cache coverage. Node GPS: {snap.lat:.5f}, {snap.lon:.5f}",
+                None,
+            )
 
         def _sep_str(m: float) -> str:
             return f"{m / 1000:.1f} km" if m >= 1000 else f"{m:.0f} m"
@@ -800,6 +1087,8 @@ def handle_command(
                     f"⚠️ {omitted_count} GPS node(s) omitted as separate cluster, "
                     f"nearest {_sep_str(sel.nearest_omitted_m)} from main mesh"
                 )
+            if outside_count:
+                lines.append(f"⚠️ {outside_count} GPS node(s) outside offline map coverage")
             if no_gps:
                 lines.append(f"⚠️ {no_gps} node(s) missing GPS")
             text_reply = "\n".join(lines)
@@ -829,6 +1118,10 @@ def handle_command(
                 lines.append(
                     f"⚠️  {omitted_count} GPS node(s) omitted as separate cluster, "
                     f"nearest {_sep_str(sel.nearest_omitted_m)} from main mesh."
+                )
+            if outside_count:
+                lines.append(
+                    f"⚠️  {outside_count} GPS node(s) outside offline map coverage."
                 )
             if no_gps:
                 lines.append(f"⚠️  {no_gps} node(s) have no GPS fix — omitted from map.")
