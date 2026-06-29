@@ -575,18 +575,17 @@ def _tile_range_for_view(
     """Integer tile range the square render viewport will request from the tile
     server, including the half-viewport spill in every direction.
 
-    Conservative at tile edges: floor() for the min indices, ceil() for the max
-    indices, so a viewport that pokes even slightly into the next tile row/column
-    counts that tile. Erring outward here can only make the cache-containment
-    gate stricter (fall back to text), never let a needed edge tile slip past it
-    and 404 at render time."""
+    Conservative at tile edges: floor() for the min indices, ceil()-1 for the max
+    indices. A viewport that ends exactly on a tile boundary does not need the
+    tile beyond that boundary, while a viewport that pokes even slightly into the
+    next tile row/column counts that tile."""
     fx, fy = _deg2tile(center_lat, center_lon, zoom)
     half = (render_size / 2.0) / tile_size          # half-viewport in tiles
     n = 2 ** zoom
     def _lo(v: float) -> int:
         return max(0, min(n - 1, int(math.floor(v))))
     def _hi(v: float) -> int:
-        return max(0, min(n - 1, int(math.ceil(v))))
+        return max(0, min(n - 1, int(math.ceil(v) - 1)))
     return _lo(fx - half), _hi(fx + half), _lo(fy - half), _hi(fy + half)
 
 
@@ -600,24 +599,60 @@ def _tile_range_contains(
     return rx0 >= cx0 and rx1 <= cx1 and ry0 >= cy0 and ry1 <= cy1
 
 
+def _cached_view_choice(
+    bounds: Tuple[float, float, float, float],
+    cfg: ReticulumBridgeConfig,
+    desired_zoom: int,
+    desired_render_size: int,
+    min_render_size: int = 480,
+) -> Optional[Tuple[int, int, Tuple[int, int, int, int], Tuple[int, int, int, int]]]:
+    """Pick a zoom/render-size pair whose viewport is fully inside cache tiles.
+
+    Cache bounds often describe a rectangular tile set, while StaticMap renders a
+    square viewport. If the first viewport spills outside the cache, try higher
+    cached zooms and, if needed, shrink the internal render size instead of
+    immediately falling back to text.
+    """
+    lat_min, lat_max, lon_min, lon_max = bounds
+    center_lon = (lon_min + lon_max) / 2
+    center_lat = (lat_min + lat_max) / 2
+    min_zoom = cfg.cache_zoom_min if cfg.cache_zoom_min is not None else 14
+    max_zoom = cfg.cache_zoom_max if cfg.cache_zoom_max is not None else desired_zoom
+    min_zoom = min(min_zoom, max_zoom)
+    desired_zoom = max(min_zoom, min(desired_zoom, max_zoom))
+
+    zooms = list(range(desired_zoom, max_zoom + 1))
+    zooms.extend(range(desired_zoom - 1, min_zoom - 1, -1))
+
+    sizes: List[int] = []
+    size = desired_render_size
+    while size >= min_render_size:
+        sizes.append(size)
+        size -= 128
+    if min_render_size not in sizes:
+        sizes.append(min_render_size)
+
+    for zoom in zooms:
+        cache_range = _tile_range_for_bounds(bounds, zoom)
+        for render_size in sizes:
+            view_range = _tile_range_for_view(center_lat, center_lon, zoom, render_size)
+            if _tile_range_contains(cache_range, view_range):
+                return zoom, render_size, view_range, cache_range
+    return None
+
+
 def _preflight_tile_urls(
     tile_url_template: str,
     tile_range: Tuple[int, int, int, int],
     zoom: int,
-    limit: int = 64,
 ) -> List[Tuple[int, int, int]]:
     """Probe the local tile server for the tiles the render needs. Returns a
     list of missing/unreachable (z, x, y) tiles; short-circuits on the first
-    miss so a missing tile costs one request, and caps total probes at `limit`
-    so a huge extent never floods the server."""
+    miss so a missing tile costs one request."""
     x0, x1, y0, y1 = tile_range
     missing: List[Tuple[int, int, int]] = []
-    probed = 0
     for x in range(x0, x1 + 1):
         for y in range(y0, y1 + 1):
-            if probed >= limit:
-                return missing          # too many tiles to preflight — caller decides
-            probed += 1
             url = tile_url_template.format(z=zoom, x=x, y=y)
             try:
                 urllib.request.urlopen(url, timeout=2)
@@ -770,23 +805,31 @@ def render_map(
         lat_min, lat_max, lon_min, lon_max = bounds
         center_lon = (lon_min + lon_max) / 2
         center_lat = (lat_min + lat_max) / 2
-        zoom = _best_zoom([lat_min, lat_max], [lon_min, lon_max], render_size)
-        if cfg.cache_zoom_max is not None:
-            zoom = min(zoom, cfg.cache_zoom_max)
-        if cfg.cache_zoom_min is not None:
-            zoom = max(zoom, cfg.cache_zoom_min)
+        desired_zoom = _best_zoom([lat_min, lat_max], [lon_min, lon_max], render_size)
 
         # Tile-range containment gate: refuse to render if the square viewport
         # needs any tile outside the cached tile range (catches the padding /
-        # square-aspect spill that lat/lon bounds alone don't cover).
-        view_range  = _tile_range_for_view(center_lat, center_lon, zoom, render_size)
-        cache_range = _tile_range_for_bounds(bounds, zoom)
-        if not _tile_range_contains(cache_range, view_range):
+        # square-aspect spill that lat/lon bounds alone don't cover). If the
+        # first choice spills, try cached zooms/smaller internal render sizes
+        # before falling back to text.
+        choice = _cached_view_choice(bounds, cfg, desired_zoom, render_size)
+        if choice is None:
+            fallback_zoom = desired_zoom
+            if cfg.cache_zoom_max is not None:
+                fallback_zoom = min(fallback_zoom, cfg.cache_zoom_max)
+            if cfg.cache_zoom_min is not None:
+                fallback_zoom = max(fallback_zoom, cfg.cache_zoom_min)
             logger.warning(
-                "Render tile range %s exceeds cache range %s at z%d — text fallback",
-                view_range, cache_range, zoom,
+                "No cached map viewport fits inside cache bounds at z%d — text fallback",
+                fallback_zoom,
             )
             return None
+        zoom, render_size, view_range, cache_range = choice
+        if zoom != desired_zoom or render_size != max(max_dimension * 2, 480):
+            logger.info(
+                "Adjusted map viewport to fit cache: z%d size=%d tiles=%s cache=%s",
+                zoom, render_size, view_range, cache_range,
+            )
 
         # Use the local/offline tiles directly and preflight the real render
         # tiles: a passing zoom-14 probe never implies the chosen-zoom tiles exist.

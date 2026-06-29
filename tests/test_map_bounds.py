@@ -23,6 +23,7 @@ try:
         _tile_range_for_bounds,
         _tile_range_for_view,
         _tile_range_contains,
+        _cached_view_choice,
     )
 except (ImportError, SystemExit) as exc:  # rns/lxmf/staticmap/dotenv not installed
     pytest.skip(f"reticulum_bridge unavailable: {exc}", allow_module_level=True)
@@ -155,12 +156,24 @@ def test_tile_range_for_view_is_edge_conservative():
     half = (size / 2.0) / 256
     x0, x1, y0, y1 = _tile_range_for_view(lat, lon, z, size)
     assert x0 == math.floor(fx - half)
-    assert x1 == math.ceil(fx + half)
+    assert x1 == math.ceil(fx + half) - 1
     assert y0 == math.floor(fy - half)
-    assert y1 == math.ceil(fy + half)
-    # ceil includes the edge tile a floor-based max would have dropped.
-    assert x1 > math.floor(fx + half)
-    assert y1 > math.floor(fy + half)
+    assert y1 == math.ceil(fy + half) - 1
+    # ceil()-1 includes a partially entered edge tile without adding the tile
+    # beyond an exact tile boundary.
+    assert x1 >= math.floor(fx + half)
+    assert y1 >= math.floor(fy + half)
+
+
+def test_tile_range_for_view_does_not_include_tile_past_exact_boundary():
+    # With a 512px viewport the half-width is exactly 1 tile. Centering on an
+    # integer tile coordinate should request one tile on each side, not a third
+    # tile just beyond the exact boundary.
+    x, y, z = 1000, 2000, 17
+    n = 2 ** z
+    lon = x / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    assert _tile_range_for_view(lat, lon, z, 512) == (999, 1000, 1999, 2000)
 
 
 def test_tile_range_contains_true_when_view_inside_cache():
@@ -177,6 +190,24 @@ def test_tile_range_contains_false_when_square_viewport_spills():
     cache = _tile_range_for_bounds(tiny, 17)
     view = _tile_range_for_view(26.3845, -80.1025, 17, 512)
     assert _tile_range_contains(cache, view) is False
+
+
+def test_cached_view_choice_tries_higher_cached_zoom_before_failing():
+    # Mirrors the production failure shape: z16 selected from the bounds spills
+    # outside a small cache rectangle, but z17 can fit because the cached bounds
+    # cover more integer tiles at that zoom.
+    bounds = (26.3720, 26.3785, -80.1000, -80.0920)
+    cfg = _cfg(
+        cache_lat_min=bounds[0], cache_lat_max=bounds[1],
+        cache_lon_min=bounds[2], cache_lon_max=bounds[3],
+        cache_zoom_min=14, cache_zoom_max=19,
+    )
+    choice = _cached_view_choice(bounds, cfg, desired_zoom=16, desired_render_size=1280)
+    assert choice is not None
+    zoom, render_size, view_range, cache_range = choice
+    assert zoom >= 16
+    assert render_size >= 480
+    assert _tile_range_contains(cache_range, view_range) is True
 
 
 # ── handle_command: map <id> outside coverage ────────────────────────────────
