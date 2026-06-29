@@ -8,8 +8,12 @@ This repo contains the modular Python bridge that:
 - Publishes into Mosquitto on `127.0.0.1:1883`
 - Outputs clean MQTT topics for downstream storage and dashboards
 
-Farm-specific cloud PostgreSQL isolation and the safe rollout procedure are
-documented in [docs/farm-isolation-deployment.md](docs/farm-isolation-deployment.md).
+Deployment docs:
+- [Raspberry Pi deployment](docs/raspberry-pi-deployment.md) — start here for
+  field Pi setup, Docker Compose, systemd startup, serial radio ports, logs, and
+  common deployment troubleshooting.
+- [Farm isolation deployment](docs/farm-isolation-deployment.md) — cloud table
+  rollout and farm-specific verification.
 
 ---
 
@@ -158,6 +162,3 @@ Stop the bridge, then:
 Verify:
 
 -`mosquitto_sub -h 127.0.0.1 -p 1883 -t "#" -v`
-
-
-

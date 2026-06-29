@@ -26,6 +26,7 @@ Thumbs.db
 # Config exports (avoid committing keys)
 *.yaml
 *.yml
+!docker-compose.example.yml
 
 # Databases / data folders
 *.db

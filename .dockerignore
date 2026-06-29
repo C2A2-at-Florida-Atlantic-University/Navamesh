@@ -1,0 +1,39 @@
+.git
+.gitignore
+.dockerignore
+
+# Local secrets and host-specific deployment files
+.env
+.env.*
+docker-compose.yml
+
+# Python/runtime cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+src/navamesh.egg-info/
+
+# Local data, queues, map cache, and service state
+data/
+tiles/
+mosquitto/
+reticulum-meshchat/
+cloud_sync_queue.db
+*.db
+
+# Logs and generated artifacts
+*.log
+nohup.out
+*.docx
+
+# Large installer/package files that should never enter Docker build context
+influxdb2*
+*.deb
+*.rpm
+*.tar
+*.tar.gz
+*.tgz
+*.zip

@@ -1,0 +1,50 @@
+services:
+
+  bridge:
+    build: .
+    container_name: navamesh_bridge
+    restart: always
+    command: python3 main.py
+    env_file: .env
+    network_mode: host
+    group_add:
+      - dialout
+    devices:
+      - ${SERIAL_PORT}:${SERIAL_PORT}
+
+  ingestor:
+    build: .
+    container_name: navamesh_ingestor
+    restart: always
+    command: python3 src/navamesh/mqtt_to_db.py
+    env_file: .env
+    environment:
+      SYNC_QUEUE_PATH: /data/cloud_sync_queue.db
+    network_mode: host
+    volumes:
+      - ingestor_data:/data
+
+  reticulum:
+    build: .
+    container_name: navamesh_reticulum
+    restart: always
+    command: python3 src/navamesh/reticulum_bridge.py
+    env_file: .env
+    network_mode: host
+    volumes:
+      - ./data/lxmf:/root/.navamesh_lxmf
+      - /home/pi/.reticulum:/root/.reticulum
+
+  tileserver:
+    image: nginx:alpine
+    container_name: navamesh_tiles
+    restart: always
+    network_mode: host
+    volumes:
+      - ./tiles:/usr/share/nginx/html/tiles:ro
+    command: >
+      sh -c "echo 'server { listen 8080; location /tiles/ { root /usr/share/nginx/html; } }'
+      > /etc/nginx/conf.d/tiles.conf && nginx -g 'daemon off;'"
+
+volumes:
+  ingestor_data:
