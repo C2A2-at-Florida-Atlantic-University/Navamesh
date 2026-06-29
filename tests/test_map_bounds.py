@@ -229,19 +229,6 @@ def test_map_id_outside_bounds_does_not_recenter_or_render():
     assert "outside offline map coverage" in text
 
 
-def test_plain_map_with_no_in_bounds_nodes_returns_clear_text():
-    # Cache configured, but every GPS node falls outside coverage.
-    nodes = {
-        "!a1": NodeSnapshot(node_id="!a1", lat=40.0, lon=-74.0),
-        "!b2": NodeSnapshot(node_id="!b2", lat=41.0, lon=-75.0),
-    }
-    text, image = handle_command("map", nodes, _cfg_with_bounds())
-    assert image is None
-    assert text == (
-        "No GPS nodes are inside offline map coverage. 2 GPS node(s) outside coverage."
-    )
-
-
 @pytest.mark.skipif(not MAP_AVAILABLE, reason="staticmap/pillow not installed")
 def test_map_id_in_bounds_but_render_fails_gives_specific_text():
     # Tiny cache box that contains the node, but a square render viewport spills

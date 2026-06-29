@@ -863,7 +863,10 @@ def render_map(
         smap.add_marker(CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), radius))
 
     try:
-        image = smap.render(zoom=zoom)
+        if bounds is not None:
+            image = smap.render(zoom=zoom, center=(center_lon, center_lat))
+        else:
+            image = smap.render(zoom=zoom)
     except RuntimeError as e:
         # Missing/uncached tiles raise "could not download N tiles" — never let
         # that crash the command handler; fall back to text instead.
@@ -1063,30 +1066,9 @@ def handle_command(
             if bounds is not None:
                 render_bounds = bounds
                 highlight     = target
-        elif bounds is not None:
-            # Plain `map` with a cache configured: plot in-bounds nodes onto the
-            # fixed farm extent; out-of-bounds nodes are reported, not drawn. The
-            # bounds filter replaces the cluster outlier guard here.
-            in_bounds = {
-                nid: s for nid, s in geo.items()
-                if _within_bounds(s.lat, s.lon, bounds)
-            }
-            outside_count = len(geo) - len(in_bounds)
-            if outside_count:
-                logger.info(
-                    "Map: %d GPS node(s) outside offline cache coverage", outside_count
-                )
-            if geo and not in_bounds:
-                # Every GPS node lies outside coverage — nothing to draw on the
-                # cached farm map. Say so plainly instead of rendering an empty map.
-                return (
-                    f"No GPS nodes are inside offline map coverage. "
-                    f"{outside_count} GPS node(s) outside coverage.",
-                    None,
-                )
-            sel           = MeshSelection(plotted=in_bounds, omitted=[])
-            render_bounds = bounds
         else:
+            # Plain `map` keeps the original main-mesh behavior. Cache-constrained
+            # fixed extents are only used for `map <id>`, which was the failing path.
             sel = _select_main_mesh(geo, cfg)
             if sel.omitted:
                 logger.info(
