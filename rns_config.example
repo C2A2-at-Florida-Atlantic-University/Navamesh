@@ -16,13 +16,15 @@
   [[TCP Server]]
     type = TCPServerInterface
     enabled = true
-    listen_ip = 0.0.0.0
+    # Bind to a specific LAN/interface address when remote peers need access.
+    listen_ip = 127.0.0.1
     listen_port = 4243
 
   [[UDP Broadcast]]
     type = UDPInterface
     enabled = true
-    listen_ip = 0.0.0.0
+    # Bind to a specific LAN/interface address when broadcasting on a mesh link.
+    listen_ip = 127.0.0.1
     listen_port = 4242
     forward_ip = 192.168.10.255
     forward_port = 4242
@@ -36,5 +38,5 @@
 #  [[HaLow TCP Server]]
 #    type = TCPServerInterface
 #    enabled = true
-#    listen_ip = 0.0.0.0
+#    listen_ip = 127.0.0.1
 #    listen_port = 4243

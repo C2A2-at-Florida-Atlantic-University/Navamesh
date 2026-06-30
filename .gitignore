@@ -2,6 +2,20 @@
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.kdbx
+secrets/
+secret/
+credentials/
+service-account*.json
+*-service-account.json
+firebase-adminsdk*.json
+google-application-credentials*.json
 
 # Virtual environments
 .venv/
@@ -30,24 +44,20 @@ Thumbs.db
 
 # Databases / data folders
 *.db
+*.sqlite
+*.sqlite3
 data/
+tiles/
+mosquitto/
+reticulum-meshchat/
+cloud_sync_queue.db
 
 # Old single-file bridge (do not commit)
 mesh_to_mqtt.py
 influxdata-archive_compat.key
 mqtt_to_influx.py
-reticulum-meshchat/
 src/navamesh.egg-info/
-To
-mosquitto/
-cloud_sync_queue.db
-influxdata-archive_compat.key
-mqtt_to_influx.py
-reticulum-meshchat/
-src/navamesh.egg-info/
-To
-mosquitto/
-cloud_sync_queue.db
 nohup.out
-tiles/
-data/
+
+# Generated/shareable documents can contain deployment details.
+*.docx

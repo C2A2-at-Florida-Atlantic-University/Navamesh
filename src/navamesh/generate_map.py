@@ -33,7 +33,7 @@ def _get_db_params():
     if dsn:
         return {"dsn": dsn, "sslmode": "require"}
     return {
-        "host":     os.getenv("DB_HOST",     "navamesh-db.postgres.database.azure.com"),
+        "host":     os.getenv("DB_HOST",     "localhost"),
         "port":     int(os.getenv("DB_PORT", "5432")),
         "dbname":   os.getenv("DB_NAME",     "navamesh"),
         "user":     os.getenv("DB_USER",     "navamesh"),
