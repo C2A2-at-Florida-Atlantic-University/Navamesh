@@ -18,3 +18,6 @@ def node_position(root_nodes: str, from_id: str) -> str:
 
 def node_battery(root_nodes: str, from_id: str) -> str:
     return f"{root_nodes}/{from_id}/battery"
+
+def node_info(root_nodes: str, from_id: str) -> str:
+    return f"{root_nodes}/{from_id}/info"

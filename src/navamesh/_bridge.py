@@ -18,6 +18,7 @@ from navamesh.processors.soil_text import (
 from navamesh.processors.link import extract_link
 from navamesh.processors.position import extract_position
 from navamesh.processors.telemetry import extract_battery
+from navamesh.processors.node_info import extract_node_info
 
 
 def _should_bridge(packet: dict, private_channel_index: int) -> bool:
@@ -62,6 +63,15 @@ def main():
                 mqtt_pub.publish(
                     topics.node_position(cfg.root_nodes, pos["fromId"]),
                     pos,
+                    retain=True,
+                )
+
+            # Node names (from NODEINFO_APP) — retained so app renames survive restarts
+            info = extract_node_info(packet)
+            if info:
+                mqtt_pub.publish(
+                    topics.node_info(cfg.root_nodes, info["fromId"]),
+                    info,
                     retain=True,
                 )
 

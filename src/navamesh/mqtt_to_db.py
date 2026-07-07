@@ -221,6 +221,11 @@ class NodeState:
     uptime_seconds: Optional[int] = None  # from "Up: Xh Ym" in status messages
     rx_rssi: Optional[float] = None
     rx_snr: Optional[float] = None
+    # Meshtastic NODEINFO_APP owner names (app renames); display_name is the
+    # resolved label (short first, then long)
+    long_name: Optional[str] = None
+    short_name: Optional[str] = None
+    display_name: Optional[str] = None
 
     def metadata(self, location_name: str, node_type: str) -> Dict[str, Any]:
         return {
@@ -238,6 +243,9 @@ class NodeState:
             "hdop": self.hdop,
             "rx_rssi": self.rx_rssi,
             "rx_snr": self.rx_snr,
+            "long_name": self.long_name,
+            "short_name": self.short_name,
+            "display_name": self.display_name,
             "last_packet_ts": self.last_seen_ts,
         }
 
@@ -259,6 +267,9 @@ def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "
         "uptime_seconds": state.uptime_seconds,
         "rx_rssi": state.rx_rssi,
         "rx_snr": state.rx_snr,
+        "long_name": state.long_name,
+        "short_name": state.short_name,
+        "display_name": state.display_name,
         "location_name": location_name,
         "node_type": node_type,
     }
@@ -281,6 +292,9 @@ def _state_from_dict(d: dict) -> NodeState:
         uptime_seconds=d.get("uptime_seconds"),
         rx_rssi=d.get("rx_rssi"),
         rx_snr=d.get("rx_snr"),
+        long_name=d.get("long_name"),
+        short_name=d.get("short_name"),
+        display_name=d.get("display_name"),
     )
 
 
@@ -908,6 +922,7 @@ class MqttToDbIngestor:
             "position": f"{self.cfg.root_nodes}/+/position",
             "battery": f"{self.cfg.root_nodes}/+/battery",
             "link": f"{self.cfg.root_nodes}/+/link",
+            "info": f"{self.cfg.root_nodes}/+/info",
         }
 
     @staticmethod
@@ -1064,7 +1079,7 @@ class MqttToDbIngestor:
             if len(parts) != 2:
                 return None, None
             node_id, metric = parts
-            if metric in {"position", "battery", "link"}:
+            if metric in {"position", "battery", "link", "info"}:
                 return metric, node_id
             return None, None
 
@@ -1096,6 +1111,14 @@ class MqttToDbIngestor:
         elif kind == "link":
             state.rx_rssi = self._coerce_float(payload.get("rxRssi"))
             state.rx_snr = self._coerce_float(payload.get("rxSnr"))
+        elif kind == "info":
+            state.long_name = self._coerce_name(
+                payload.get("longName", payload.get("long_name"))
+            )
+            state.short_name = self._coerce_name(
+                payload.get("shortName", payload.get("short_name"))
+            )
+            state.display_name = state.short_name or state.long_name
 
     def write_outputs(self, state: NodeState, kind: str) -> None:
         # --- Local (primary — always write) ---
@@ -1170,6 +1193,13 @@ class MqttToDbIngestor:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _coerce_name(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
 
 
 def main() -> int:
