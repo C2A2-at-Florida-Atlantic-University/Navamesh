@@ -37,6 +37,8 @@ Optional env vars:
   LXMF_ANNOUNCE_INTERVAL  — seconds between RNS announces (default: 180)
   IGNORED_NODES           — comma-separated node IDs to ignore
   LOG_LEVEL               — logging level (default: INFO)
+  NODE_LABEL_ALIASES      — manual node labels used when no Meshtastic name has
+                            been received, e.g. "!abc12345=Node A,!def67890=Node B"
 
   # Map rendering (only needed for 'map' command)
   MAP_LINK_PROFILE        — lora | halow | wifi  (default: lora)
@@ -266,6 +268,10 @@ class NodeSnapshot:
     alt: Optional[float] = None
     rx_rssi: Optional[float] = None
     rx_snr: Optional[float] = None
+    # Meshtastic NODEINFO_APP owner names, when the Pi has received them
+    display_name: Optional[str] = None
+    long_name: Optional[str] = None
+    short_name: Optional[str] = None
 
 
 @dataclass
@@ -315,6 +321,9 @@ def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
             lon=lon,
             rx_rssi=meta.get("rx_rssi"),
             rx_snr=meta.get("rx_snr"),
+            display_name=meta.get("display_name"),
+            long_name=meta.get("long_name"),
+            short_name=meta.get("short_name"),
         )
     logger.debug("Loaded %d node(s) from Postgres.", len(snapshots))
     return snapshots
@@ -324,6 +333,55 @@ def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
 
 def _fmt_node(node_id: str) -> str:
     return f"Node {node_id[-4:]}" if node_id.startswith("!") else node_id
+
+
+def _node_aliases() -> Dict[str, str]:
+    """Optional manual labels from the environment, e.g.
+    NODE_LABEL_ALIASES="!abc12345=Node A,!def67890=Node B"."""
+    aliases: Dict[str, str] = {}
+    for pair in os.getenv("NODE_LABEL_ALIASES", "").split(","):
+        if "=" not in pair:
+            continue
+        nid, name = pair.split("=", 1)
+        nid, name = nid.strip(), name.strip()
+        if nid and name:
+            aliases[nid] = name
+    return aliases
+
+
+def _label_candidates(node_id: str, snap: Optional[NodeSnapshot], order: Tuple[str, ...]):
+    for field in order:
+        cand = getattr(snap, field, None) if snap is not None else None
+        if isinstance(cand, str) and cand.strip():
+            yield cand.strip()
+    alias = _node_aliases().get(node_id)
+    if alias:
+        yield alias
+
+
+def _node_label(node_id: str, snap: Optional[NodeSnapshot] = None) -> str:
+    """Human label for text replies: Meshtastic display/short/long name, then a
+    configured alias, then the legacy 'Node <last4>' fallback."""
+    for cand in _label_candidates(
+        node_id, snap, ("display_name", "short_name", "long_name")
+    ):
+        return cand
+    return _fmt_node(node_id)
+
+
+# Image labels stay compact so they don't crowd the map or spill off the frame.
+_MAP_LABEL_MAX = 12
+
+
+def _map_pin_label(node_id: str, snap: Optional[NodeSnapshot] = None) -> str:
+    """Short label for map-image pins: prefers short_name, truncates anything
+    longer than _MAP_LABEL_MAX (image only — stored values are untouched), and
+    falls back to the legacy last-4-chars of the node ID."""
+    for cand in _label_candidates(
+        node_id, snap, ("short_name", "display_name", "long_name")
+    ):
+        return cand[:_MAP_LABEL_MAX].rstrip()
+    return node_id[-4:]
 
 def _fmt_ts(ts: Optional[int]) -> str:
     if ts is None:
@@ -582,10 +640,14 @@ def _tile_range_for_view(
     fx, fy = _deg2tile(center_lat, center_lon, zoom)
     half = (render_size / 2.0) / tile_size          # half-viewport in tiles
     n = 2 ** zoom
+    # Absorb float round-trip noise (lat -> Mercator -> lat drifts ~1e-11 tiles)
+    # so an edge that lands exactly on a tile boundary is treated as on it,
+    # not as poking into the neighboring tile. Sub-micrometer at any zoom.
+    eps = 1e-9
     def _lo(v: float) -> int:
-        return max(0, min(n - 1, int(math.floor(v))))
+        return max(0, min(n - 1, int(math.floor(v + eps))))
     def _hi(v: float) -> int:
-        return max(0, min(n - 1, int(math.ceil(v) - 1)))
+        return max(0, min(n - 1, int(math.ceil(v - eps) - 1)))
     return _lo(fx - half), _hi(fx + half), _lo(fy - half), _hi(fy + half)
 
 
@@ -771,6 +833,47 @@ def _select_main_mesh(
     )
 
 
+def _label_values(snap: NodeSnapshot) -> Tuple[str, str]:
+    """Soil/battery value strings for a map label ("?" when unknown, "USB" when
+    on external power)."""
+    soil_str = f"{snap.soil_percent:.0f}%" if snap.soil_percent is not None else "?"
+    bat_str = "USB" if snap.battery_usb else (
+        f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "?"
+    )
+    return soil_str, bat_str
+
+
+def _draw_droplet_icon(draw, x: int, y: int, size: int, color) -> None:
+    """Tiny water-droplet glyph drawn with primitives — the default Pillow font
+    on the Pi has no emoji coverage, so 💧 can't be rendered as text."""
+    w = max(4, int(size * 0.72))
+    cx = x + size / 2
+    body_top = y + size * 0.30
+    draw.ellipse((cx - w / 2, body_top, cx + w / 2, y + size), fill=color)
+    draw.polygon(
+        [
+            (cx, y),
+            (cx - w / 2 + 1, body_top + size * 0.20),
+            (cx + w / 2 - 1, body_top + size * 0.20),
+        ],
+        fill=color,
+    )
+
+
+def _draw_battery_icon(draw, x: int, y: int, size: int, color) -> None:
+    """Tiny battery glyph (solid body + terminal nub), primitives for the same
+    no-emoji-font reason as the droplet."""
+    body_h = max(4, int(size * 0.55))
+    top = y + (size - body_h) / 2
+    body_w = max(6, int(size * 0.82))
+    nub_w = max(1, int(size * 0.14))
+    draw.rectangle((x, top, x + body_w, top + body_h), fill=color)
+    draw.rectangle(
+        (x + body_w, top + body_h * 0.28, x + body_w + nub_w, top + body_h * 0.72),
+        fill=color,
+    )
+
+
 def render_map(
     nodes: Dict[str, NodeSnapshot],
     cfg: ReticulumBridgeConfig,
@@ -911,15 +1014,28 @@ def render_map(
 
     for node_id, snap in geo_nodes.items():
         px, py = pin_centers[node_id]
-        soil_str = f"{snap.soil_percent:.0f}%" if snap.soil_percent is not None else "?"
-        bat_str  = "USB" if snap.battery_usb else (
-            f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "?"
-        )
-        label = f"{node_id[-4:]}\nS:{soil_str} B:{bat_str}"
+        soil_str, bat_str = _label_values(snap)
+        id_text = _map_pin_label(node_id, snap)
 
-        b0 = draw.textbbox((0, 0), label, font=font)
-        lw = b0[2] - b0[0]
-        lh = b0[3] - b0[1]
+        # Second line is icon+value pairs (droplet=soil, battery=charge) drawn
+        # with primitives, so measure it piecewise instead of as one string.
+        line_gap = 4  # Pillow's default multiline spacing, kept from the old label
+        b_id   = draw.textbbox((0, 0), id_text, font=font)
+        b_soil = draw.textbbox((0, 0), soil_str, font=font)
+        b_bat  = draw.textbbox((0, 0), bat_str, font=font)
+        id_h     = b_id[3] - b_id[1]
+        val_top  = min(b_soil[1], b_bat[1])
+        val_h    = max(b_soil[3], b_bat[3]) - val_top
+        icon_sz  = max(8, val_h)
+        icon_gap = max(2, font_size // 8)
+        pair_gap = 3 * icon_gap
+        line2_w = (
+            icon_sz + icon_gap + (b_soil[2] - b_soil[0])
+            + pair_gap
+            + icon_sz + icon_gap + (b_bat[2] - b_bat[0])
+        )
+        lw = max(b_id[2] - b_id[0], line2_w)
+        lh = id_h + line_gap + val_top + icon_sz
         other_pins = [box for nid, box in pin_boxes.items() if nid != node_id]
 
         def _anchor_for(dirx, diry, dist):
@@ -972,11 +1088,20 @@ def render_map(
 
         chosen_lx, chosen_ly, chosen_box = chosen
         placed.append(chosen_box)
-        draw.rectangle(chosen_box, fill=(0, 0, 0, 200))
-        draw.text((chosen_lx, chosen_ly), label, fill="white", font=font)
         cx_l = (chosen_box[0] + chosen_box[2]) // 2
         cy_l = (chosen_box[1] + chosen_box[3]) // 2
+        # Leader line first so the boxless black text is drawn on top of it.
         draw.line([(px, py), (cx_l, cy_l)], fill=(255, 255, 255, 160), width=3)
+        draw.text((chosen_lx, chosen_ly), id_text, fill="black", font=font)
+        ly2 = chosen_ly + id_h + line_gap
+        ix = chosen_lx
+        _draw_droplet_icon(draw, ix, ly2 + val_top, icon_sz, "black")
+        ix += icon_sz + icon_gap
+        draw.text((ix, ly2), soil_str, fill="black", font=font)
+        ix += (b_soil[2] - b_soil[0]) + pair_gap
+        _draw_battery_icon(draw, ix, ly2 + val_top, icon_sz, "black")
+        ix += icon_sz + icon_gap
+        draw.text((ix, ly2), bat_str, fill="black", font=font)
 
     if image.mode != "RGB":
         image = image.convert("RGB")
@@ -1134,7 +1259,7 @@ def handle_command(
                     else "no GPS"
                 )
                 lines += [
-                    f"  {_fmt_node(node_id)} ({node_id})",
+                    f"  {_node_label(node_id, snap)} ({node_id})",
                     f"    Soil:    {soil_str}",
                     f"    Battery: {bat_str}",
                     f"    GPS:     {gps_str}", "",
