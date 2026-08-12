@@ -12,6 +12,8 @@ dependencies = [
     "pypubsub",
     "python-dotenv",
     "pyserial",
+    # navamesh.SoilReading (PortNum 256) decoding; gencode asserts runtime >= 6.33.4
+    "protobuf>=6.33.4",
 ]
 
 [project.optional-dependencies]

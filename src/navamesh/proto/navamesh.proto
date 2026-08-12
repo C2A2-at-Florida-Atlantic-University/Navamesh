@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package navamesh;
+
+/*
+ * Private Navamesh wire format, sent on Meshtastic PortNum 256 (PRIVATE_APP).
+ *
+ * This is NOT part of upstream Meshtastic. The protobufs/ submodule is never
+ * modified, so there is no risk of colliding with a field number that upstream
+ * assigns in a future release.
+ *
+ * The field node performs NO calibration. It ships the raw averaged ADC count
+ * and the Raspberry Pi owns the raw -> moisture-% mapping, so calibration can
+ * change without reflashing deployed nodes.
+ *
+ * Wire-format note for decoders: proto3 singular scalars equal to zero are
+ * omitted from the encoded bytes. A decoder MUST default absent fields to 0.
+ */
+message SoilReading {
+  /*
+   * Mean of 5 consecutive analogRead() samples, untouched: no constrain(),
+   * no map(), no scaling of any kind.
+   *
+   * RAK4631: 12-bit (0..4095) sampled against an AR_INTERNAL_3_0 reference,
+   * so volts ~= raw_adc * 3.0 / 4096. Saturates at 4095 for any input >= 3.0 V,
+   * which is why dry air reads 4095.
+   */
+  uint32 raw_adc = 1;
+
+  /*
+   * powerStatus->getBatteryChargePercent().
+   * On RAK4631 (BATTERY_PIN defined) 0 means "no battery / unknown".
+   * On boards without BATTERY_PIN, values > 100 mean externally powered.
+   */
+  uint32 battery_percent = 2;
+
+  /*
+   * powerStatus->getBatteryVoltageMv(), clamped to >= 0 by the sender
+   * (the underlying getter is signed and defaults to -1 when unknown).
+   */
+  uint32 battery_mv = 3;
+
+  /*
+   * Wrap-safe seconds since boot.
+   */
+  uint32 uptime_seconds = 4;
+}

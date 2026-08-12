@@ -1,14 +1,27 @@
 """
-soil_text.py — Parse soil/battery/uptime from Meshtastic text messages.
+soil_text.py — Parse battery/uptime from legacy Meshtastic text messages.
 
-Format B (RAK4631 firmware):
+Format B (LEGACY firmware):
     "Soil: 47% | Bat: 82% | Up: 1h 23m"
     "Soil: 0%  | Bat: USB | Up: 0h 3m"
+
+!! THE SOIL PERCENTAGE IN THESE MESSAGES IS NO LONGER AUTHORITATIVE. !!
+
+Soil moisture now comes exclusively from the navamesh.SoilReading protobuf on
+PortNum 256 (see soil_proto.py), where the node reports a RAW ADC count and the
+percentage is derived here on the Pi. A node-computed percentage cannot be
+recalibrated after the fact, which is the whole reason for the change.
+
+This module is retained only to salvage battery / voltage / uptime from nodes
+still running old firmware. It deliberately does NOT produce a soil payload:
+a node on old firmware simply has no valid soil measurement until it is
+reflashed. parse_status_message() still returns soil_percent, but that value is
+for logging only and must never be published to farm/sensors/soil/+/percent.
 """
 
 import re
 import time
-from typing import Optional, Tuple
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # FORMAT B  — device status string (RAK4631 firmware)
@@ -89,36 +102,28 @@ def parse_status_message(text: str) -> Optional[dict]:
     }
 
 
-def make_status_mqtt_payloads(
-    from_id: str, parsed: dict
-) -> Tuple[dict, Optional[dict]]:
+def make_status_battery_payload(from_id: str, parsed: dict) -> Optional[dict]:
     """
-    Convert the output of parse_status_message() into MQTT-ready payloads.
+    Convert the output of parse_status_message() into a battery MQTT payload.
 
-    Returns:
-        (soil_payload, battery_payload)
-        battery_payload is None if no battery data was found in the message.
+    Returns None if no battery data was found in the message.
 
-    soil_payload    → publish to farm/sensors/soil/<fromId>/percent
     battery_payload → publish to farm/nodes/<fromId>/battery
+
+    NOTE: there is deliberately no soil payload here. The node-computed
+    percentage in a legacy status string is not authoritative and must not reach
+    farm/sensors/soil/<fromId>/percent — that topic is now fed exclusively by the
+    PRIVATE_APP raw-ADC path in soil_proto.py. This function was previously
+    make_status_mqtt_payloads() and returned both.
     """
-    ts = int(time.time())
+    if parsed.get("battery_level") is None:
+        return None
 
-    soil_payload = {
-        "value": parsed["soil_percent"],
+    return {
         "fromId": from_id,
-        "ts": ts,
+        "ts": int(time.time()),
+        "batteryLevel": parsed["battery_level"],
+        "batteryUsb": parsed["battery_usb"],
+        "uptimeSeconds": parsed["uptime_seconds"],
+        # voltage not present in text messages — left absent
     }
-
-    battery_payload = None
-    if parsed.get("battery_level") is not None:
-        battery_payload = {
-            "fromId": from_id,
-            "ts": ts,
-            "batteryLevel": parsed["battery_level"],
-            "batteryUsb": parsed["battery_usb"],
-            "uptimeSeconds": parsed["uptime_seconds"],
-            # voltage not present in text messages — left absent
-        }
-
-    return soil_payload, battery_payload

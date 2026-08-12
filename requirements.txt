@@ -4,6 +4,10 @@ paho-mqtt
 pypubsub
 python-dotenv
 pyserial
+# Decodes the navamesh.SoilReading protobuf on PortNum 256 (PRIVATE_APP).
+# Available transitively via meshtastic, but declared directly because we import it.
+# The generated navamesh_pb2.py asserts a runtime of at least 6.33.4.
+protobuf>=6.33.4
 
 # Optional — required for the DB ingestor (src/navamesh/mqtt_to_db.py)
 # Install with:  pip install -e ".[db]"
