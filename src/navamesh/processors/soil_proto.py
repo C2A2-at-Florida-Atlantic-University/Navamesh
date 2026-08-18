@@ -4,7 +4,7 @@ soil_proto.py — Decode the structured Navamesh soil reading (PortNum 256).
 FORMAT C (RAK4631 firmware, authoritative):
     A navamesh.SoilReading protobuf on Meshtastic PortNum 256 (PRIVATE_APP),
     carrying the RAW averaged ADC count. The node performs no calibration; the
-    percentage is derived here (see navamesh.calibration).
+    DRY/DAMP/WET band is derived here (see navamesh.calibration).
 
 This supersedes the FORMAT B text string in soil_text.py, which is retained so
 nodes running older firmware keep working. Unlike FORMAT B, this path also
@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 
 from google.protobuf.message import DecodeError
 
-from navamesh.calibration import adc_to_percent
+from navamesh.calibration import adc_to_band, adc_to_percent
 from navamesh.proto import navamesh_pb2
 
 # Meshtastic's python library reports portnum as the enum *name*.
@@ -107,22 +107,24 @@ def extract_soil_reading(packet: dict) -> Optional[dict]:
 
 
 def make_soil_mqtt_payloads(
-    from_id: str, reading: dict, dry: int, wet: int
-) -> Tuple[dict, Optional[dict], dict]:
+    from_id: str, reading: dict
+) -> Tuple[dict, Optional[dict], dict, dict]:
     """
     Convert extract_soil_reading() output into MQTT-ready payloads.
 
-    Returns (raw_payload, percent_payload, battery_payload):
+    Returns (raw_payload, percent_payload, band_payload, battery_payload):
         raw_payload     -> farm/sensors/soil/<fromId>/raw
-        percent_payload -> farm/sensors/soil/<fromId>/percent  (None if the
-                           calibration span is degenerate)
+        percent_payload -> farm/sensors/soil/<fromId>/percent  (None outside the
+                           DAMP band, where the sensor has no resolution)
+        band_payload    -> farm/sensors/soil/<fromId>/band     (DRY/DAMP/WET)
         battery_payload -> farm/nodes/<fromId>/battery
 
     Payload shapes deliberately match what mqtt_to_db.apply_payload() already
     expects, so no ingestor changes are needed.
 
-    The raw ADC is passed through untouched; only the derived percentage is
-    clamped.
+    The raw ADC is passed through untouched. The band is the authoritative
+    derived value; the percentage is a coarse convenience and is omitted rather
+    than fabricated wherever the bench data shows the probe cannot resolve.
     """
     ts = int(time.time())
     raw_adc = reading["raw_adc"]
@@ -134,7 +136,14 @@ def make_soil_mqtt_payloads(
         "source": SOIL_SOURCE,
     }
 
-    percent = adc_to_percent(raw_adc, dry, wet)
+    band_payload = {
+        "value": adc_to_band(raw_adc),
+        "fromId": from_id,
+        "ts": ts,
+        "source": SOIL_SOURCE,
+    }
+
+    percent = adc_to_percent(raw_adc)
     percent_payload = None
     if percent is not None:
         percent_payload = {
@@ -156,4 +165,4 @@ def make_soil_mqtt_payloads(
         "voltage": round(reading["battery_mv"] / 1000.0, 3),
     }
 
-    return raw_payload, percent_payload, battery_payload
+    return raw_payload, percent_payload, band_payload, battery_payload

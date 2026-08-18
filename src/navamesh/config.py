@@ -36,12 +36,12 @@ class Config:
 
     farm_id: str
 
-    # Soil calibration. The RAK4631 sends only the raw averaged ADC count; these
-    # two points turn it into a percentage (see navamesh.calibration). Retune by
-    # editing .env and restarting the bridge — no node reflash required.
-    # Defaults are the constants the firmware used to hard-code.
-    soil_adc_dry: int
-    soil_adc_wet: int
+    # Soil calibration is no longer two env-tunable endpoints. The bench data
+    # (15-18 Aug 2026) showed the response is a step, not a line: flat below
+    # ~9.5% moisture, ~4000 counts inside half a percent, then saturated above
+    # 20%. A two-point linear fit cannot represent that at any setting, so the
+    # band thresholds now live in navamesh.calibration. SOIL_ADC_DRY and
+    # SOIL_ADC_WET in .env are dead and can be removed.
 
 def load_config() -> Config:
     def getenv_int(name: str, default: int) -> int:
@@ -61,7 +61,4 @@ def load_config() -> Config:
         root_cmd=os.getenv("ROOT_CMD", "farm/cmd"),
 
         farm_id=normalize_farm_id(os.getenv("FARM_ID", "farm1")),
-
-        soil_adc_dry=getenv_int("SOIL_ADC_DRY", 3120),
-        soil_adc_wet=getenv_int("SOIL_ADC_WET", 1567),
     )

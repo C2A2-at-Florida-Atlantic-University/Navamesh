@@ -10,6 +10,15 @@ def soil_raw(root_sensors: str, from_id: str) -> str:
 def soil_percent(root_sensors: str, from_id: str) -> str:
     return f"{root_sensors}/soil/{from_id}/percent"
 
+def soil_band(root_sensors: str, from_id: str) -> str:
+    """DRY / DAMP / WET — the authoritative soil state (see navamesh.calibration).
+
+    Published alongside /percent rather than replacing it: /percent still carries a
+    coarse figure inside the DAMP band for trend lines, but it is absent outside it,
+    where the sensor has no resolution. Consumers making decisions read this topic.
+    """
+    return f"{root_sensors}/soil/{from_id}/band"
+
 def node_link(root_nodes: str, from_id: str) -> str:
     return f"{root_nodes}/{from_id}/link"
 

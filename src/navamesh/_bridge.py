@@ -165,13 +165,13 @@ def main():
 
             # FORMAT C: navamesh.SoilReading protobuf on PortNum 256 (PRIVATE_APP).
             # Authoritative path — the node sends the RAW averaged ADC and the
-            # percentage is derived here. Must be handled before the
+            # DRY/DAMP/WET band is derived here. Must be handled before the
             # TEXT_MESSAGE_APP early-return below, which would otherwise drop it.
             reading = extract_soil_reading(packet)
             if reading is not None:
                 from_id = packet.get("fromId") or "unknown"
-                raw_pl, pct_pl, bat_pl = make_soil_mqtt_payloads(
-                    from_id, reading, cfg.soil_adc_dry, cfg.soil_adc_wet
+                raw_pl, pct_pl, band_pl, bat_pl = make_soil_mqtt_payloads(
+                    from_id, reading
                 )
 
                 # Raw ADC — the authoritative measurement, stored verbatim
@@ -181,7 +181,15 @@ def main():
                     retain=True,
                 )
 
-                # Pi-derived percentage
+                # Pi-derived band — DRY / DAMP / WET. What consumers act on.
+                mqtt_pub.publish(
+                    topics.soil_band(cfg.root_sensors, from_id),
+                    band_pl,
+                    retain=True,
+                )
+
+                # Coarse percentage. Absent outside the DAMP band, where the
+                # bench data shows the probe has no resolution to report.
                 if pct_pl is not None:
                     mqtt_pub.publish(
                         topics.soil_percent(cfg.root_sensors, from_id),
@@ -196,9 +204,10 @@ def main():
                     retain=True,
                 )
 
-                pct_str = f"{pct_pl['value']}%" if pct_pl else "n/a (bad calibration)"
+                pct_str = f" ({pct_pl['value']}%)" if pct_pl else ""
                 print(f"[SENSOR] {from_id} | raw_adc={reading['raw_adc']} | "
-                      f"soil={pct_str} | bat={reading['battery_percent']}% "
+                      f"soil={band_pl['value']}{pct_str} | "
+                      f"bat={reading['battery_percent']}% "
                       f"({bat_pl['voltage']}V) | up={reading['uptime_seconds']}s")
                 return
 

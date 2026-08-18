@@ -56,9 +56,26 @@ MOISTURE_DRY      = int(os.getenv("MOISTURE_DRY",      "30"))
 MOISTURE_LOW      = int(os.getenv("MOISTURE_LOW",      "50"))
 MOISTURE_MODERATE = int(os.getenv("MOISTURE_MODERATE", "70"))
 
-# ── Confirmed key from mqtt_to_db.py NodeState → metadata() ─────────────────
+# ── Confirmed keys from mqtt_to_db.py NodeState → metadata() ────────────────
 # The ingestor writes  metadata->>'soil_percent'  (not 'soil_moisture').
 MOISTURE_KEY = os.getenv("MOISTURE_KEY", "soil_percent")
+
+# DRY / DAMP / WET. Preferred over the percentage: bench calibration showed the
+# probe is blind below ~9.5% moisture and saturated above 20%, so soil_percent is
+# deliberately absent outside the DAMP band. A node reading bone-dry has a band
+# but no percentage -- colouring by percentage alone would render it "No reading".
+BAND_KEY = os.getenv("BAND_KEY", "soil_band")
+
+BAND_COLORS = {
+    "DRY":  "#e74c3c",   # red    — needs water
+    "DAMP": "#27ae60",   # green  — adequate
+    "WET":  "#2980b9",   # blue   — saturated, do not irrigate
+}
+BAND_LABELS = {
+    "DRY":  "Dry ⚠️ — needs water",
+    "DAMP": "Damp ✓",
+    "WET":  "Wet — saturated",
+}
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -70,7 +87,11 @@ def deg2tile(lat, lon, zoom):
     return x, y
 
 
-def moisture_color(value):
+def moisture_color(value, band=None):
+    """Band wins when present; the percentage thresholds remain for legacy rows
+    written before the band existed."""
+    if band in BAND_COLORS:
+        return BAND_COLORS[band]
     if value is None:
         return "#888888"
     if value < MOISTURE_DRY:
@@ -82,7 +103,12 @@ def moisture_color(value):
     return "#27ae60"        # green — good
 
 
-def moisture_label(value):
+def moisture_label(value, band=None):
+    if band in BAND_LABELS:
+        # Inside DAMP the coarse figure is worth showing; elsewhere it does not exist.
+        if band == "DAMP" and value is not None:
+            return f"{BAND_LABELS[band]} (~{value:.0f}%)"
+        return BAND_LABELS[band]
     if value is None:
         return "No reading"
     if value < MOISTURE_DRY:
@@ -152,13 +178,14 @@ def fetch_nodes():
             last_seen,
             metadata,
             metadata->>%s                AS moisture_raw,
+            metadata->>%s                AS soil_band,
             metadata->>'status'          AS status,
             metadata->>'rx_snr'          AS rx_snr,
             metadata->>'type'            AS node_type,
             metadata->>'battery_level'   AS battery
         FROM mesh_nodes
         ORDER BY last_seen DESC NULLS LAST;
-    """, (MOISTURE_KEY,))
+    """, (MOISTURE_KEY, BAND_KEY))
 
     rows = cur.fetchall()
     cur.close()
@@ -179,6 +206,7 @@ def fetch_nodes():
             "lon":       float(row["lon"]) if row["lon"] is not None else None,
             "last_seen": row["last_seen"].isoformat() if row["last_seen"] else "Unknown",
             "moisture":  moisture,
+            "band":      row["soil_band"],
             "status":    row["status"] or "unknown",
             "rx_snr":    row["rx_snr"],
             "node_type": row["node_type"] or "field-node",
@@ -219,8 +247,8 @@ def generate_html(nodes, tile_data, zoom_levels=(16, 17, 18)):
 
     markers_js = []
     for n in positioned:
-        color = moisture_color(n["moisture"])
-        label = moisture_label(n["moisture"])
+        color = moisture_color(n["moisture"], n.get("band"))
+        label = moisture_label(n["moisture"], n.get("band"))
         popup = (
             f"<b>{n['node_id']}</b><br>"
             f"Moisture: {label}<br>"

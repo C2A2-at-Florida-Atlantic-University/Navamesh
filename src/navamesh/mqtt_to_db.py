@@ -215,6 +215,9 @@ class NodeState:
     hdop: Optional[float] = None
     soil_raw: Optional[float] = None
     soil_percent: Optional[float] = None
+    # DRY / DAMP / WET -- the authoritative derived value. soil_percent is a
+    # coarse convenience and is absent outside DAMP (see navamesh.calibration).
+    soil_band: Optional[str] = None
     battery_level: Optional[float] = None
     battery_usb: Optional[bool] = None    # True when RAK4631 reports "Bat: USB"
     voltage: Optional[float] = None
@@ -234,6 +237,7 @@ class NodeState:
             "status": "online",
             "soil_raw": self.soil_raw,
             "soil_percent": self.soil_percent,
+            "soil_band": self.soil_band,
             "battery_level": self.battery_level,
             "battery_usb": self.battery_usb,
             "voltage": self.voltage,
@@ -261,6 +265,7 @@ def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "
         "hdop": state.hdop,
         "soil_raw": state.soil_raw,
         "soil_percent": state.soil_percent,
+        "soil_band": state.soil_band,
         "battery_level": state.battery_level,
         "battery_usb": state.battery_usb,
         "voltage": state.voltage,
@@ -286,6 +291,7 @@ def _state_from_dict(d: dict) -> NodeState:
         hdop=d.get("hdop"),
         soil_raw=d.get("soil_raw"),
         soil_percent=d.get("soil_percent"),
+        soil_band=d.get("soil_band"),
         battery_level=d.get("battery_level"),
         battery_usb=d.get("battery_usb"),
         voltage=d.get("voltage"),
@@ -763,6 +769,8 @@ class InfluxWriter:
             point = point.field("raw", float(state.soil_raw))
         if state.soil_percent is not None:
             point = point.field("percent", float(state.soil_percent))
+        if state.soil_band is not None:
+            point = point.field("band", str(state.soil_band))
         if state.battery_level is not None:
             point = point.field("battery_level", float(state.battery_level))
         if state.battery_usb is not None:
@@ -1006,6 +1014,7 @@ class MqttToDbIngestor:
         self.topic_patterns = {
             "soil_raw": f"{self.cfg.root_sensors}/soil/+/raw",
             "soil_percent": f"{self.cfg.root_sensors}/soil/+/percent",
+            "soil_band": f"{self.cfg.root_sensors}/soil/+/band",
             "position": f"{self.cfg.root_nodes}/+/position",
             "battery": f"{self.cfg.root_nodes}/+/battery",
             "link": f"{self.cfg.root_nodes}/+/link",
@@ -1173,6 +1182,8 @@ class MqttToDbIngestor:
                 return "soil_raw", node_id
             if metric == "percent":
                 return "soil_percent", node_id
+            if metric == "band":
+                return "soil_band", node_id
             return None, None
 
         if topic.startswith(nodes_prefix):
@@ -1195,6 +1206,9 @@ class MqttToDbIngestor:
             state.soil_raw = self._coerce_float(payload.get("value"))
         elif kind == "soil_percent":
             state.soil_percent = self._coerce_float(payload.get("value"))
+        elif kind == "soil_band":
+            band = payload.get("value")
+            state.soil_band = str(band) if band is not None else None
         elif kind == "position":
             state.lat = self._coerce_float(payload.get("lat"))
             state.lon = self._coerce_float(payload.get("lon"))
@@ -1225,7 +1239,7 @@ class MqttToDbIngestor:
     def write_outputs(self, state: NodeState, kind: str) -> None:
         # --- Local (primary — always write) ---
         if self.influx.enabled:
-            if kind in {"soil_raw", "soil_percent", "battery"}:
+            if kind in {"soil_raw", "soil_percent", "soil_band", "battery"}:
                 try:
                     self.influx.write_soil(state)
                 except Exception as e:
@@ -1249,7 +1263,7 @@ class MqttToDbIngestor:
 
         # --- Cloud (secondary — best-effort, queue on failure) ---
         if self.influx_cloud.enabled:
-            if kind in {"soil_raw", "soil_percent", "battery"}:
+            if kind in {"soil_raw", "soil_percent", "soil_band", "battery"}:
                 try:
                     self.influx_cloud.write_soil(state)
                 except Exception as e:
