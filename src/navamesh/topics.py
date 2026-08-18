@@ -21,3 +21,18 @@ def node_battery(root_nodes: str, from_id: str) -> str:
 
 def node_info(root_nodes: str, from_id: str) -> str:
     return f"{root_nodes}/{from_id}/info"
+
+
+# --- Downlink command bus -------------------------------------------------------
+#
+# Both of these MUST be published non-retained. A retained command would be
+# redelivered to the bridge on every reconnect and silently re-command the mesh --
+# reopening BLE windows or re-muting nodes long after the operator moved on.
+
+def cmd_request(root_cmd: str) -> str:
+    """reticulum_bridge -> bridge: a validated command to transmit."""
+    return f"{root_cmd}/request"
+
+def cmd_status(root_cmd: str) -> str:
+    """bridge -> ingestor: transmit outcome, then the node's ack when it arrives."""
+    return f"{root_cmd}/status"

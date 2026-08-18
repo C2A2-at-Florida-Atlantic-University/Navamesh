@@ -64,6 +64,7 @@ Dependencies:
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
@@ -178,6 +179,13 @@ class ReticulumBridgeConfig:
     cache_zoom_min: Optional[int]
     cache_zoom_max: Optional[int]
     pg_dsn: str
+    # RNS/LXMF identity hashes permitted to issue control commands (WRITE_VERBS).
+    # EMPTY MEANS EVERYONE, which is the current intent for testing and first deployment:
+    # any device that can reach the gateway may command the mesh. Populate it to restrict.
+    # See is_sender_authorized() and TODO.md.
+    authorized_farmer_hashes: Tuple[str, ...] = ()
+    # How long to wait for a node's ack before reporting a timeout to the operator.
+    cmd_ack_timeout_seconds: int = 120
 
 
 def load_rns_config() -> ReticulumBridgeConfig:
@@ -215,6 +223,26 @@ def load_rns_config() -> ReticulumBridgeConfig:
         except ValueError:
             return None
 
+    def _hash_list(name: str) -> Tuple[str, ...]:
+        """
+        Parse a comma-separated list of RNS identity hashes.
+
+        Normalised to lowercase with any ':' separators stripped, so an operator can paste
+        a hash in either the delimited or bare form that RNS prints.
+        """
+        v = os.getenv(name, "")
+        parsed = tuple(
+            h.strip().lower().replace(":", "")
+            for h in v.split(",")
+            if h.strip()
+        )
+        if not parsed:
+            logger.warning(
+                "%s is unset — control commands are OPEN to any sender that can reach this "
+                "gateway. Fine for testing; set it before this is a trusted deployment.", name
+            )
+        return parsed
+
     return ReticulumBridgeConfig(
         rns_config_dir=os.getenv("RNS_CONFIG_DIR", os.path.expanduser("~/.reticulum")),
         lxmf_storage_dir=os.path.expanduser(
@@ -248,6 +276,8 @@ def load_rns_config() -> ReticulumBridgeConfig:
         cache_zoom_min=_opt_int("CACHE_ZOOM_MIN"),
         cache_zoom_max=_opt_int("CACHE_ZOOM_MAX"),
         pg_dsn=os.getenv("PG_DSN", ""),
+        authorized_farmer_hashes=_hash_list("AUTHORIZED_FARMER_HASHES"),
+        cmd_ack_timeout_seconds=_int("CMD_ACK_TIMEOUT_SECONDS", 120),
     )
 
 
@@ -483,7 +513,146 @@ HELP_TEXT = """🌱 Navamesh Gateway — Commands
   map          — rendered map image (all nodes)
   map <id>     — rendered map image (one node)
   nodes        — list all known node IDs
-  help         — this message"""
+  help         — this message
+
+Control commands (change the field nodes):
+  ble <id|^all> <min>      — open a Bluetooth window, then auto-close
+  interval <id|^all> <sec> — set telemetry interval (live, no reboot)
+  quiet <id|^all> on|off   — stop / resume transmitting"""
+
+
+# Verbs that change deployed field hardware. Gated by AUTHORIZED_FARMER_HASHES; every
+# other verb in this gateway is read-only and safe to leave open.
+WRITE_VERBS = ("ble", "interval", "quiet")
+
+# How often to check for command acks to report. Tight, because an operator standing in a
+# field waiting on a Bluetooth window is actively watching for this.
+COMMAND_OUTCOME_POLL_SECONDS = 5
+
+
+def is_sender_authorized(sender_hash: str, allowed_hashes) -> bool:
+    """
+    May this sender issue control commands?
+
+    An EMPTY allow-list means everyone may. That is a deliberate choice for testing and
+    first deployment: any device that can reach this gateway over Reticulum can command
+    the mesh, and the only thing in the way is that the verb list lives in the wrapper app.
+
+    That is obscurity rather than access control, and note the `help` verb prints the
+    control commands to anyone who asks for them. Populating AUTHORIZED_FARMER_HASHES
+    turns this into a real check with no code change -- see TODO.md.
+
+    Kept as a module-level pure function so the policy is testable without standing up RNS
+    or a gateway instance.
+    """
+    if not allowed_hashes:
+        return True
+    return sender_hash.strip().lower().replace(":", "") in allowed_hashes
+
+# Bounds duplicated from processors.command_proto so a bad value is rejected here, with a
+# readable message, instead of travelling all the way to a node that would silently clamp
+# it. command_proto re-validates before transmit; this is the operator-facing copy.
+_BLE_MIN_MINUTES, _BLE_MAX_MINUTES = 1, 240
+_INTERVAL_MIN_SECONDS, _INTERVAL_MAX_SECONDS = 60, 86400
+_QUIET_MIN_MINUTES, _QUIET_MAX_MINUTES = 1, 4320
+
+BROADCAST_TARGET = "^all"
+
+
+def _parse_write_args(command: str, target: Optional[str]):
+    """
+    Parse "<id|^all> <value>" (or "<id|^all> on|off" for quiet).
+
+    Returns (node, value, quiet_on, error_message). `error_message` is non-None on any
+    problem, in which case the other fields are meaningless.
+    """
+    if not target:
+        return None, None, None, (
+            f"'{command}' needs a target. Example: {command} ^all "
+            f"{'on' if command == 'quiet' else '15'}"
+        )
+
+    bits = target.split()
+    node = bits[0]
+    arg = bits[1] if len(bits) > 1 else None
+
+    if command == "quiet":
+        if arg not in ("on", "off"):
+            return None, None, None, "quiet needs 'on' or 'off'. Example: quiet ^all on"
+        return node, None, arg == "on", None
+
+    if arg is None:
+        unit = "minutes" if command == "ble" else "seconds"
+        return None, None, None, f"'{command}' needs a value in {unit}. Example: {command} {node} 15"
+
+    try:
+        value = int(arg)
+    except ValueError:
+        return None, None, None, f"'{arg}' is not a number."
+
+    if command == "ble" and not _BLE_MIN_MINUTES <= value <= _BLE_MAX_MINUTES:
+        return None, None, None, (
+            f"BLE window must be {_BLE_MIN_MINUTES}-{_BLE_MAX_MINUTES} minutes."
+        )
+    if command == "interval" and not _INTERVAL_MIN_SECONDS <= value <= _INTERVAL_MAX_SECONDS:
+        return None, None, None, (
+            f"Interval must be {_INTERVAL_MIN_SECONDS}-{_INTERVAL_MAX_SECONDS} seconds "
+            f"({_INTERVAL_MIN_SECONDS // 60} min to 24 h)."
+        )
+
+    return node, value, None, None
+
+
+def _handle_write_command(
+    command: str,
+    target: Optional[str],
+    nodes: Dict[str, NodeSnapshot],
+    *,
+    dispatch_write=None,
+    source_hash: Optional[str] = None,
+    authorized: bool = False,
+) -> str:
+    """Validate a control command and hand it to the transmit path."""
+    if not authorized:
+        # Deliberately terse. This gateway answers any LXMF sender that discovers it via
+        # RNS announce, so an unauthorized peer should learn nothing about what exists.
+        return "Unauthorized: this gateway does not accept control commands from you."
+
+    if dispatch_write is None:
+        return "Control commands are not available on this gateway (no command bus configured)."
+
+    node, value, quiet_on, error = _parse_write_args(command, target)
+    if error:
+        return f"⚠️  {error}"
+
+    is_broadcast = node in (BROADCAST_TARGET, "all")
+    if not is_broadcast and node not in nodes:
+        return f"Node '{node}' not found. Send 'nodes' to list all known nodes."
+
+    resolved = BROADCAST_TARGET if is_broadcast else node
+    try:
+        cmd_id = dispatch_write(
+            verb=command,
+            target=resolved,
+            value=value,
+            quiet_on=quiet_on,
+            requested_by=source_hash or "unknown",
+        )
+    except Exception as exc:
+        # Most likely the MQTT broker is down. Fail loudly: silently swallowing this
+        # would leave the operator believing a node had been reconfigured.
+        return f"⚠️  Could not queue command: {exc}"
+
+    who = "ALL field nodes" if is_broadcast else _node_label(node, nodes.get(node))
+    if command == "ble":
+        what = f"Bluetooth window for {value} min"
+    elif command == "interval":
+        what = f"telemetry interval {value} s"
+    else:
+        what = "quiet mode ON" if quiet_on else "quiet mode OFF"
+
+    return (f"📤 Queued: {what} → {who}\n"
+            f"Command {cmd_id}. Waiting for the node to acknowledge…")
 
 
 # ── Map renderer ──────────────────────────────────────────────────────────────
@@ -1134,10 +1303,33 @@ def handle_command(
     cmd: str,
     nodes: Dict[str, NodeSnapshot],
     cfg: ReticulumBridgeConfig,
+    *,
+    dispatch_write=None,
+    source_hash: Optional[str] = None,
+    authorized: bool = False,
 ) -> Tuple[str, Optional[Tuple[str, bytes, str]]]:
+    """
+    Interpret one operator command.
+
+    The read-only verbs are pure functions of `nodes` and stay that way. The write verbs
+    (see WRITE_VERBS) need to reach the mesh, which this process cannot do -- the bridge
+    process owns the serial port -- so they call `dispatch_write` instead.
+
+    The write-path parameters are keyword-only with defaults so every existing caller and
+    test that passes just (cmd, nodes, cfg) keeps working unchanged, and a caller that
+    forgets to wire up authorization gets "unauthorized" rather than an open door.
+    """
     parts   = cmd.strip().lower().split(None, 1)
     command = parts[0] if parts else ""
     target  = parts[1].strip() if len(parts) > 1 else None
+
+    if command in WRITE_VERBS:
+        return _handle_write_command(
+            command, target, nodes,
+            dispatch_write=dispatch_write,
+            source_hash=source_hash,
+            authorized=authorized,
+        ), None
 
     if command == "nodes":
         if not nodes: return "No nodes in database yet.", None
@@ -1297,6 +1489,175 @@ class LxmfGateway:
         self._router: Optional[LXMF.LXMRouter] = None
         self._source: Optional[Any] = None
         self._lock = threading.Lock()
+        # Lazily created on the first control command, so a gateway that never issues one
+        # never opens an MQTT connection it does not need.
+        self._cmd_mqtt: Optional[Any] = None
+        self._cmd_seq_lock = threading.Lock()
+
+    # ── Control-command dispatch ──────────────────────────────────────────────
+
+    def _is_authorized(self, sender_hash: str) -> bool:
+        """True if this sender may issue control commands. See is_sender_authorized()."""
+        return is_sender_authorized(sender_hash, self._cfg.authorized_farmer_hashes)
+
+    def _next_cmd_id(self) -> int:
+        """
+        Allocate a command id.
+
+        The firmware uses this as a monotonic replay guard, so it must strictly increase
+        per node and survive a gateway restart. A second-resolution unix timestamp does
+        both without needing any persisted counter; the lock just prevents two commands
+        issued in the same second from colliding.
+        """
+        with self._cmd_seq_lock:
+            candidate = int(time.time())
+            last = getattr(self, "_last_cmd_id", 0)
+            if candidate <= last:
+                candidate = last + 1
+            self._last_cmd_id = candidate
+            return candidate
+
+    def _dispatch_write(self, verb: str, target: str, value, quiet_on, requested_by: str) -> int:
+        """
+        Log a control command and publish it to the bridge process for transmission.
+
+        Raises on failure so handle_command() can tell the operator the command did NOT
+        go out. Silently swallowing this would leave them believing a node had been
+        reconfigured when nothing was ever sent.
+        """
+        from navamesh import topics
+        from navamesh.mqtt_client import MqttPublisher
+
+        cmd_id = self._next_cmd_id()
+        params = {"value": value, "quiet_on": quiet_on}
+
+        # Record the intent before transmitting, so a command that is sent but never
+        # acknowledged still leaves an audit trail.
+        self._log_pending_command(cmd_id, verb, target, params, requested_by)
+
+        if self._cmd_mqtt is None:
+            self._cmd_mqtt = MqttPublisher(
+                self._navamesh_cfg.mqtt_host, self._navamesh_cfg.mqtt_port
+            )
+
+        self._cmd_mqtt.publish(
+            topics.cmd_request(self._navamesh_cfg.root_cmd),
+            {
+                "cmd_id": cmd_id,
+                "verb": verb,
+                "target": target,
+                "value": value,
+                "quiet_on": quiet_on,
+                "requested_by": requested_by,
+                "ts": int(time.time()),
+            },
+            qos=1,
+            # Never retained: the broker would redeliver this on every bridge reconnect
+            # and re-command the mesh long after the operator moved on.
+            retain=False,
+        )
+        return cmd_id
+
+    def _log_pending_command(self, cmd_id: int, verb: str, target: str,
+                             params: dict, requested_by: str) -> None:
+        if _psycopg is None or not self._cfg.pg_dsn:
+            return
+        try:
+            with _psycopg.connect(self._cfg.pg_dsn, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO public.command_log
+                            (cmd_id, verb, target, params, requested_by, state)
+                        VALUES (%s, %s, %s, %s, %s, 'pending')
+                        ON CONFLICT (cmd_id) DO NOTHING
+                        """,
+                        (str(cmd_id), verb, target, json.dumps(params), requested_by),
+                    )
+        except Exception as exc:
+            # Do not abort the command: losing the audit row is worse than nothing, but
+            # far less bad than refusing to open a BLE window for a crew already on site.
+            logger.warning("Could not log pending command %s: %s", cmd_id, exc)
+
+    def notify_command_outcomes(self) -> None:
+        """
+        Report finished or timed-out commands back to whoever asked for them.
+
+        Called on a timer by ReticulumBridge. Commands are fire-and-forget from the
+        operator's point of view, so this is what closes the loop: the node's ack arrives
+        asynchronously through the bridge and the ingestor, long after the original reply
+        was sent.
+        """
+        if _psycopg is None or not self._cfg.pg_dsn:
+            return
+        try:
+            with _psycopg.connect(self._cfg.pg_dsn, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    # Anything still pending/sent past the deadline is a timeout: the node
+                    # never answered. Marked before selecting so it gets reported too.
+                    cur.execute(
+                        """
+                        UPDATE public.command_log
+                           SET state = 'timeout', updated_at = now(), notified = false
+                         WHERE state IN ('pending', 'sent')
+                           AND requested_at < now() - (%s * interval '1 second')
+                        """,
+                        (self._cfg.cmd_ack_timeout_seconds,),
+                    )
+                    cur.execute(
+                        """
+                        SELECT cmd_id, verb, target, state, detail, requested_by
+                          FROM public.command_log
+                         WHERE notified = false
+                           AND state NOT IN ('pending', 'sent')
+                         ORDER BY requested_at
+                         LIMIT 20
+                        """
+                    )
+                    rows = cur.fetchall()
+
+                    for cmd_id, verb, target, state, detail, requested_by in rows:
+                        if self._send_outcome(cmd_id, verb, target, state, detail, requested_by):
+                            cur.execute(
+                                "UPDATE public.command_log SET notified = true WHERE cmd_id = %s",
+                                (cmd_id,),
+                            )
+        except Exception as exc:
+            logger.warning("Command outcome poll failed: %s", exc)
+
+    def _send_outcome(self, cmd_id, verb, target, state, detail, requested_by) -> bool:
+        """Send one outcome over LXMF. Returns True if it was handed to the router."""
+        icon = {"acked": "✅", "nak": "❌", "timeout": "⏱", "error": "⚠️"}.get(state, "ℹ️")
+        who = "ALL field nodes" if target in ("^all", "all") else _node_label(target)
+
+        detail = detail or {}
+        applied = detail.get("applied_value") if isinstance(detail, dict) else None
+        reason = detail.get("reason") if isinstance(detail, dict) else None
+
+        if state == "acked":
+            body = f"{icon} {who} applied {verb}"
+            if applied:
+                body += f" = {applied}"
+        elif state == "timeout":
+            body = (f"{icon} {who} did not acknowledge {verb} within "
+                    f"{self._cfg.cmd_ack_timeout_seconds}s.\n"
+                    f"The command may still have been applied — check the next reading. "
+                    f"Nodes out of direct gateway range cannot be reached by unicast; "
+                    f"try ^all instead.")
+        elif state == "nak":
+            body = f"{icon} {who} rejected {verb} (value out of range or unsupported)."
+        else:
+            body = f"{icon} {verb} → {who} failed: {reason or state}"
+
+        try:
+            dest = self._dest_from_hash(requested_by)
+            if dest is None:
+                return False
+            self._send_text_to(dest, f"{body}\n(command {cmd_id})")
+            return True
+        except Exception as exc:
+            logger.warning("Could not deliver outcome for %s: %s", cmd_id, exc)
+            return False
 
     def start(self) -> None:
         os.makedirs(self._cfg.lxmf_storage_dir, exist_ok=True)
@@ -1331,7 +1692,12 @@ class LxmfGateway:
             logger.info("Command from %s: %r", sender, cmd)
 
             nodes        = _nodes_from_postgres(self._cfg.pg_dsn)
-            text_reply, image_result = handle_command(cmd, nodes, self._cfg)
+            text_reply, image_result = handle_command(
+                cmd, nodes, self._cfg,
+                dispatch_write=self._dispatch_write,
+                source_hash=sender,
+                authorized=self._is_authorized(sender),
+            )
 
             if image_result:
                 self._send_with_image(message, text_reply, image_result)
@@ -1342,34 +1708,67 @@ class LxmfGateway:
             logger.error("Error handling message: %s", exc, exc_info=True)
 
     def _dest(self, original: Any) -> Any:
-        identity = RNS.Identity.recall(original.source_hash)
+        """Build a reply destination for an inbound message."""
+        return self._dest_from_hash(original.source_hash)
+
+    def _dest_from_hash(self, source_hash: Any) -> Any:
+        """
+        Build a destination from a bare identity hash.
+
+        Split out from _dest() so an asynchronous command outcome can be delivered later,
+        when the original LXMessage object is long gone. Accepts bytes or a hex string
+        (with or without ':' separators) since the command log stores the hex form.
+        """
+        if isinstance(source_hash, str):
+            source_hash = bytes.fromhex(source_hash.strip().lower().replace(":", ""))
+
+        identity = RNS.Identity.recall(source_hash)
         if identity is None:
             logger.info(
                 "Identity not cached for %s — requesting path...",
-                RNS.hexrep(original.source_hash, delimit=False),
+                RNS.hexrep(source_hash, delimit=False),
             )
-            RNS.Transport.request_path(original.source_hash)
+            RNS.Transport.request_path(source_hash)
             deadline = time.time() + 8
             while time.time() < deadline:
-                identity = RNS.Identity.recall(original.source_hash)
+                identity = RNS.Identity.recall(source_hash)
                 if identity is not None:
-                    logger.info("Path resolved for %s", RNS.hexrep(original.source_hash, delimit=False))
+                    logger.info("Path resolved for %s", RNS.hexrep(source_hash, delimit=False))
                     break
                 time.sleep(0.2)
         if identity is None:
             raise RuntimeError(
-                f"Cannot resolve identity for {RNS.hexrep(original.source_hash)} — path unknown"
+                f"Cannot resolve identity for {RNS.hexrep(source_hash)} — path unknown"
             )
-        if not RNS.Transport.has_path(original.source_hash):
+        if not RNS.Transport.has_path(source_hash):
             logger.warning(
                 "No RNS path cached for %s — DIRECT delivery will likely fail",
-                RNS.hexrep(original.source_hash, delimit=False),
+                RNS.hexrep(source_hash, delimit=False),
             )
         return RNS.Destination(
             identity,
             RNS.Destination.OUT, RNS.Destination.SINGLE,
             "lxmf", "delivery",
         )
+
+    def _send_text_to(self, dest: Any, text: str, title: str = "Navamesh") -> None:
+        """
+        Send text to an already-resolved destination.
+
+        Used for asynchronous command outcomes. Kept simpler than _send_text(): there is
+        no OPPORTUNISTIC fallback because a missed outcome notice is cosmetic -- the
+        command itself already succeeded or failed on its own, and the command_log row
+        stays as the durable record either way.
+        """
+        with self._lock:
+            msg = LXMF.LXMessage(
+                destination=dest,
+                source=self._source,
+                content=text,
+                title=title,
+                desired_method=LXMF.LXMessage.DIRECT,
+            )
+            self._router.handle_outbound(msg)
 
     def _send_text(self, original: Any, text: str, title: str = "Navamesh") -> None:
         with self._lock:
@@ -1505,6 +1904,7 @@ class ReticulumBridge:
         self._gateway.announce()
         threading.Timer(15.0, self._gateway.announce).start()
         threading.Thread(target=self._announce_loop, daemon=True).start()
+        threading.Thread(target=self._command_outcome_loop, daemon=True).start()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1516,6 +1916,20 @@ class ReticulumBridge:
                 self._gateway.announce()
             except Exception as exc:
                 logger.warning("Announce loop error: %s", exc)
+
+    def _command_outcome_loop(self) -> None:
+        """
+        Deliver command acks and timeouts back to the operator.
+
+        Separate from _announce_loop because the cadences are unrelated: announces are
+        every few minutes, whereas someone standing in a field waiting for a Bluetooth
+        window wants to know within seconds.
+        """
+        while not self._stop_event.wait(COMMAND_OUTCOME_POLL_SECONDS):
+            try:
+                self._gateway.notify_command_outcomes()
+            except Exception as exc:
+                logger.warning("Command outcome loop error: %s", exc)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

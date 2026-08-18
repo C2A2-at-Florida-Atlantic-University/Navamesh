@@ -29,6 +29,11 @@ class Config:
     root_sensors: str
     root_nodes: str
 
+    # Downlink command bus. reticulum_bridge publishes requests here and the bridge
+    # process (the only one holding the serial port) consumes them. Kept off the
+    # sensor roots so the ingestor's node-keyed topic classifier never sees them.
+    root_cmd: str
+
     farm_id: str
 
     # Soil calibration. The RAK4631 sends only the raw averaged ADC count; these
@@ -53,6 +58,7 @@ def load_config() -> Config:
         root_raw=os.getenv("ROOT_RAW", "farm/raw"),
         root_sensors=os.getenv("ROOT_SENSORS", "farm/sensors"),
         root_nodes=os.getenv("ROOT_NODES", "farm/nodes"),
+        root_cmd=os.getenv("ROOT_CMD", "farm/cmd"),
 
         farm_id=normalize_farm_id(os.getenv("FARM_ID", "farm1")),
 

@@ -443,6 +443,90 @@ class CloudSyncQueue:
         self._conn.close()
 
 
+class CommandLogWriter:
+    """
+    Records downlink command outcomes in public.command_log (see sql/002).
+
+    Kept entirely separate from PostgresWriter and from the NodeState cache on purpose.
+    Every other topic in this process is node-keyed and flows through
+    classify_topic -> apply_payload -> write_outputs; command rows are keyed by cmd_id
+    instead. Forcing them through that pipeline would mean bending the per-node
+    telemetry path, which is the part of this system that must not break.
+    """
+
+    def __init__(self, dsn: str):
+        self._dsn = dsn
+        self._conn = None
+        self._enabled = bool(dsn)
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled and psycopg is not None
+
+    def connect(self) -> None:
+        if not self.enabled:
+            logger.warning("Command log disabled: PG_DSN not set or psycopg missing.")
+            self._enabled = False
+            return
+        self._conn = psycopg.connect(
+            self._dsn,
+            keepalives=1, keepalives_idle=60, keepalives_interval=10, keepalives_count=5,
+        )
+        self._conn.autocommit = True
+
+    def record_status(self, payload: dict) -> None:
+        """
+        Upsert the outcome of a command.
+
+        The bridge publishes twice per command (once on transmit, once when the node's
+        ack arrives), so this has to be an upsert rather than an update.
+
+        `notified` is reset to false on every state change so the LXMF poller reports the
+        newest outcome rather than stopping after the first one.
+        """
+        if not self.enabled or self._conn is None:
+            return
+
+        cmd_id = payload.get("cmd_id")
+        if cmd_id in (None, "", 0):
+            # An unsolicited ack (quiet mode self-expired) carries cmd_id 0. There is no
+            # request row to attach it to; the bridge already logged it, and the node's
+            # next reading is the real confirmation that it is transmitting again.
+            logger.info("Command log: ignoring status with no cmd_id: %s", payload)
+            return
+
+        state = payload.get("state") or "unknown"
+        detail = payload.get("detail")
+        node_id = payload.get("node_id") or "^all"
+
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.command_log
+                        (cmd_id, verb, target, params, requested_by, state, detail, updated_at, notified)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, now(), false)
+                    ON CONFLICT (cmd_id) DO UPDATE SET
+                        state = EXCLUDED.state,
+                        detail = EXCLUDED.detail,
+                        updated_at = now(),
+                        notified = false
+                    """,
+                    (
+                        str(cmd_id),
+                        payload.get("verb") or "unknown",
+                        node_id,
+                        json.dumps(payload.get("params")) if payload.get("params") is not None else None,
+                        payload.get("requested_by") or "bridge",
+                        state,
+                        json.dumps(detail) if detail is not None else None,
+                    ),
+                )
+            logger.info("Command log: cmd_id=%s state=%s", cmd_id, state)
+        except Exception as exc:
+            logger.error("Command log write failed for cmd_id=%s: %s", cmd_id, exc)
+
+
 class PostgresWriter:
     def __init__(self, dsn: str, table_name: str = "mesh_nodes"):
         if table_name not in POSTGRES_TABLES:
@@ -877,6 +961,9 @@ class MqttToDbIngestor:
 
         # Local writers — primary, always write
         self.pg = PostgresWriter(self.db_cfg.pg_dsn, "mesh_nodes")
+        # Audit trail for downlink commands. Local only: this is an operational record of
+        # what was done to the field hardware, not sensor data for the cloud.
+        self.command_log = CommandLogWriter(self.db_cfg.pg_dsn)
         self.influx = InfluxWriter(
             url=self.db_cfg.influx_url,
             token=self.db_cfg.influx_token,
@@ -923,6 +1010,8 @@ class MqttToDbIngestor:
             "battery": f"{self.cfg.root_nodes}/+/battery",
             "link": f"{self.cfg.root_nodes}/+/link",
             "info": f"{self.cfg.root_nodes}/+/info",
+            # Not node-keyed; handled ahead of classify_topic in on_message().
+            "cmd_status": f"{self.cfg.root_cmd}/status",
         }
 
     @staticmethod
@@ -945,6 +1034,12 @@ class MqttToDbIngestor:
     def start(self) -> None:
         self.pg.connect()
         self.influx.connect()
+
+        # Non-fatal: losing the audit trail must not stop telemetry ingestion.
+        try:
+            self.command_log.connect()
+        except Exception as e:
+            logger.warning("Command log unavailable at startup: %s", e)
 
         # Cloud connections — failures are non-fatal; sync queue handles the backlog
         try:
@@ -1042,6 +1137,13 @@ class MqttToDbIngestor:
             return
 
         logger.info("MQTT received topic=%s payload=%s", topic, payload)
+
+        # Command status is keyed by cmd_id, not node_id, so it is routed here rather
+        # than through classify_topic()/NodeState. Handled before that call so a command
+        # topic can never be misread as an unexpected node topic.
+        if topic == f"{self.cfg.root_cmd}/status":
+            self.command_log.record_status(payload)
+            return
 
         with self.lock:
             kind, node_id = self.classify_topic(topic)

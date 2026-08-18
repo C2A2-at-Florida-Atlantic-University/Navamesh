@@ -6,7 +6,7 @@ import time
 from dotenv import load_dotenv, find_dotenv
 
 from navamesh.config import load_config
-from navamesh.mqtt_client import MqttPublisher
+from navamesh.mqtt_client import MqttPublisher, MqttCommandSubscriber
 from navamesh.bridge import MeshBridge
 from navamesh import topics
 
@@ -19,6 +19,12 @@ from navamesh.processors.soil_proto import (
     SOIL_SOURCE,
     extract_soil_reading,
     make_soil_mqtt_payloads,
+)
+from navamesh.processors.command_proto import (
+    COMMAND_PORTNUM,
+    CommandValidationError,
+    encode_command,
+    extract_command_ack,
 )
 from navamesh.processors.link import extract_link
 from navamesh.processors.position import extract_position
@@ -131,6 +137,32 @@ def main():
 
             decoded = packet.get("decoded", {}) or {}
 
+            # Command acknowledgement on PortNum 259. Checked before the soil path
+            # purely for readability -- the two live on different portnums, so unlike
+            # the old shared-256 scheme there is no decode-order requirement here.
+            ack = extract_command_ack(packet)
+            if ack is not None:
+                from_id = packet.get("fromId") or "unknown"
+                status = {
+                    "cmd_id": ack["command_id"],
+                    "node_id": from_id,
+                    "state": "acked" if ack["ok"] else "nak",
+                    "detail": {
+                        "command_type": ack["command_type_name"],
+                        "applied_value": ack["applied_value"],
+                        "unsolicited": ack["unsolicited"],
+                    },
+                    "ts": int(time.time()),
+                }
+                mqtt_pub.publish(topics.cmd_status(cfg.root_cmd), status, qos=1)
+                if ack["unsolicited"]:
+                    print(f"[CMD] {from_id} self-resumed from quiet mode (unsolicited ack)")
+                else:
+                    print(f"[CMD] {from_id} ack id={ack['command_id']} "
+                          f"{ack['command_type_name']} ok={ack['ok']} "
+                          f"applied={ack['applied_value']}")
+                return
+
             # FORMAT C: navamesh.SoilReading protobuf on PortNum 256 (PRIVATE_APP).
             # Authoritative path — the node sends the RAW averaged ADC and the
             # percentage is derived here. Must be handled before the
@@ -219,6 +251,68 @@ def main():
     bridge = MeshBridge(cfg.serial_port, on_receive=on_receive)
     bridge.start()
 
+    def on_command(req: dict) -> None:
+        """
+        Transmit a command that reticulum_bridge has already validated and logged.
+
+        This process is the only one holding the serial port, which is why the command
+        arrives over MQTT rather than being sent by the process that received it from
+        the operator.
+
+        Everything is re-validated here anyway. This is the last gate before RF, and it
+        must hold even if a command were published by something other than
+        reticulum_bridge.
+        """
+        cmd_id = req.get("cmd_id")
+        verb = (req.get("verb") or "").strip().lower()
+        target = (req.get("target") or "^all").strip()
+        value = req.get("value")
+        quiet_on = req.get("quiet_on")
+
+        def report(state: str, detail) -> None:
+            mqtt_pub.publish(
+                topics.cmd_status(cfg.root_cmd),
+                {
+                    "cmd_id": cmd_id,
+                    "node_id": target,
+                    "state": state,
+                    "detail": detail,
+                    "ts": int(time.time()),
+                },
+                qos=1,
+            )
+
+        try:
+            payload = encode_command(verb, cmd_id, value=value, quiet_on=quiet_on)
+        except CommandValidationError as e:
+            print(f"[CMD] rejecting {verb!r} for {target}: {e}")
+            report("error", {"reason": str(e)})
+            return
+
+        # want_ack only for unicast. A broadcast has no hardware ack, so requesting one
+        # would burn airtime on retries that cannot ever be satisfied. Either way the
+        # node's own NavameshAck on PortNum 259 is what actually confirms delivery.
+        is_broadcast = target in ("^all", "", "all")
+        sent = bridge.send_data(
+            payload,
+            destination_id="^all" if is_broadcast else target,
+            port_num=COMMAND_PORTNUM,
+            channel_index=cfg.private_channel_index,
+            want_ack=not is_broadcast,
+        )
+
+        if sent:
+            print(f"[CMD] sent id={cmd_id} {verb} -> {target} "
+                  f"(value={value}, quiet_on={quiet_on})")
+            report("sent", {"broadcast": is_broadcast})
+        else:
+            print(f"[CMD] transmit failed id={cmd_id} {verb} -> {target}")
+            report("error", {"reason": "gateway radio unavailable"})
+
+    cmd_sub = MqttCommandSubscriber(
+        cfg.mqtt_host, cfg.mqtt_port, topics.cmd_request(cfg.root_cmd), on_command
+    )
+
     print("Navamesh bridge running. Ctrl+C to stop.")
     try:
         while True:
@@ -226,6 +320,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        cmd_sub.close()
         bridge.stop()
         mqtt_pub.close()
         print("Stopped.")

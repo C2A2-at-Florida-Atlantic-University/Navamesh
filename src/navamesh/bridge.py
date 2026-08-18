@@ -19,6 +19,9 @@ class MeshBridge:
         self._on_receive = on_receive
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # Serialises transmits. send_data() is called from the MQTT client's network
+        # thread while _run_loop()'s reconnect logic may be swapping _iface underneath it.
+        self._send_lock = threading.Lock()
 
     def start(self) -> None:
         self._running = True
@@ -76,6 +79,46 @@ class MeshBridge:
             if self._running:
                 print(f"[BRIDGE] Waiting {RECONNECT_DELAY_SECS}s before reconnect...")
                 time.sleep(RECONNECT_DELAY_SECS)
+
+    def send_data(
+        self,
+        payload: bytes,
+        destination_id: str = "^all",
+        port_num: int = 258,
+        channel_index: int = 0,
+        want_ack: bool = False,
+    ) -> bool:
+        """
+        Transmit a raw payload into the mesh.
+
+        This is the only outbound path in the bridge; everything else here is
+        receive-only. Exposed as a method rather than a getter for `_iface` so the
+        reconnect lifecycle stays owned by this class.
+
+        `destination_id` is either "^all" for broadcast or a Meshtastic "!hexid".
+        Use want_ack only for unicast -- a broadcast has no hardware acknowledgement,
+        and asking for one just wastes airtime on retries that can never succeed.
+
+        Returns False rather than raising when the port is mid-reconnect, so a
+        caller on the MQTT thread can report "not sent" instead of dying.
+        """
+        with self._send_lock:
+            iface = self._iface
+            if iface is None:
+                print("[BRIDGE] send_data: no interface (reconnecting?), dropping")
+                return False
+            try:
+                iface.sendData(
+                    payload,
+                    destinationId=destination_id,
+                    portNum=port_num,
+                    channelIndex=channel_index,
+                    wantAck=want_ack,
+                )
+                return True
+            except Exception as e:
+                print(f"[BRIDGE] send_data failed: {e}")
+                return False
 
     def stop(self) -> None:
         self._running = False

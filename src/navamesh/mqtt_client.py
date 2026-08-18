@@ -50,3 +50,55 @@ class MqttPublisher:
             self._client.loop_stop()
         except Exception:
             pass
+
+
+class MqttCommandSubscriber:
+    """
+    Holds a durable subscription and invokes a callback per message.
+
+    Deliberately its own paho client rather than a method on MqttPublisher:
+    MqttPublisher.collect_retained() takes over `on_message` and then sets it back to
+    None, which would silently tear down any long-lived subscription sharing that
+    client. Keeping them separate means the startup retained-purge cannot break the
+    command bus.
+    """
+
+    def __init__(self, host: str, port: int, topic: str, on_command, qos: int = 1):
+        self._topic = topic
+        self._qos = qos
+        self._on_command = on_command
+        self._client = mqtt.Client()
+        self._client.on_connect = self._on_connect
+        self._client.on_message = self._on_message
+        # connect_async, not connect: the bridge and the broker are separate containers
+        # with no start-up ordering guarantee, and the gateway radio is far more
+        # important than the command bus. A blocking connect here would abort the whole
+        # bridge process just because the broker was a few seconds behind. paho's network
+        # loop retries on its own, and _on_connect re-subscribes each time it succeeds.
+        self._client.connect_async(host, port, 60)
+        self._client.loop_start()
+
+    def _on_connect(self, client, userdata, flags, rc):
+        # Re-subscribing here (rather than once after connect) means the subscription
+        # survives a broker restart, which would otherwise leave commands unheard.
+        client.subscribe(self._topic, qos=self._qos)
+        print(f"[MQTT] subscribed rc={rc} topic={self._topic}")
+
+    def _on_message(self, client, userdata, msg):
+        # A malformed command must never kill the network thread -- that would take the
+        # whole command bus down until the process restarted.
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+        except Exception as e:
+            print(f"[MQTT] ignoring undecodable command on {msg.topic}: {e}")
+            return
+        try:
+            self._on_command(payload)
+        except Exception as e:
+            print(f"[MQTT] command handler raised on {msg.topic}: {e}")
+
+    def close(self) -> None:
+        try:
+            self._client.loop_stop()
+        except Exception:
+            pass

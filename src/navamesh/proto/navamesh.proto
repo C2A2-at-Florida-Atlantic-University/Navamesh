@@ -3,7 +3,19 @@ syntax = "proto3";
 package navamesh;
 
 /*
- * Private Navamesh wire format, sent on Meshtastic PortNum 256 (PRIVATE_APP).
+ * Private Navamesh wire format.
+ *
+ * Three messages on three portnums, all on the "navamesh" channel:
+ *   SoilReading    PortNum 256 (PRIVATE_APP)  node -> Pi, broadcast
+ *   NavameshCommand PortNum 258              Pi -> node, unicast or broadcast
+ *   NavameshAck    PortNum 259               node -> Pi, unicast
+ *
+ * Separate portnums (rather than multiplexing everything onto 256) mean the
+ * receiving module's portnum filter does all the discrimination: there is no
+ * decode-order rule, no ambiguity, and SoilReading stays byte-for-byte identical
+ * to what the 18 deployed nodes already send. Only 256 and 257
+ * (ATAK_FORWARDER) are assigned upstream; 258-510 are free and _PortNum_MAX is
+ * 511, so 258/259 cannot collide with a stock portnum.
  *
  * This is NOT part of upstream Meshtastic. The protobufs/ submodule is never
  * modified, so there is no risk of colliding with a field number that upstream
@@ -44,4 +56,98 @@ message SoilReading {
    * Wrap-safe seconds since boot.
    */
   uint32 uptime_seconds = 4;
+}
+
+/*
+ * What a NavameshCommand asks a node to do.
+ *
+ * Numeric arguments are carried in NavameshCommand rather than encoded per-type,
+ * so adding a command later does not disturb existing field numbers. Bounds are
+ * enforced in firmware constants, NOT here -- limits can then be retuned by a
+ * firmware bump without a proto regen on both sides.
+ */
+enum NavameshCommandType {
+  NAVAMESH_COMMAND_UNKNOWN = 0;
+
+  /*
+   * Enable Bluetooth for duration_minutes, then disable it automatically.
+   * This is how the field crew gets a connectable node without opening the
+   * solar case: broadcast the window, walk up, connect, and it closes itself.
+   */
+  BLE_WINDOW = 1;
+
+  /*
+   * Set moduleConfig.telemetry.environment_update_interval to interval_seconds.
+   * Takes effect on the next telemetry cycle with NO reboot, and persists.
+   */
+  SET_TELEMETRY_INTERVAL = 2;
+
+  /*
+   * Stop transmitting telemetry and position. The receiver stays on, so the node
+   * still hears QUIET_MODE_EXIT. duration_minutes is a safety ceiling after
+   * which the node resumes on its own, so a lost exit command cannot silence a
+   * node indefinitely. Never persisted -- any reboot resumes normal operation.
+   */
+  QUIET_MODE_ENTER = 3;
+
+  /*
+   * Resume transmitting immediately.
+   */
+  QUIET_MODE_EXIT = 4;
+}
+
+/*
+ * Pi -> node, PortNum 258.
+ *
+ * There is deliberately no target-node field. Meshtastic's own routing already
+ * does the addressing: MeshModule::callModules() computes
+ * toUs = isBroadcast(mp.to) || isToUs(&mp) and only dispatches matching packets,
+ * so mp.to = NODENUM_BROADCAST reaches every node and mp.to = <nodenum> reaches
+ * exactly one.
+ */
+message NavameshCommand {
+  NavameshCommandType command_type = 1;
+
+  /*
+   * Sender-chosen nonce, echoed in NavameshAck.command_id so the Pi can
+   * correlate a reply to the command that caused it.
+   *
+   * Also the replay guard: a node rejects any command_id that is not strictly
+   * greater than the last one it accepted. This channel has no PKI (trust is the
+   * channel PSK), so without this a captured packet could simply be replayed.
+   */
+  uint32 command_id = 2;
+
+  /*
+   * BLE_WINDOW and QUIET_MODE_ENTER. 0 means "use the firmware default".
+   */
+  uint32 duration_minutes = 3;
+
+  /*
+   * SET_TELEMETRY_INTERVAL only.
+   */
+  uint32 interval_seconds = 4;
+}
+
+/*
+ * node -> Pi, PortNum 259, unicast back to the commanding node.
+ *
+ * Also sent UNSOLICITED with command_id = 0 and command_type = QUIET_MODE_EXIT
+ * when quiet mode self-expires, so the Pi learns a node recovered on its own
+ * even though nobody sent it an exit command.
+ */
+message NavameshAck {
+  uint32 command_id = 1;
+  NavameshCommandType command_type = 2;
+
+  /*
+   * False when the command was malformed or the value was out of range.
+   */
+  bool ok = 3;
+
+  /*
+   * The value actually applied AFTER clamping, so the Pi can report "you asked
+   * for 5 s, the node applied 30 s" rather than silently disagreeing with it.
+   */
+  uint32 applied_value = 4;
 }
