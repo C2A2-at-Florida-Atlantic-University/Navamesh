@@ -29,6 +29,7 @@ test = [
 navamesh-bridge  = "navamesh._bridge:main"
 navamesh-ingest  = "navamesh.mqtt_to_db:main"
 navamesh-sync-admin = "navamesh.sync_admin:main"
+navamesh-cmd     = "navamesh.cmd_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

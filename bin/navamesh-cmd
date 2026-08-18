@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Host-side convenience wrapper: runs navamesh-cmd inside the bridge container, which is
+# where the package and its dependencies live. The bridge owns the gateway serial port, so
+# commands go via MQTT rather than opening the radio a second time.
+#
+#   bin/navamesh-cmd ble      !0b9aed49 15
+#   bin/navamesh-cmd interval !0b9aed49 300
+#   bin/navamesh-cmd quiet    !0b9aed49 on
+#   bin/navamesh-cmd ble      ^all 30
+exec docker exec navamesh_bridge navamesh-cmd "$@"
