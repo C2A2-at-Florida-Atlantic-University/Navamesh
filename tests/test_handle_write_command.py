@@ -9,6 +9,7 @@ import pytest
 
 from navamesh.reticulum_bridge import (
     WRITE_VERBS,
+    is_lxmf_destination,
     NodeSnapshot,
     ReticulumBridgeConfig,
     handle_command,
@@ -210,3 +211,27 @@ def test_dispatch_failure_is_surfaced_to_the_operator(nodes, cfg):
     reply = _run(f"ble {KNOWN_NODE} 15", nodes, cfg, dispatch=rec)
     assert "could not queue" in reply.lower()
     assert "broker unreachable" in reply
+
+
+# ── outcome delivery targets ─────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("requested_by", ["navamesh-cmd", "bridge", "", None])
+def test_non_lxmf_requesters_are_not_reply_targets(requested_by):
+    """
+    Regression guard. Commands from the CLI or the bridge stamp requested_by with a
+    name, not an RNS hash. Treating those as destinations raised ValueError from
+    bytes.fromhex, and because the row was then never marked notified it retried every
+    poll cycle forever -- observed spamming the reticulum log once per 5s.
+    """
+    assert is_lxmf_destination(requested_by) is False
+
+
+@pytest.mark.parametrize("h", ["a" * 32, ("b" * 32).upper(), "aa:" + "c" * 30, "  " + "d" * 32 + "  "])
+def test_real_rns_hashes_are_reply_targets(h):
+    """RNS prints hashes 16 bytes wide, in either delimited or bare form."""
+    assert is_lxmf_destination(h) is True
+
+
+@pytest.mark.parametrize("h", ["a" * 31, "a" * 33, "z" * 32])
+def test_wrong_length_or_non_hex_is_rejected(h):
+    assert is_lxmf_destination(h) is False

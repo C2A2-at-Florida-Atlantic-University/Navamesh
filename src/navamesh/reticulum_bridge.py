@@ -530,6 +530,22 @@ WRITE_VERBS = ("ble", "interval", "quiet")
 COMMAND_OUTCOME_POLL_SECONDS = 5
 
 
+def is_lxmf_destination(requested_by: str) -> bool:
+    """
+    True if `requested_by` looks like an RNS identity hash we could reply to.
+
+    Commands do not only come from Sideband: navamesh-cmd stamps requested_by with its
+    own name, and the bridge uses "bridge". Those requesters get their answer through
+    MQTT and have no LXMF address, so trying to build a destination for them raises
+    ValueError from bytes.fromhex and -- because the row then never gets marked
+    notified -- retries forever, once per poll.
+    """
+    if not requested_by:
+        return False
+    h = requested_by.strip().lower().replace(":", "")
+    return len(h) == 32 and all(c in "0123456789abcdef" for c in h)
+
+
 def is_sender_authorized(sender_hash: str, allowed_hashes) -> bool:
     """
     May this sender issue control commands?
@@ -1617,6 +1633,15 @@ class LxmfGateway:
                     rows = cur.fetchall()
 
                     for cmd_id, verb, target, state, detail, requested_by in rows:
+                        if not is_lxmf_destination(requested_by):
+                            # Nothing to deliver to: this command came from the CLI or the
+                            # bridge, which already reported the outcome over MQTT. Mark it
+                            # notified so it is not re-polled every cycle.
+                            cur.execute(
+                                "UPDATE public.command_log SET notified = true WHERE cmd_id = %s",
+                                (cmd_id,),
+                            )
+                            continue
                         if self._send_outcome(cmd_id, verb, target, state, detail, requested_by):
                             cur.execute(
                                 "UPDATE public.command_log SET notified = true WHERE cmd_id = %s",

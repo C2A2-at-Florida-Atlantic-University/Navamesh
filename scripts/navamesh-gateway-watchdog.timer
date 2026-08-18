@@ -1,0 +1,11 @@
+[Unit]
+Description=Check every 5 min whether the gateway radio has gone silent
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=navamesh-gateway-watchdog.service
+
+[Install]
+WantedBy=timers.target

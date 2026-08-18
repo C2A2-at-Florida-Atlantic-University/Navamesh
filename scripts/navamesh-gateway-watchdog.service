@@ -1,0 +1,7 @@
+[Unit]
+Description=Recover a hung Meshtastic gateway radio by re-enumerating its USB device
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/navamesh-gateway-watchdog

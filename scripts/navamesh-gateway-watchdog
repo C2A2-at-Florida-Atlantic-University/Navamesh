@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# navamesh-gateway-watchdog — recover a hung Meshtastic gateway radio.
+#
+# The RAK4631 gateway has twice stopped delivering packets over USB while still
+# enumerated: no USB disconnect, no error from the bridge, which sits holding an
+# open port to a dead radio. Observed 2026-08-17 and 2026-08-18.
+#
+# Toggling the USB device s authorized flag forces a re-enumeration, which
+# recovered it both times WITHOUT physical access. That the re-enumeration is
+# enough tells us the hang is in the device s USB/CDC-ACM layer rather than the
+# whole radio.
+#
+# Detection is "no [SENSOR] line in the bridge log for STALE_SECS". That is a
+# deliberately conservative signal: it only fires when data has genuinely stopped,
+# so a quiet mesh at a long telemetry interval must not trip it -- set STALE_SECS
+# comfortably above the slowest expected reporting interval.
+set -uo pipefail
+
+STALE_SECS="${STALE_SECS:-900}"      # 15 min. Field nodes report every 8h, but the
+                                     # gateway also emits its own telemetry far more
+                                     # often, so 15 min of total silence is abnormal.
+CONTAINER="${CONTAINER:-navamesh_bridge}"
+VENDOR_ID="${VENDOR_ID:-239a}"       # Adafruit/RAK nRF52
+LOG_TAG="navamesh-watchdog"
+
+log() { logger -t "$LOG_TAG" "$*"; echo "$(date -Is) $*"; }
+
+# Any sensor traffic recently? Absence of the container is not our problem to fix.
+if ! docker inspect -f "{{.State.Running}}" "$CONTAINER" >/dev/null 2>&1; then
+  log "container $CONTAINER not running; nothing to do"
+  exit 0
+fi
+
+recent=$(docker logs --since "${STALE_SECS}s" "$CONTAINER" 2>&1 | grep -c "\[SENSOR\]" || true)
+if [ "${recent:-0}" -gt 0 ]; then
+  exit 0
+fi
+
+# Find the radio s USB device directory by vendor id.
+devpath=""
+for d in /sys/bus/usb/devices/*/idVendor; do
+  [ -r "$d" ] || continue
+  if [ "$(cat "$d" 2>/dev/null)" = "$VENDOR_ID" ]; then devpath="$(dirname "$d")"; break; fi
+done
+if [ -z "$devpath" ] || [ ! -w "$devpath/authorized" ]; then
+  log "no writable USB device for vendor $VENDOR_ID; cannot reset"
+  exit 1
+fi
+
+log "no sensor traffic in ${STALE_SECS}s -- re-enumerating $(basename "$devpath")"
+echo 0 > "$devpath/authorized"; sleep 3
+echo 1 > "$devpath/authorized"; sleep 10
+
+# The bridge reconnects on its own (10s retry loop), so do not restart it here:
+# restarting would discard its MQTT subscription and buy nothing.
+log "re-enumeration done; bridge will reconnect on its own"
