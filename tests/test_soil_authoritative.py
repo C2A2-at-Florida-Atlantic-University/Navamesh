@@ -109,7 +109,7 @@ def test_A_private_app_produces_raw_and_derived_percent(bridge):
     pct = soil_topics(mqtt, "percent")
 
     assert len(raw) == 1 and raw[0][1]["value"] == 1842
-    assert len(pct) == 1 and pct[0][1]["value"] == pytest.approx(82.29, abs=0.01)
+    assert len(pct) == 1 and pct[0][1]["value"] == pytest.approx(10.0, abs=0.5)
     # Both stamped as authoritative so startup purge can recognise them.
     assert raw[0][1]["source"] == SOIL_SOURCE
     assert pct[0][1]["source"] == SOIL_SOURCE
@@ -199,7 +199,7 @@ def test_D_legacy_after_valid_reading_cannot_overwrite(bridge):
 
     pct = soil_topics(mqtt, "percent")
     assert len(pct) == 1, "legacy text published a second soil percent"
-    assert pct[0][1]["value"] == authoritative == pytest.approx(82.29, abs=0.01)
+    assert pct[0][1]["value"] == authoritative == pytest.approx(10.0, abs=0.5)
 
 
 def test_D2_startup_purges_legacy_retained_but_keeps_authoritative(monkeypatch):
@@ -212,7 +212,7 @@ def test_D2_startup_purges_legacy_retained_but_keeps_authoritative(monkeypatch):
         # Legacy: no source marker -> must be purged
         "farm/sensors/soil/!legacy01/percent": {"value": 100, "fromId": "!legacy01"},
         # Authoritative: marked -> must be kept
-        "farm/sensors/soil/!new00001/percent": {"value": 82.29, "fromId": "!new00001",
+        "farm/sensors/soil/!new00001/percent": {"value": 10.0, "fromId": "!new00001",
                                                 "source": SOIL_SOURCE},
         "farm/sensors/soil/!new00001/raw": {"value": 1842, "fromId": "!new00001",
                                             "source": SOIL_SOURCE},

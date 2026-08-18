@@ -166,7 +166,10 @@ def test_mqtt_payload_shapes():
     assert raw_pl["value"] == 1842 and raw_pl["fromId"] == "!a1b2c3d4"
     assert "ts" in raw_pl
     assert band_pl["value"] == DAMP_BAND
-    assert pct_pl["value"] == pytest.approx(11.0, abs=0.5)
+    # 1842 sits above CURVE[0] (1603 = 10%), i.e. drier than the driest measured
+    # point in the DAMP band, so the estimate clamps to 10.0 rather than
+    # extrapolating past the data.
+    assert pct_pl["value"] == pytest.approx(10.0, abs=0.5)
 
     # apply_payload() reads exactly these keys off the battery topic.
     assert bat_pl["batteryLevel"] == 85.0
