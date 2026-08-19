@@ -100,6 +100,7 @@ except ImportError:
     MAP_AVAILABLE = False
 
 from navamesh.config import load_config
+from navamesh.calibration import DAMP, adc_to_band, adc_to_percent
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -342,6 +343,10 @@ def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
         snapshots[node_id] = NodeSnapshot(
             node_id=node_id,
             ts=int(ts) if ts is not None else None,
+            # soil_raw is the authoritative reading -- the DRY/DAMP/WET band is
+            # derived from it. Without this the formatter silently falls back to
+            # the legacy (node-computed, uncalibrated) percentage.
+            soil_raw=meta.get("soil_raw"),
             soil_percent=meta.get("soil_percent"),
             battery_level=meta.get("battery_level"),
             battery_usb=meta.get("battery_usb"),
@@ -431,6 +436,37 @@ def _fmt_uptime(seconds: Optional[int]) -> str:
     if m: return f"{m}m {s}s"
     return f"{s}s"
 
+def _fmt_soil_reading(snap) -> Optional[str]:
+    """Render a soil reading as a DRY/DAMP/WET band, or None if there is no data.
+
+    The band comes from the RAW ADC via calibration.adc_to_band(), which is the
+    single source of truth -- do not re-derive thresholds anywhere else.
+
+    A percentage is shown ONLY inside the DAMP band. adc_to_percent() returns
+    None outside it by design: below WET_CEIL_ADC and above DRY_FLOOR_ADC the
+    probe is pinned to a rail and has no resolution, so a percentage there is
+    invented precision. The raw count is kept in parentheses for diagnostics.
+
+    snap.soil_percent is deliberately NOT trusted when a raw count exists: the
+    DB still holds percentages parsed from legacy firmware status strings (see
+    processors/soil_text.py, which states they are not authoritative), and those
+    disagree with the probe -- a node at raw_adc=4095 (bone dry) was reporting
+    "10.0%". It is used only as a last resort for nodes that never send raw.
+    """
+    if snap.soil_raw is not None:
+        raw = float(snap.soil_raw)
+        band = adc_to_band(raw)
+        if band == DAMP:
+            pct = adc_to_percent(raw)
+            if pct is not None:
+                return f"{band} ~{pct:.0f}% (ADC {raw:.0f})"
+        return f"{band} (ADC {raw:.0f})"
+    if snap.soil_percent is not None:
+        # Legacy firmware only: no raw count, so the band cannot be derived.
+        return f"{snap.soil_percent:.1f}% (legacy, uncalibrated)"
+    return None
+
+
 def _header(title: str) -> str:
     return f"{'─'*30}\n{title}\n{'─'*30}\n"
 
@@ -441,10 +477,9 @@ def fmt_status(nodes: Dict[str, NodeSnapshot]) -> str:
     for node_id, snap in sorted(nodes.items()):
         lines.append(f"[ {_fmt_node(node_id)} ]  {node_id}")
         lines.append(f"  Last seen:  {_fmt_ts(snap.ts)}")
-        if snap.soil_percent is not None:
-            lines.append(f"  Soil:       {snap.soil_percent:.1f}%")
-        elif snap.soil_raw is not None:
-            lines.append(f"  Soil ADC:   {snap.soil_raw}")
+        soil = _fmt_soil_reading(snap)
+        if soil is not None:
+            lines.append(f"  Soil:       {soil}")
         if snap.battery_usb:
             lines.append(f"  Battery:    USB (charging)")
         elif snap.battery_level is not None:
@@ -462,12 +497,11 @@ def fmt_soil(nodes: Dict[str, NodeSnapshot]) -> str:
     if not nodes: return "No soil data in database yet."
     lines = [_header("🌱 Soil Moisture")]
     for node_id, snap in sorted(nodes.items()):
-        if snap.soil_percent is not None:
-            lines.append(f"{_fmt_node(node_id)}: {snap.soil_percent:.1f}%  ({_fmt_ts(snap.ts)})")
-        elif snap.soil_raw is not None:
-            lines.append(f"{_fmt_node(node_id)}: ADC={snap.soil_raw}  ({_fmt_ts(snap.ts)})")
-        else:
+        soil = _fmt_soil_reading(snap)
+        if soil is None:
             lines.append(f"{_fmt_node(node_id)}: no soil data yet")
+        else:
+            lines.append(f"{_fmt_node(node_id)}: {soil}  ({_fmt_ts(snap.ts)})")
     return "\n".join(lines)
 
 def fmt_battery(nodes: Dict[str, NodeSnapshot]) -> str:
