@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# navamesh-watch — follow ONLY the command round-trip, with the noise removed.
+#
+# `docker compose logs -f` is unusable for watching a command test: the ingestor
+# emits a cloud-sync retry line every 30s (that queue is intentionally never
+# flushed on the dev Pi) and the bridge prints an [MQTT] published line for every
+# single topic. The signal is a handful of lines per command, buried in hundreds.
+#
+# This follows only the two services that matter -- reticulum (what the phone
+# asked for) and bridge (what went over LoRa and what the node answered) -- and
+# keeps just the lines that tell the story:
+#
+#   reticulum_1  | Command from a1b2... : 'ble !0b9aed49 5'     <- phone asked
+#   bridge_1     | [CMD] sent id=1787... ble -> !0b9aed49       <- went out over LoRa
+#   bridge_1     | [CMD] !0b9aed49 ack id=1787... BLE_WINDOW ok=True applied=5
+#   bridge_1     | [SENSOR] !0b9aed49 | raw_adc=4095 | soil=DRY | ...   <- interval effect
+#
+# The ingestor is excluded entirely rather than filtered, which is what removes
+# the cloud-write chatter at the source.
+#
+# Usage:
+#   scripts/navamesh-watch                 # commands + acks + node reports
+#   scripts/navamesh-watch --commands      # drop [SENSOR]; just the command traffic
+#   scripts/navamesh-watch --since 30m     # include recent history, then follow
+#   scripts/navamesh-watch --raw           # no filtering (bridge+reticulum only)
+set -uo pipefail
+
+SINCE=""
+MODE="all"
+cd "$(dirname "$0")/.." || exit 1
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --commands|--commands-only) MODE="commands" ;;
+    --raw)                      MODE="raw" ;;
+    --since)                    SINCE="--since $2"; shift ;;
+    --since=*)                  SINCE="--since ${1#*=}" ;;
+    -h|--help)                  sed -n '2,28p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# What counts as signal.
+#   \[CMD\]      bridge: queued / sent / ack / nak / transmit failed
+#   Command from reticulum: the verb the phone actually sent
+#   Queued:      the reply text handed back to the phone
+#   \[BRIDGE\]   gateway serial connect/lost -- explains a sudden silence
+#   NavameshCommand / self-resumed: node-side notices worth seeing
+INCLUDE='\[CMD\]|Command from|Queued:|\[BRIDGE\]|self-resumed|NavameshCommand'
+[ "$MODE" = "all" ] && INCLUDE="$INCLUDE|\[SENSOR\]"
+
+# Belt-and-braces: these should not appear once the ingestor is excluded, but a
+# future service could reintroduce them.
+EXCLUDE='Cloud sync|MQTT\] published|MQTT received|Postgres|Influx|Announce sent'
+
+echo "watching: bridge + reticulum   mode=$MODE ${SINCE:+($SINCE)}"
+echo "(ingestor excluded -- that is where the cloud-sync retries come from)"
+echo "---"
+
+if [ "$MODE" = "raw" ]; then
+  exec docker compose logs -f --tail 20 $SINCE bridge reticulum
+fi
+
+# --tail 0 unless --since was given, so we start at "now" and only show the test.
+TAIL="--tail 0"; [ -n "$SINCE" ] && TAIL=""
+
+docker compose logs -f $TAIL $SINCE bridge reticulum 2>&1 \
+  | grep --line-buffered -E "$INCLUDE" \
+  | grep --line-buffered -vE "$EXCLUDE"
