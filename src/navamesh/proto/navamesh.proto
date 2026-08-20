@@ -94,6 +94,19 @@ enum NavameshCommandType {
    * Resume transmitting immediately.
    */
   QUIET_MODE_EXIT = 4;
+
+  /*
+   * Store latitude_i/longitude_i as this node's fixed position, exactly as the
+   * Meshtastic app's "Fixed Position" toggle does over Bluetooth.
+   *
+   * These nodes ship with gps_mode = NOT_PRESENT and have no GPS receiver, so a
+   * position can only ever come from outside. Until now that meant standing next
+   * to a sealed solar case with the stock app; this carries the same coordinates
+   * over LoRa instead. Applied with NO reboot and persisted.
+   *
+   * Never send this to NODENUM_BROADCAST: every node would claim the same spot.
+   */
+  SET_LOCATION = 5;
 }
 
 /*
@@ -127,6 +140,21 @@ message NavameshCommand {
    * SET_TELEMETRY_INTERVAL only.
    */
   uint32 interval_seconds = 4;
+
+  /*
+   * SET_LOCATION only: degrees * 1e7, the same integer convention (and the same
+   * sfixed32 wire type) as meshtastic.Position.latitude_i/longitude_i, so the
+   * values drop straight into a meshtastic_Position with no rescaling.
+   *
+   * sfixed32 rather than sint32 because a coordinate is almost never small: the
+   * zigzag varint that makes sint32 cheap for values near zero costs 5 bytes for
+   * a real longitude, where sfixed32 is always exactly 4.
+   *
+   * 0/0 is rejected rather than applied. It is a valid point in the Gulf of
+   * Guinea, but in practice it only ever means "the sender had no GPS fix".
+   */
+  sfixed32 latitude_i = 5;
+  sfixed32 longitude_i = 6;
 }
 
 /*
@@ -150,4 +178,18 @@ message NavameshAck {
    * for 5 s, the node applied 30 s" rather than silently disagreeing with it.
    */
   uint32 applied_value = 4;
+
+  /*
+   * SET_LOCATION only: the coordinates actually stored, echoed back.
+   *
+   * applied_value is unsigned and single, so it cannot carry a signed pair. The
+   * alternative -- inferring success from the node's next position broadcast --
+   * would make confirmation depend on a second packet surviving the mesh, and
+   * would say nothing at all while quiet mode is suppressing transmissions.
+   *
+   * Zero on every other command type, which is also what a pre-SET_LOCATION node
+   * yields when its acks are decoded by a newer Pi.
+   */
+  sfixed32 applied_latitude_i = 5;
+  sfixed32 applied_longitude_i = 6;
 }

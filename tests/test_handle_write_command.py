@@ -132,7 +132,7 @@ def test_ble_window_dispatches_with_parsed_value(nodes, cfg):
     reply = _run(f"ble {KNOWN_NODE} 30", nodes, cfg, dispatch=rec)
     assert rec.calls[0] == {
         "verb": "ble", "target": KNOWN_NODE, "value": 30,
-        "quiet_on": None, "requested_by": "deadbeef",
+        "quiet_on": None, "lat": None, "lon": None, "requested_by": "deadbeef",
     }
     assert "12345" in reply
 
@@ -200,6 +200,73 @@ def test_malformed_arguments_are_rejected_with_guidance(bad, nodes, cfg):
     reply = _run(bad, nodes, cfg, dispatch=rec)
     assert reply.startswith("⚠️")
     assert rec.calls == []
+
+
+# ── setloc ───────────────────────────────────────────────────────────────────────
+
+def test_setloc_dispatches_both_coordinates(nodes, cfg):
+    rec = Recorder()
+    reply = _run(f"setloc {KNOWN_NODE} 36.0721 -109.0450", nodes, cfg, dispatch=rec)
+    assert rec.calls[0] == {
+        "verb": "setloc", "target": KNOWN_NODE, "value": None, "quiet_on": None,
+        "lat": 36.0721, "lon": -109.0450, "requested_by": "deadbeef",
+    }
+    assert "36.072100" in reply and "-109.045000" in reply
+
+
+@pytest.mark.parametrize("target", ["^all", "all"])
+def test_setloc_refuses_to_broadcast(target, nodes, cfg):
+    """
+    Every node claiming the same coordinates would erase the node map in one command, and
+    nothing about it is undoable over the air. The transmit path in _bridge refuses this
+    independently; this is the copy that gives the operator a reason.
+    """
+    rec = Recorder()
+    reply = _run(f"setloc {target} 36.0721 -109.0450", nodes, cfg, dispatch=rec)
+    assert "one node" in reply.lower()
+    assert rec.calls == []
+
+
+@pytest.mark.parametrize("bad", [
+    f"setloc {KNOWN_NODE} 91.0 -109.045",     # latitude past the pole
+    f"setloc {KNOWN_NODE} -90.001 -109.045",
+    f"setloc {KNOWN_NODE} 36.0721 180.5",     # longitude past the antimeridian
+    f"setloc {KNOWN_NODE} 36.0721 -180.5",
+])
+def test_setloc_out_of_range_is_rejected_before_dispatch(bad, nodes, cfg):
+    rec = Recorder()
+    reply = _run(bad, nodes, cfg, dispatch=rec)
+    assert "must be" in reply.lower()
+    assert rec.calls == []
+
+
+@pytest.mark.parametrize("bad", [
+    "setloc",
+    f"setloc {KNOWN_NODE}",
+    f"setloc {KNOWN_NODE} 36.0721",           # longitude missing
+    f"setloc {KNOWN_NODE} north west",
+    f"setloc {KNOWN_NODE} 36.0721 west",
+])
+def test_setloc_malformed_arguments_are_rejected_with_guidance(bad, nodes, cfg):
+    rec = Recorder()
+    reply = _run(bad, nodes, cfg, dispatch=rec)
+    assert reply.startswith("⚠️")
+    assert rec.calls == []
+
+
+def test_setloc_unknown_node_is_rejected_before_dispatch(nodes, cfg):
+    rec = Recorder()
+    reply = _run("setloc !nosuchnode 36.0721 -109.0450", nodes, cfg, dispatch=rec)
+    assert "not found" in reply.lower()
+    assert rec.calls == []
+
+
+def test_setloc_accepts_integer_degrees(nodes, cfg):
+    """A whole-number coordinate is still a coordinate; int() parsing would be a trap."""
+    rec = Recorder()
+    _run(f"setloc {KNOWN_NODE} 36 -109", nodes, cfg, dispatch=rec)
+    assert rec.calls[0]["lat"] == 36.0
+    assert rec.calls[0]["lon"] == -109.0
 
 
 def test_dispatch_failure_is_surfaced_to_the_operator(nodes, cfg):

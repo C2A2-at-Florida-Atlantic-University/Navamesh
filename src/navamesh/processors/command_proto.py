@@ -27,11 +27,15 @@ ACK_PORTNUM = 259
 VERB_BLE = "ble"
 VERB_INTERVAL = "interval"
 VERB_QUIET = "quiet"
+VERB_SETLOC = "setloc"
 
-_VERB_TO_COMMAND_TYPE = {
-    VERB_BLE: navamesh_pb2.BLE_WINDOW,
-    VERB_INTERVAL: navamesh_pb2.SET_TELEMETRY_INTERVAL,
-}
+# Verbs that may never go to ^all. A broadcast setloc would hand every node in the field the
+# same coordinates in one unrecoverable transmission, and nobody has ever meant that.
+#
+# Lives here, beside the verbs themselves, because both gates that enforce it need it:
+# reticulum_bridge (so the operator gets a readable refusal) and _bridge (the last gate
+# before RF, which must hold even for a command published by something else).
+UNICAST_ONLY_VERBS = (VERB_SETLOC,)
 
 # Bounds mirror the firmware's clamps (NavameshCommand.cpp). Validating here too means
 # an operator gets an immediate, readable rejection instead of silently having their
@@ -44,6 +48,17 @@ INTERVAL_MIN_SECONDS = 60
 INTERVAL_MAX_SECONDS = 86400
 QUIET_MIN_MINUTES = 1
 QUIET_MAX_MINUTES = 4320
+
+# Fixed position. The firmware refuses anything outside these, and refuses 0/0, rather than
+# clamping -- a clamped coordinate is a different place, so moving a node to the edge of the
+# valid range would be worse than not moving it. Mirrored here for a readable rejection.
+LATITUDE_MIN_DEGREES = -90.0
+LATITUDE_MAX_DEGREES = 90.0
+LONGITUDE_MIN_DEGREES = -180.0
+LONGITUDE_MAX_DEGREES = 180.0
+
+# Degrees -> the integer scaling meshtastic.Position uses for latitude_i/longitude_i.
+_DEGREES_TO_I = 1e7
 
 
 class CommandValidationError(ValueError):
@@ -91,6 +106,8 @@ def encode_command(
     command_id: int,
     value: Optional[int] = None,
     quiet_on: Optional[bool] = None,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
 ) -> bytes:
     """
     Build a NavameshCommand payload.
@@ -149,6 +166,33 @@ def encode_command(
         else:
             cmd.command_type = navamesh_pb2.QUIET_MODE_EXIT
 
+    elif verb == VERB_SETLOC:
+        if lat is None or lon is None:
+            raise CommandValidationError("setloc requires a latitude and a longitude")
+        if not LATITUDE_MIN_DEGREES <= lat <= LATITUDE_MAX_DEGREES:
+            raise CommandValidationError(
+                f"latitude must be {LATITUDE_MIN_DEGREES} to {LATITUDE_MAX_DEGREES}"
+            )
+        if not LONGITUDE_MIN_DEGREES <= lon <= LONGITUDE_MAX_DEGREES:
+            raise CommandValidationError(
+                f"longitude must be {LONGITUDE_MIN_DEGREES} to {LONGITUDE_MAX_DEGREES}"
+            )
+
+        latitude_i = int(round(lat * _DEGREES_TO_I))
+        longitude_i = int(round(lon * _DEGREES_TO_I))
+
+        # Checked after scaling, not before: a fix of 1e-9 degrees is not zero as a float but
+        # rounds to 0/0 on the wire, and the node would reject it. Fail here with a reason
+        # instead of letting it become an opaque nak two radio hops away.
+        if latitude_i == 0 and longitude_i == 0:
+            raise CommandValidationError(
+                "refusing to set 0, 0 -- that usually means the sender had no GPS fix"
+            )
+
+        cmd.command_type = navamesh_pb2.SET_LOCATION
+        cmd.latitude_i = latitude_i
+        cmd.longitude_i = longitude_i
+
     else:
         raise CommandValidationError(f"unknown verb {verb!r}")
 
@@ -167,6 +211,11 @@ def extract_command_ack(packet: dict) -> Optional[dict]:
 
     Returns a dict with keys command_id, command_type, ok, applied_value, or None if
     this is not a decodable ack. A decode failure must never raise.
+
+    A SET_LOCATION ack additionally carries applied_lat/applied_lon: the coordinates the
+    node actually stored, in degrees. They are None for every other command type, and also
+    for a node running firmware that predates SET_LOCATION, whose acks simply omit the
+    fields and decode to 0/0.
 
     command_id == 0 marks an UNSOLICITED ack: the node's quiet mode self-expired and it
     resumed on its own without anyone sending an exit command. Callers should treat that
@@ -192,6 +241,13 @@ def extract_command_ack(packet: dict) -> Optional[dict]:
     except (DecodeError, ValueError):
         return None
 
+    applied_lat = applied_lon = None
+    if ack.command_type == navamesh_pb2.SET_LOCATION and not (
+        ack.applied_latitude_i == 0 and ack.applied_longitude_i == 0
+    ):
+        applied_lat = ack.applied_latitude_i / _DEGREES_TO_I
+        applied_lon = ack.applied_longitude_i / _DEGREES_TO_I
+
     return {
         "command_id": int(ack.command_id),
         "command_type": int(ack.command_type),
@@ -200,5 +256,7 @@ def extract_command_ack(packet: dict) -> Optional[dict]:
         else str(ack.command_type),
         "ok": bool(ack.ok),
         "applied_value": int(ack.applied_value),
+        "applied_lat": applied_lat,
+        "applied_lon": applied_lon,
         "unsolicited": int(ack.command_id) == 0,
     }

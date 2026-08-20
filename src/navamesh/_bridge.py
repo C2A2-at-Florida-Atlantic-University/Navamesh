@@ -22,6 +22,8 @@ from navamesh.processors.soil_proto import (
 )
 from navamesh.processors.command_proto import (
     COMMAND_PORTNUM,
+    UNICAST_ONLY_VERBS,
+    VERB_SETLOC,
     CommandValidationError,
     encode_command,
     extract_command_ack,
@@ -150,6 +152,8 @@ def main():
                     "detail": {
                         "command_type": ack["command_type_name"],
                         "applied_value": ack["applied_value"],
+                        "applied_lat": ack["applied_lat"],
+                        "applied_lon": ack["applied_lon"],
                         "unsolicited": ack["unsolicited"],
                     },
                     "ts": int(time.time()),
@@ -277,6 +281,8 @@ def main():
         target = (req.get("target") or "^all").strip()
         value = req.get("value")
         quiet_on = req.get("quiet_on")
+        lat = req.get("lat")
+        lon = req.get("lon")
 
         def report(state: str, detail) -> None:
             mqtt_pub.publish(
@@ -292,7 +298,8 @@ def main():
             )
 
         try:
-            payload = encode_command(verb, cmd_id, value=value, quiet_on=quiet_on)
+            payload = encode_command(verb, cmd_id, value=value, quiet_on=quiet_on,
+                                     lat=lat, lon=lon)
         except CommandValidationError as e:
             print(f"[CMD] rejecting {verb!r} for {target}: {e}")
             report("error", {"reason": str(e)})
@@ -302,6 +309,15 @@ def main():
         # would burn airtime on retries that cannot ever be satisfied. Either way the
         # node's own NavameshAck on PortNum 259 is what actually confirms delivery.
         is_broadcast = target in ("^all", "", "all")
+
+        # Re-checked here rather than trusted from reticulum_bridge: this is the last gate
+        # before RF, and a broadcast setloc would hand every node in the field the same
+        # coordinates in a single unrecoverable transmission.
+        if is_broadcast and verb in UNICAST_ONLY_VERBS:
+            print(f"[CMD] refusing to broadcast {verb!r}")
+            report("error", {"reason": f"{verb} must target one node, not {target}"})
+            return
+
         sent = bridge.send_data(
             payload,
             destination_id="^all" if is_broadcast else target,
@@ -311,8 +327,9 @@ def main():
         )
 
         if sent:
-            print(f"[CMD] sent id={cmd_id} {verb} -> {target} "
-                  f"(value={value}, quiet_on={quiet_on})")
+            args = (f"lat={lat}, lon={lon}" if verb == VERB_SETLOC
+                    else f"value={value}, quiet_on={quiet_on}")
+            print(f"[CMD] sent id={cmd_id} {verb} -> {target} ({args})")
             report("sent", {"broadcast": is_broadcast})
         else:
             print(f"[CMD] transmit failed id={cmd_id} {verb} -> {target}")

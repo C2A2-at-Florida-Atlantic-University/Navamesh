@@ -101,6 +101,7 @@ except ImportError:
 
 from navamesh.config import load_config
 from navamesh.calibration import DAMP, adc_to_band, adc_to_percent
+from navamesh.processors.command_proto import UNICAST_ONLY_VERBS
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -552,12 +553,16 @@ HELP_TEXT = """🌱 Navamesh Gateway — Commands
 Control commands (change the field nodes):
   ble <id|^all> <min>      — open a Bluetooth window, then auto-close
   interval <id|^all> <sec> — set telemetry interval (live, no reboot)
-  quiet <id|^all> on|off   — stop / resume transmitting"""
+  quiet <id|^all> on|off   — stop / resume transmitting
+  setloc <id> <lat> <lon>  — set the node's fixed position (one node only)"""
 
 
 # Verbs that change deployed field hardware. Gated by AUTHORIZED_FARMER_HASHES; every
 # other verb in this gateway is read-only and safe to leave open.
-WRITE_VERBS = ("ble", "interval", "quiet")
+WRITE_VERBS = ("ble", "interval", "quiet", "setloc")
+
+# Which of those may never go to ^all -- see UNICAST_ONLY_VERBS in command_proto, which is
+# where it lives because the transmit path enforces the same rule independently.
 
 # How often to check for command acks to report. Tight, because an operator standing in a
 # field waiting on a Bluetooth window is actively watching for this.
@@ -605,21 +610,32 @@ def is_sender_authorized(sender_hash: str, allowed_hashes) -> bool:
 _BLE_MIN_MINUTES, _BLE_MAX_MINUTES = 1, 240
 _INTERVAL_MIN_SECONDS, _INTERVAL_MAX_SECONDS = 60, 86400
 _QUIET_MIN_MINUTES, _QUIET_MAX_MINUTES = 1, 4320
+_LAT_MIN_DEGREES, _LAT_MAX_DEGREES = -90.0, 90.0
+_LON_MIN_DEGREES, _LON_MAX_DEGREES = -180.0, 180.0
 
 BROADCAST_TARGET = "^all"
+
+_WRITE_EXAMPLE_ARGS = {
+    "ble": "15",
+    "interval": "1800",
+    "quiet": "on",
+    "setloc": "36.0721 -109.0450",
+}
 
 
 def _parse_write_args(command: str, target: Optional[str]):
     """
-    Parse "<id|^all> <value>" (or "<id|^all> on|off" for quiet).
+    Parse "<id|^all> <value>" ("<id|^all> on|off" for quiet, "<id> <lat> <lon>" for setloc).
 
-    Returns (node, value, quiet_on, error_message). `error_message` is non-None on any
-    problem, in which case the other fields are meaningless.
+    Returns (node, value, quiet_on, coords, error_message). `error_message` is non-None on
+    any problem, in which case the other fields are meaningless. `coords` is a (lat, lon)
+    pair of floats for setloc and None for every other verb.
     """
     if not target:
-        return None, None, None, (
-            f"'{command}' needs a target. Example: {command} ^all "
-            f"{'on' if command == 'quiet' else '15'}"
+        example = _WRITE_EXAMPLE_ARGS.get(command, "15")
+        who = "!a1b2c3d4" if command in UNICAST_ONLY_VERBS else BROADCAST_TARGET
+        return None, None, None, None, (
+            f"'{command}' needs a target. Example: {command} {who} {example}"
         )
 
     bits = target.split()
@@ -628,29 +644,51 @@ def _parse_write_args(command: str, target: Optional[str]):
 
     if command == "quiet":
         if arg not in ("on", "off"):
-            return None, None, None, "quiet needs 'on' or 'off'. Example: quiet ^all on"
-        return node, None, arg == "on", None
+            return None, None, None, None, "quiet needs 'on' or 'off'. Example: quiet ^all on"
+        return node, None, arg == "on", None, None
+
+    if command == "setloc":
+        if len(bits) < 3:
+            return None, None, None, None, (
+                f"setloc needs a latitude and a longitude. "
+                f"Example: setloc {node} {_WRITE_EXAMPLE_ARGS['setloc']}"
+            )
+        try:
+            lat, lon = float(bits[1]), float(bits[2])
+        except ValueError:
+            return None, None, None, None, (
+                f"'{bits[1]} {bits[2]}' is not a latitude and longitude in decimal degrees."
+            )
+        if not _LAT_MIN_DEGREES <= lat <= _LAT_MAX_DEGREES:
+            return None, None, None, None, (
+                f"Latitude must be {_LAT_MIN_DEGREES} to {_LAT_MAX_DEGREES}, got {lat}."
+            )
+        if not _LON_MIN_DEGREES <= lon <= _LON_MAX_DEGREES:
+            return None, None, None, None, (
+                f"Longitude must be {_LON_MIN_DEGREES} to {_LON_MAX_DEGREES}, got {lon}."
+            )
+        return node, None, None, (lat, lon), None
 
     if arg is None:
         unit = "minutes" if command == "ble" else "seconds"
-        return None, None, None, f"'{command}' needs a value in {unit}. Example: {command} {node} 15"
+        return None, None, None, None, f"'{command}' needs a value in {unit}. Example: {command} {node} 15"
 
     try:
         value = int(arg)
     except ValueError:
-        return None, None, None, f"'{arg}' is not a number."
+        return None, None, None, None, f"'{arg}' is not a number."
 
     if command == "ble" and not _BLE_MIN_MINUTES <= value <= _BLE_MAX_MINUTES:
-        return None, None, None, (
+        return None, None, None, None, (
             f"BLE window must be {_BLE_MIN_MINUTES}-{_BLE_MAX_MINUTES} minutes."
         )
     if command == "interval" and not _INTERVAL_MIN_SECONDS <= value <= _INTERVAL_MAX_SECONDS:
-        return None, None, None, (
+        return None, None, None, None, (
             f"Interval must be {_INTERVAL_MIN_SECONDS}-{_INTERVAL_MAX_SECONDS} seconds "
             f"({_INTERVAL_MIN_SECONDS // 60} min to 24 h)."
         )
 
-    return node, value, None, None
+    return node, value, None, None, None
 
 
 def _handle_write_command(
@@ -671,21 +709,27 @@ def _handle_write_command(
     if dispatch_write is None:
         return "Control commands are not available on this gateway (no command bus configured)."
 
-    node, value, quiet_on, error = _parse_write_args(command, target)
+    node, value, quiet_on, coords, error = _parse_write_args(command, target)
     if error:
         return f"⚠️  {error}"
 
     is_broadcast = node in (BROADCAST_TARGET, "all")
+    if is_broadcast and command in UNICAST_ONLY_VERBS:
+        return (f"⚠️  '{command}' must name one node. Sending it to {BROADCAST_TARGET} would "
+                f"give every node the same position.")
     if not is_broadcast and node not in nodes:
         return f"Node '{node}' not found. Send 'nodes' to list all known nodes."
 
     resolved = BROADCAST_TARGET if is_broadcast else node
+    lat, lon = coords if coords else (None, None)
     try:
         cmd_id = dispatch_write(
             verb=command,
             target=resolved,
             value=value,
             quiet_on=quiet_on,
+            lat=lat,
+            lon=lon,
             requested_by=source_hash or "unknown",
         )
     except Exception as exc:
@@ -698,6 +742,8 @@ def _handle_write_command(
         what = f"Bluetooth window for {value} min"
     elif command == "interval":
         what = f"telemetry interval {value} s"
+    elif command == "setloc":
+        what = f"fixed position {lat:.6f}, {lon:.6f}"
     else:
         what = "quiet mode ON" if quiet_on else "quiet mode OFF"
 
@@ -1567,7 +1613,8 @@ class LxmfGateway:
             self._last_cmd_id = candidate
             return candidate
 
-    def _dispatch_write(self, verb: str, target: str, value, quiet_on, requested_by: str) -> int:
+    def _dispatch_write(self, verb: str, target: str, value, quiet_on, requested_by: str,
+                        lat=None, lon=None) -> int:
         """
         Log a control command and publish it to the bridge process for transmission.
 
@@ -1579,7 +1626,7 @@ class LxmfGateway:
         from navamesh.mqtt_client import MqttPublisher
 
         cmd_id = self._next_cmd_id()
-        params = {"value": value, "quiet_on": quiet_on}
+        params = {"value": value, "quiet_on": quiet_on, "lat": lat, "lon": lon}
 
         # Record the intent before transmitting, so a command that is sent but never
         # acknowledged still leaves an audit trail.
@@ -1598,6 +1645,8 @@ class LxmfGateway:
                 "target": target,
                 "value": value,
                 "quiet_on": quiet_on,
+                "lat": lat,
+                "lon": lon,
                 "requested_by": requested_by,
                 "ts": int(time.time()),
             },
@@ -1691,18 +1740,26 @@ class LxmfGateway:
 
         detail = detail or {}
         applied = detail.get("applied_value") if isinstance(detail, dict) else None
+        applied_lat = detail.get("applied_lat") if isinstance(detail, dict) else None
+        applied_lon = detail.get("applied_lon") if isinstance(detail, dict) else None
         reason = detail.get("reason") if isinstance(detail, dict) else None
 
         if state == "acked":
             body = f"{icon} {who} applied {verb}"
-            if applied:
+            # The node echoes back the coordinates it actually stored, so report those rather
+            # than the ones we sent -- they are what the node will broadcast from now on.
+            if applied_lat is not None and applied_lon is not None:
+                body += f" = {applied_lat:.6f}, {applied_lon:.6f}"
+            elif applied:
                 body += f" = {applied}"
         elif state == "timeout":
+            retry = ("" if verb in UNICAST_ONLY_VERBS else
+                     " Nodes out of direct gateway range cannot be reached by unicast; "
+                     "try ^all instead.")
             body = (f"{icon} {who} did not acknowledge {verb} within "
                     f"{self._cfg.cmd_ack_timeout_seconds}s.\n"
-                    f"The command may still have been applied — check the next reading. "
-                    f"Nodes out of direct gateway range cannot be reached by unicast; "
-                    f"try ^all instead.")
+                    f"The command may still have been applied — check the next reading."
+                    f"{retry}")
         elif state == "nak":
             body = f"{icon} {who} rejected {verb} (value out of range or unsupported)."
         else:
