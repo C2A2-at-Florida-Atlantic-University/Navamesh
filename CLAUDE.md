@@ -7,15 +7,19 @@ they matter.
 
 ## The three repos and how they fit
 
-They are not siblings on disk. Typical layout:
+**Each repo has its own `CLAUDE.md`** covering how to build it, how to test it, and what
+bites. Read the one for whichever you are touching; this file is only the map between them.
 
-```
-dev/
-├── Navamesh-main/                        ← this repo. The Pi.
-├── Navamesh_sideband_wrapper/            ← the Android app (a Sideband fork)
-└── Navamesh-Hardware/
-    └── meshtastic-soil-sensor/           ← the node firmware (a Meshtastic fork)
-```
+| GitHub repo | What it is | Its own notes |
+|---|---|---|
+| `Navamesh` | the Pi: gateway, ingest, map, farmer replies | this file's repo |
+| `navamesh-sideband-wrapper` | the Android app (a Sideband fork) | `CLAUDE.md` in that repo |
+| `meshtastic-soil-sensor` | the node firmware (a Meshtastic fork) | `CLAUDE.md` in that repo |
+
+**Local directory names vary by machine and do not match the GitHub names everywhere** —
+one machine has them flat under a parent (`Navamesh-Dev/`), another nests the firmware
+inside a `Navamesh-Hardware/` folder and renames `Navamesh` to `Navamesh-main`. Identify a
+repo by its git remote, not its folder name, and do not assume they are siblings on disk.
 
 All three track the branch **`raw-adc-private-app`**. The firmware repo pushes to the
 `myfork` remote, not `origin` — `origin` (Sarkors) is read-only for us and a push there
