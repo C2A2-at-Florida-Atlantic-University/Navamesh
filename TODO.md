@@ -220,3 +220,42 @@ half-measure if the full fix waits.
 
 Worth doing before: CI becomes the thing anyone trusts instead of a local run, or someone
 other than the author starts merging changes to the bridge.
+
+## Decide what the public site shows now that the app shows bands
+
+**Status:** open, and currently inconsistent in production.
+
+There is a fourth repo — **`Navamesh-Cloud`** (`metadavi/Navamesh-Cloud`, branch `main`),
+the Flask backend and frontend behind nextg-ag.org. It reads this Pi's Postgres directly
+and was not touched when soil moved to DRY/DAMP/WET in cd60737, so the same node now reads
+**DAMP** in the farmer's app and **17.7%** on the website.
+
+`api.py` selects `metadata->>'soil_percent' AS soil` for `/api/nodes`, and `/api/history`
+maps `"soil" -> ("soil_moisture", "percent")` against InfluxDB. The frontend plots it on a
+fixed 0-100 axis (`yDomain:[0,100]`, `yLabel:"Soil Moisture (%)"`) and describes the
+sensing as "Soil moisture (%VWC)". `soil_band` appears nowhere in `api.py`, though the
+ingestor already writes it alongside `soil_percent`, so the data is there.
+
+The reasoning that removed the percentage from the app applies here unchanged: the probe
+is blind below ~9.5% moisture and saturated above 20%, so a 0-100 axis presents resolution
+the hardware does not have. A DRY node pinned at raw 4095 plots as a plausible-looking
+number rather than as "no reading in the resolvable range".
+
+This is genuinely a decision rather than a bug, which is why it is here and not a patch.
+A public research site may reasonably want a continuous series for a time-series chart
+even where a farmer wants a word — and a band renders poorly as a line graph. Options,
+roughly in increasing effort:
+
+- Leave the chart, relabel the axis honestly (it is %VWC-equivalent within a narrow band,
+  not a calibrated 0-100 measure), and show the band on the node popup where a farmer-style
+  answer belongs.
+- Serve `soil_band` beside `soil_percent` from `/api/nodes` and let the frontend choose.
+- Plot the raw ADC for the series (monotonic, honest, no invented calibration) with the
+  band as the label.
+
+**To close it:** pick one, and whichever it is, make the map popup on the site agree with
+the app. Two farmer-facing surfaces disagreeing about the same node is worse than either
+choice.
+
+Worth doing before: the site is shown to anyone who would compare it against the app, or
+before the percentage is quoted anywhere it might be read as calibrated.

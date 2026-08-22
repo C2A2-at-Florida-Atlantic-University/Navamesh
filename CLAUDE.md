@@ -15,13 +15,20 @@ bites. Read the one for whichever you are touching; this file is only the map be
 | `Navamesh` | the Pi: gateway, ingest, map, farmer replies | this file's repo |
 | `navamesh-sideband-wrapper` | the Android app (a Sideband fork) | `CLAUDE.md` in that repo |
 | `meshtastic-soil-sensor` | the node firmware (a Meshtastic fork) | `CLAUDE.md` in that repo |
+| `Navamesh-Cloud` | the public site, nextg-ag.org (Flask + frontend) | — |
+
+**`Navamesh-Cloud` is a fourth consumer that is easy to forget.** It reads this Pi's
+Postgres directly, on branch `main` rather than `raw-adc-private-app`, and it is not part
+of the mesh path below — which is exactly why a farmer-facing change here can leave it
+contradicting the app. It currently still shows soil as a percentage while the app and map
+show DRY/DAMP/WET; see `TODO.md`. Check it whenever you change what a reading *means*.
 
 **Local directory names vary by machine and do not match the GitHub names everywhere** —
 one machine has them flat under a parent (`Navamesh-Dev/`), another nests the firmware
 inside a `Navamesh-Hardware/` folder and renames `Navamesh` to `Navamesh-main`. Identify a
 repo by its git remote, not its folder name, and do not assume they are siblings on disk.
 
-All three track the branch **`raw-adc-private-app`**. The firmware repo pushes to the
+The three mesh repos track the branch **`raw-adc-private-app`** (`Navamesh-Cloud` is on `main`). The firmware repo pushes to the
 `myfork` remote, not `origin` — `origin` (Sarkors) is read-only for us and a push there
 403s.
 
