@@ -104,20 +104,29 @@ def moisture_color(value, band=None):
 
 
 def moisture_label(value, band=None):
+    """Always a band, never a percentage.
+
+    The percentage was invented precision on this hardware: bench calibration showed the
+    probe is blind below ~9.5% moisture and saturated above 20%, so a figure outside the
+    DAMP window described the rail the probe was pinned to rather than the soil. Showing
+    "17.7%" next to a sensor invited a reading of the number it could not support, and a
+    farmer's decision is DRY / DAMP / WET either way -- water it, leave it, or hold off.
+
+    Legacy rows carry a percentage but no band (they predate the band, or came from the
+    old firmware's status strings). Those are mapped onto the same three words through the
+    MOISTURE_* thresholds rather than shown as a number, so the map never mixes vocabularies.
+    """
     if band in BAND_LABELS:
-        # Inside DAMP the coarse figure is worth showing; elsewhere it does not exist.
-        if band == "DAMP" and value is not None:
-            return f"{BAND_LABELS[band]} (~{value:.0f}%)"
         return BAND_LABELS[band]
     if value is None:
         return "No reading"
+    # Legacy percentage → the nearest band word. Deliberately no figure: it would be the
+    # only percentage on the map and would read as more trustworthy than the bands.
     if value < MOISTURE_DRY:
-        return f"{value:.1f}% — Dry ⚠️"
-    if value < MOISTURE_LOW:
-        return f"{value:.1f}% — Low"
+        return BAND_LABELS["DRY"]
     if value < MOISTURE_MODERATE:
-        return f"{value:.1f}% — Moderate"
-    return f"{value:.1f}% — Good ✓"
+        return BAND_LABELS["DAMP"]
+    return BAND_LABELS["WET"]
 
 
 def tile_to_base64(z, x, y):

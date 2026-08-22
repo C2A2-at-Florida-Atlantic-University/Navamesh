@@ -26,9 +26,36 @@ except (ImportError, SystemExit) as exc:  # rns/lxmf/staticmap/dotenv not instal
 
 # ── _label_values ─────────────────────────────────────────────────────────────
 
-def test_label_values_known_percentages():
-    snap = NodeSnapshot(node_id="!abcd1234", soil_percent=45.4, battery_level=82.0)
-    assert _label_values(snap) == ("45%", "82%")
+def test_label_values_soil_is_a_band_not_a_percentage():
+    """The pin says DRY/DAMP/WET. Battery stays a percentage -- it really is one.
+
+    A soil figure implied precision this probe does not have: it is blind below ~9.5%
+    moisture and saturated above 20%, so any number outside that window described the rail
+    the probe was pinned to rather than the soil.
+    """
+    snap = NodeSnapshot(node_id="!abcd1234", soil_raw=800.0, battery_level=82.0)
+    soil, bat = _label_values(snap)
+    assert soil in ("DRY", "DAMP", "WET")
+    assert "%" not in soil
+    assert bat == "82%"
+
+
+def test_label_values_legacy_percentage_maps_onto_a_band():
+    """Rows predating the band carry only a percentage; it must still render as a word,
+    so the map never mixes vocabularies."""
+    dry = NodeSnapshot(node_id="!abcd1234", soil_percent=12.0)
+    damp = NodeSnapshot(node_id="!abcd1234", soil_percent=45.4)
+    wet = NodeSnapshot(node_id="!abcd1234", soil_percent=80.0)
+    assert _label_values(dry)[0] == "DRY"
+    assert _label_values(damp)[0] == "DAMP"
+    assert _label_values(wet)[0] == "WET"
+
+
+def test_label_values_raw_wins_over_legacy_percentage():
+    """The raw ADC is authoritative: the DB still holds legacy percentages that disagree
+    with the probe (a bone-dry node at raw 4095 was reporting "10.0%")."""
+    snap = NodeSnapshot(node_id="!abcd1234", soil_raw=4095.0, soil_percent=45.0)
+    assert _label_values(snap)[0] == "DRY"
 
 
 def test_label_values_unknown_are_question_marks():
@@ -38,9 +65,11 @@ def test_label_values_unknown_are_question_marks():
 
 def test_label_values_usb_wins_over_battery_level():
     snap = NodeSnapshot(
-        node_id="!abcd1234", soil_percent=10.0, battery_level=99.0, battery_usb=True
+        node_id="!abcd1234", soil_raw=800.0, battery_level=99.0, battery_usb=True
     )
-    assert _label_values(snap) == ("10%", "USB")
+    soil, bat = _label_values(snap)
+    assert soil in ("DRY", "DAMP", "WET")
+    assert bat == "USB"
 
 
 # ── node display labels (Meshtastic NODEINFO_APP names) ──────────────────────

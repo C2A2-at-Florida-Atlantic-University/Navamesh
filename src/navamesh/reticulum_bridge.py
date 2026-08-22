@@ -100,7 +100,7 @@ except ImportError:
     MAP_AVAILABLE = False
 
 from navamesh.config import load_config
-from navamesh.calibration import DAMP, adc_to_band, adc_to_percent
+from navamesh.calibration import DAMP, DRY, WET, adc_to_band
 from navamesh.processors.command_proto import UNICAST_ONLY_VERBS
 
 logging.basicConfig(
@@ -443,10 +443,12 @@ def _fmt_soil_reading(snap) -> Optional[str]:
     The band comes from the RAW ADC via calibration.adc_to_band(), which is the
     single source of truth -- do not re-derive thresholds anywhere else.
 
-    A percentage is shown ONLY inside the DAMP band. adc_to_percent() returns
-    None outside it by design: below WET_CEIL_ADC and above DRY_FLOOR_ADC the
-    probe is pinned to a rail and has no resolution, so a percentage there is
-    invented precision. The raw count is kept in parentheses for diagnostics.
+    No percentage is shown at all, anywhere. It used to appear inside the DAMP band,
+    where adc_to_percent() can resolve one -- but a figure present on some readings and
+    absent on others reads as the precise answer with the rest as approximations, when
+    the band is the part this probe actually supports. Outside DAMP the probe is pinned
+    to a rail and has no resolution, so a percentage there was invented precision. The
+    raw count is kept in parentheses for diagnostics; it is plainly not a moisture figure.
 
     snap.soil_percent is deliberately NOT trusted when a raw count exists: the
     DB still holds percentages parsed from legacy firmware status strings (see
@@ -456,16 +458,35 @@ def _fmt_soil_reading(snap) -> Optional[str]:
     """
     if snap.soil_raw is not None:
         raw = float(snap.soil_raw)
-        band = adc_to_band(raw)
-        if band == DAMP:
-            pct = adc_to_percent(raw)
-            if pct is not None:
-                return f"{band} ~{pct:.0f}% (ADC {raw:.0f})"
-        return f"{band} (ADC {raw:.0f})"
+        # Band only, no percentage -- not even inside DAMP, where one is derivable. A single
+        # figure shown on some readings and not others reads as the precise answer and the
+        # rest as approximations, when in fact the band is the trustworthy part on this
+        # probe. The raw count stays for diagnostics; it is plainly not a moisture figure.
+        return f"{adc_to_band(raw)} (ADC {raw:.0f})"
     if snap.soil_percent is not None:
-        # Legacy firmware only: no raw count, so the band cannot be derived.
-        return f"{snap.soil_percent:.1f}% (legacy, uncalibrated)"
+        # Legacy rows: a percentage parsed from the old firmware's status strings, which
+        # soil_text.py itself marks as not authoritative -- a bone-dry node at raw 4095 was
+        # reporting "10.0%". Map it to a band word so the farmer never sees two vocabularies,
+        # and mark it uncalibrated rather than implying it is comparable to a real reading.
+        return f"{percent_to_band(snap.soil_percent)} (uncalibrated)"
     return None
+
+
+def percent_to_band(pct) -> str:
+    """A legacy percentage as one of the three band words.
+
+    Thresholds mirror generate_map.py's MOISTURE_* defaults so the map and the text
+    replies cannot disagree about the same node.
+    """
+    try:
+        v = float(pct)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+    if v < 30:
+        return DRY
+    if v < 70:
+        return DAMP
+    return WET
 
 
 def _header(title: str) -> str:
@@ -737,21 +758,62 @@ def _handle_write_command(
         # would leave the operator believing a node had been reconfigured.
         return f"⚠️  Could not queue command: {exc}"
 
-    who = "ALL field nodes" if is_broadcast else _node_label(node, nodes.get(node))
+    who = "ALL sensors" if is_broadcast else _node_label(node, nodes.get(node))
+    # Farmer-facing wording: name the request in the same words the app's button uses,
+    # and say what is being waited for. "Queued: telemetry interval 300 s" described the
+    # protocol rather than the action, and "quiet mode" appears nowhere in the UI.
     if command == "ble":
-        what = f"Bluetooth window for {value} min"
+        what = f"Bluetooth on for {value} min"
     elif command == "interval":
-        what = f"telemetry interval {value} s"
+        what = f"Reporting interval every {_friendly_seconds(value)}"
     elif command == "setloc":
-        what = f"fixed position {lat:.6f}, {lon:.6f}"
+        what = f"Sensor location {lat:.6f}, {lon:.6f}"
     else:
-        what = "quiet mode ON" if quiet_on else "quiet mode OFF"
+        what = "Pause messaging" if quiet_on else "Resume messaging"
 
-    return (f"📤 Queued: {what} → {who}\n"
-            f"Command {cmd_id}. Waiting for the node to acknowledge…")
+    return (f"📤 {what} — request sent to {who}\n"
+            f"Waiting for the sensor to confirm… (request {cmd_id})")
 
 
 # ── Map renderer ──────────────────────────────────────────────────────────────
+
+# Farmer-facing names for the wire verbs. The verb is what the protocol carries; these are
+# what the app's buttons say, and an outcome message that reads "applied setloc" asks the
+# farmer to know the protocol to understand their own sensor.
+VERB_LABELS = {
+    "ble": "Bluetooth on",
+    "interval": "Reporting interval",
+    "quiet": "Messaging pause",
+    "setloc": "Sensor location",
+}
+
+
+def _verb_label(verb) -> str:
+    return VERB_LABELS.get(str(verb), str(verb))
+
+
+def _friendly_seconds(seconds) -> str:
+    """Seconds as a farmer would say them: "5 minutes", "8 hours", "1 day".
+
+    The raw number is what the protocol carries, but "telemetry interval 300 s" asked the
+    reader to do the arithmetic. Falls back to the bare number for anything that does not
+    divide cleanly, which is better than rounding a value they explicitly chose.
+    """
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return str(seconds)
+    if s % 86400 == 0 and s >= 86400:
+        n = s // 86400
+        return f"{n} day" if n == 1 else f"{n} days"
+    if s % 3600 == 0 and s >= 3600:
+        n = s // 3600
+        return f"{n} hour" if n == 1 else f"{n} hours"
+    if s % 60 == 0 and s >= 60:
+        n = s // 60
+        return f"{n} minute" if n == 1 else f"{n} minutes"
+    return f"{s} seconds"
+
 
 def _resolve_tile_url(cfg: ReticulumBridgeConfig, geo_nodes: dict) -> Optional[str]:
     """
@@ -1098,10 +1160,32 @@ def _select_main_mesh(
     )
 
 
+def _soil_band_short(snap) -> str:
+    """DRY / DAMP / WET for a map pin, or "?" when there is no reading.
+
+    Short form on purpose: the pin label has room for a word, not a sentence. Prefers the
+    raw ADC (authoritative) and falls back to a legacy percentage mapped onto the same
+    three words, so a pin never shows a figure the probe cannot support.
+    """
+    if getattr(snap, "soil_raw", None) is not None:
+        try:
+            return adc_to_band(float(snap.soil_raw))
+        except (TypeError, ValueError):
+            pass
+    if getattr(snap, "soil_percent", None) is not None:
+        return percent_to_band(snap.soil_percent)
+    return "?"
+
+
 def _label_values(snap: NodeSnapshot) -> Tuple[str, str]:
     """Soil/battery value strings for a map label ("?" when unknown, "USB" when
-    on external power)."""
-    soil_str = f"{snap.soil_percent:.0f}%" if snap.soil_percent is not None else "?"
+    on external power).
+
+    Soil is a band, not a percentage: the pin is glanced at while deciding whether to
+    water, and DRY/DAMP/WET is that decision. A number invited precision the probe does
+    not have (it is blind below ~9.5% and saturated above 20%).
+    """
+    soil_str = _soil_band_short(snap)
     bat_str = "USB" if snap.battery_usb else (
         f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "?"
     )
@@ -1537,7 +1621,9 @@ def handle_command(
             listed = map_nodes if target else plotted
             lines = [_header(f"🗺️  Navamesh Map  ({len(listed)} node(s))")]
             for node_id, snap in sorted(listed.items()):
-                soil_str = f"{snap.soil_percent:.1f}%" if snap.soil_percent is not None else "no data"
+                soil_str = _soil_band_short(snap)
+                if soil_str == "?":
+                    soil_str = "no data"
                 bat_str  = "USB" if snap.battery_usb else (
                     f"{snap.battery_level:.0f}%" if snap.battery_level is not None else "no data"
                 )
@@ -1736,7 +1822,8 @@ class LxmfGateway:
     def _send_outcome(self, cmd_id, verb, target, state, detail, requested_by) -> bool:
         """Send one outcome over LXMF. Returns True if it was handed to the router."""
         icon = {"acked": "✅", "nak": "❌", "timeout": "⏱", "error": "⚠️"}.get(state, "ℹ️")
-        who = "ALL field nodes" if target in ("^all", "all") else _node_label(target)
+        who = "ALL sensors" if target in ("^all", "all") else _node_label(target)
+        what = _verb_label(verb)
 
         detail = detail or {}
         applied = detail.get("applied_value") if isinstance(detail, dict) else None
@@ -1745,7 +1832,7 @@ class LxmfGateway:
         reason = detail.get("reason") if isinstance(detail, dict) else None
 
         if state == "acked":
-            body = f"{icon} {who} applied {verb}"
+            body = f"{icon} {what} confirmed by {who}"
             # The node echoes back the coordinates it actually stored, so report those rather
             # than the ones we sent -- they are what the node will broadcast from now on.
             if applied_lat is not None and applied_lon is not None:
@@ -1756,14 +1843,14 @@ class LxmfGateway:
             retry = ("" if verb in UNICAST_ONLY_VERBS else
                      " Nodes out of direct gateway range cannot be reached by unicast; "
                      "try ^all instead.")
-            body = (f"{icon} {who} did not acknowledge {verb} within "
+            body = (f"{icon} {what}: no confirmation from {who} within "
                     f"{self._cfg.cmd_ack_timeout_seconds}s.\n"
                     f"The command may still have been applied — check the next reading."
                     f"{retry}")
         elif state == "nak":
-            body = f"{icon} {who} rejected {verb} (value out of range or unsupported)."
+            body = f"{icon} {what} refused by {who} — the value was not accepted."
         else:
-            body = f"{icon} {verb} → {who} failed: {reason or state}"
+            body = f"{icon} {what} to {who} failed: {reason or state}"
 
         try:
             dest = self._dest_from_hash(requested_by)
