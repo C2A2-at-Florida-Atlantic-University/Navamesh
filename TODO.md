@@ -189,3 +189,34 @@ Kept here so they are not lost, though they belong elsewhere:
   position, but kept broadcasting its previous coordinates ~2 km away. Storage path works,
   broadcast path did not follow. Needs reproducing on a second node to tell a firmware bug
   from stale state on that one radio.
+
+## Stop the test suite from skipping itself into a green CI
+
+**Status:** open. Hid the coverage gap that motivated tests/test_farmer_wording.py.
+
+Every module that imports `reticulum_bridge` guards collection like this:
+
+```python
+except (ImportError, SystemExit) as exc:  # rns/lxmf/staticmap/dotenv not installed
+    pytest.skip(f"reticulum_bridge unavailable: {exc}", allow_module_level=True)
+```
+
+That is the right behaviour on a laptop without the Reticulum stack installed. It is the
+wrong behaviour in CI, where it reports success having executed none of the bridge tests
+at all — the map labels, the command handling, the wording, the soil formatting. A run
+with the dependencies missing is indistinguishable from a run where everything passed,
+and the summary line says "passed" either way.
+
+This is not hypothetical. The changes in cd60737 were written and shipped against a suite
+that was silently skipping the very files covering them; the gap only surfaced when the
+dependencies were installed deliberately and the skip count dropped to zero.
+
+**To close it:** make the skip conditional on something CI cannot accidentally satisfy —
+an env var (`NAVAMESH_REQUIRE_FULL_TESTS=1`) that turns the skip into a hard failure, or
+a session-scoped conftest check that fails the run when the bridge stack is absent and
+the marker says it should be present. Either way CI must distinguish "these tests passed"
+from "these tests did not run". Reporting the skip count in the CI summary is the cheap
+half-measure if the full fix waits.
+
+Worth doing before: CI becomes the thing anyone trusts instead of a local run, or someone
+other than the author starts merging changes to the bridge.
