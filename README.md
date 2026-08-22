@@ -146,6 +146,41 @@ The soil sensor reports a raw ADC value (e.g. MOISTURE_RAW=324). To convert raw 
 
 -`ADC_WET: average raw reading when the sensor is fully wet (water / saturated soil)`
 
+## Running the tests
+
+```bash
+python -m venv .venv && source .venv/bin/activate      # .\.venv\Scripts\activate on Windows
+pip install pytest rns lxmf staticmap pillow python-dotenv meshtastic paho-mqtt "protobuf>=6.33.4"
+PYTHONPATH=src pytest tests/ -q
+```
+
+A correct run reports **248 passed, 0 skipped**.
+
+### Read the skip count, not just the pass count
+
+Every test module that touches `reticulum_bridge` skips itself at collection when the
+Reticulum stack is missing:
+
+```python
+except (ImportError, SystemExit) as exc:  # rns/lxmf/staticmap/dotenv not installed
+    pytest.skip(f"reticulum_bridge unavailable: {exc}", allow_module_level=True)
+```
+
+That is deliberate — it keeps the suite usable on a machine without the radio stack. But
+it means **a run with those dependencies missing reports success having executed none of
+the bridge tests**: the map labels, the command handling, the soil formatting, the
+farmer-facing wording. The summary line says "passed" either way, and the only difference
+is a skip count nobody reads.
+
+This is not hypothetical. Commit `cd60737` changed the map labels and every command
+confirmation, and was verified against a suite that was silently skipping the exact files
+covering it. The gap only surfaced when the dependencies were installed deliberately and
+the skip count dropped to zero.
+
+So: if `pytest` finishes suspiciously fast, or reports skips, the bridge tests did not
+run. See the "Stop the test suite from skipping itself into a green CI" entry in
+`TODO.md`.
+
 ## Trouble Shooting:
 Port in use / access denied
 Only one process can open the COM port at a time.
