@@ -238,10 +238,33 @@ class NodeState:
     # others. Ingest bookkeeping only -- not serialized to the cloud queue.
     applied_ts: Dict[str, int] = field(default_factory=dict, repr=False)
 
+    # Payload kinds that are an actual soil reading, as opposed to any packet at
+    # all. The distinction is the whole point of soil_last_ts below: a node in the
+    # wrong role, or with a dead probe, keeps producing the others indefinitely.
+    SOIL_KINDS = ("soil_raw", "soil_percent", "soil_band")
+
+    def soil_last_ts(self) -> Optional[int]:
+        """When this node last sent a soil reading, or None if it never has.
+
+        Separate from last_seen_ts, which any packet moves -- NodeInfo, battery,
+        position, link. A node left in CLIENT role acks commands, broadcasts
+        NodeInfo and holds a good link forever while never reading the probe, so
+        the two timestamps drifting apart is the signature of that failure and of
+        a dead probe. Nothing else in the system could tell them apart.
+        """
+        stamps = [self.applied_ts[k] for k in self.SOIL_KINDS if k in self.applied_ts]
+        return max(stamps) if stamps else None
+
     def metadata(self, location_name: str, node_type: str) -> Dict[str, Any]:
         return {
             "location": location_name,
             "type": node_type,
+            # Write-time only, and not to be read as current: this row is only
+            # rewritten when this node is heard from, so a node that stops
+            # reporting keeps whatever was stored the last time it did. Consumers
+            # must derive liveness from last_seen and soil_last_ts instead -- see
+            # classify_node_health() in reticulum_bridge.py. Kept rather than
+            # removed because Navamesh-Cloud still selects it.
             "status": "online",
             "soil_raw": self.soil_raw,
             "soil_percent": self.soil_percent,
@@ -259,6 +282,8 @@ class NodeState:
             "short_name": self.short_name,
             "display_name": self.display_name,
             "last_packet_ts": self.last_seen_ts,
+            # The fact that makes "present but never reporting" detectable at all.
+            "soil_last_ts": self.soil_last_ts(),
         }
 
 
@@ -681,6 +706,20 @@ class PostgresWriter:
         # after newer ones have been written. >= rather than > so a reading and
         # a position stamped the same second both land.
         fresh = f"EXCLUDED.last_seen >= {table}.last_seen"
+        # soil_last_ts is derived from this process's in-memory applied_ts, which is
+        # empty after a restart. Retained MQTT refills it within seconds, but a live
+        # battery or link packet arriving first would write a null over a perfectly
+        # good stored value in the meantime -- briefly wrong, then self-healing,
+        # which is the failure shape this whole change exists to stop. Carry the
+        # stored value forward whenever the incoming one has nothing to say.
+        # NULLIF is load-bearing: `->` on a JSON null yields the jsonb literal
+        # 'null', which is not SQL NULL, so COALESCE would happily choose it and the
+        # carry-forward would silently do nothing. Verified against the real schema.
+        metadata_expr = (
+            f"EXCLUDED.metadata || jsonb_build_object('soil_last_ts', "
+            f"COALESCE(NULLIF(EXCLUDED.metadata->'soil_last_ts', 'null'::jsonb), "
+            f"{table}.metadata->'soil_last_ts'))"
+        )
 
         try:
             with self._conn.cursor() as cur:
@@ -701,7 +740,7 @@ class PostgresWriter:
                             lat       = CASE WHEN {fresh} THEN EXCLUDED.lat  ELSE {table}.lat  END,
                             lon       = CASE WHEN {fresh} THEN EXCLUDED.lon  ELSE {table}.lon  END,
                             geom      = CASE WHEN {fresh} THEN EXCLUDED.geom ELSE {table}.geom END,
-                            metadata  = CASE WHEN {fresh} THEN EXCLUDED.metadata ELSE {table}.metadata END;
+                            metadata  = CASE WHEN {fresh} THEN {metadata_expr} ELSE {table}.metadata END;
                         """,
                         (state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
                     )
@@ -714,7 +753,7 @@ class PostgresWriter:
                             last_seen = GREATEST({table}.last_seen, EXCLUDED.last_seen),
                             lat       = CASE WHEN {fresh} THEN EXCLUDED.lat ELSE {table}.lat END,
                             lon       = CASE WHEN {fresh} THEN EXCLUDED.lon ELSE {table}.lon END,
-                            metadata  = CASE WHEN {fresh} THEN EXCLUDED.metadata ELSE {table}.metadata END;
+                            metadata  = CASE WHEN {fresh} THEN {metadata_expr} ELSE {table}.metadata END;
                         """,
                         (state.node_id, ts, state.lat, state.lon, metadata_json),
                     )
@@ -725,7 +764,7 @@ class PostgresWriter:
                         VALUES (%s, to_timestamp(%s), %s::jsonb)
                         ON CONFLICT (node_id) DO UPDATE SET
                             last_seen = GREATEST({table}.last_seen, EXCLUDED.last_seen),
-                            metadata  = CASE WHEN {fresh} THEN EXCLUDED.metadata ELSE {table}.metadata END;
+                            metadata  = CASE WHEN {fresh} THEN {metadata_expr} ELSE {table}.metadata END;
                         """,
                         (state.node_id, ts, metadata_json),
                     )

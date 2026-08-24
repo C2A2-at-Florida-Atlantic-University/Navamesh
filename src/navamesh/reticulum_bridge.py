@@ -304,6 +304,10 @@ class NodeSnapshot:
     display_name: Optional[str] = None
     long_name: Optional[str] = None
     short_name: Optional[str] = None
+    # When this node last sent a soil reading, as opposed to `ts` which any packet
+    # moves. The two drifting apart is what distinguishes a node that is present
+    # but not measuring from one that is simply gone.
+    soil_last_ts: Optional[int] = None
 
 
 @dataclass
@@ -360,9 +364,80 @@ def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
             display_name=meta.get("display_name"),
             long_name=meta.get("long_name"),
             short_name=meta.get("short_name"),
+            soil_last_ts=meta.get("soil_last_ts"),
         )
     logger.debug("Loaded %d node(s) from Postgres.", len(snapshots))
     return snapshots
+
+
+# ── Node health ───────────────────────────────────────────────────────────────
+
+# What to expect of a node's reporting schedule. 28800 s is the SENSOR role default
+# in the firmware (installRoleDefaults), so a correctly provisioned node that has
+# never had its interval shortened reports three times a day.
+NODE_EXPECTED_INTERVAL_SECONDS = int(os.getenv("NODE_EXPECTED_INTERVAL_SECONDS", "28800"))
+# How many expected intervals may pass before something is wrong. 2.5 rather than 1
+# because a single missed transmission is ordinary on a LoRa link -- one lost packet
+# should not make a healthy node look dead -- while two consecutive misses should not
+# be dismissed.
+NODE_STALE_INTERVALS = float(os.getenv("NODE_STALE_INTERVALS", "2.5"))
+
+NODE_REPORTING = "reporting"
+NODE_NOT_REPORTING = "not_reporting"
+NODE_UNHEARD = "unheard"
+
+
+def node_stale_after_seconds() -> float:
+    return NODE_EXPECTED_INTERVAL_SECONDS * NODE_STALE_INTERVALS
+
+
+def classify_node_health(
+    now: int,
+    last_seen_ts: Optional[int],
+    soil_last_ts: Optional[int],
+    stale_after: Optional[float] = None,
+) -> str:
+    """Is this node reporting, present but not measuring, or gone?
+
+    Three states rather than online/offline, because the middle one is the failure
+    that reads as healthy hardware. A node left in CLIENT role -- or with a dead
+    probe -- acks commands, broadcasts NodeInfo, sits in the picker and holds a good
+    link while never sending a reading. !d60add90 stayed in exactly that state for
+    its entire life: 19 transmissions, 0 readings, against ~1950/275 for its
+    siblings, and read as an unreliable radio rather than an unprovisioned one.
+
+    Deliberately "no readings in a while" rather than "no readings ever": a probe
+    that fails after a month of good data is the same problem to the farmer as one
+    that never worked, and only the time-based test catches both.
+
+    Pure and parameterised so the thresholds can be exercised without waiting out an
+    8-hour interval.
+    """
+    if stale_after is None:
+        stale_after = node_stale_after_seconds()
+
+    if last_seen_ts is None or (now - last_seen_ts) > stale_after:
+        return NODE_UNHEARD
+    if soil_last_ts is None or (now - soil_last_ts) > stale_after:
+        return NODE_NOT_REPORTING
+    return NODE_REPORTING
+
+
+def _health_note(snap: "NodeSnapshot", now: Optional[int] = None) -> Optional[str]:
+    """One short farmer-facing clause, or None when the node is fine.
+
+    Says what to do about it, not what state it is in: "check it" and "no readings"
+    are actionable, where "not_reporting" is a status code that leaves the reader to
+    work out whether it matters.
+    """
+    if now is None:
+        now = int(time.time())
+    state = classify_node_health(now, snap.ts, snap.soil_last_ts)
+    if state == NODE_UNHEARD:
+        return "not heard from recently"
+    if state == NODE_NOT_REPORTING:
+        return "no soil readings recently"
+    return None
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
@@ -498,6 +573,9 @@ def fmt_status(nodes: Dict[str, NodeSnapshot]) -> str:
     lines = [_header("🌱 Navamesh Status")]
     for node_id, snap in sorted(nodes.items()):
         lines.append(f"[ {_fmt_node(node_id)} ]  {node_id}")
+        note = _health_note(snap)
+        if note:
+            lines.append(f"  ⚠️  {note}")
         lines.append(f"  Last seen:  {_fmt_ts(snap.ts)}")
         soil = _fmt_soil_reading(snap)
         if soil is not None:
@@ -1535,7 +1613,28 @@ def handle_command(
 
     if command == "nodes":
         if not nodes: return "No nodes in database yet.", None
-        return "Known field nodes:\n" + "\n".join(f"  {n}" for n in sorted(nodes)), None
+        # Flagged rather than filtered. A node the farmer has forgotten about is
+        # worse than a stale row: it stays out in the field either way, and hiding
+        # it is how it gets forgotten. But it must not look the same as a live one
+        # in the list they tap to send a command.
+        now = int(time.time())
+        lines = []
+        stale = 0
+        for node_id in sorted(nodes):
+            note = _health_note(nodes[node_id], now)
+            if note:
+                stale += 1
+                lines.append(f"  {node_id}  ⚠️ {note}")
+            else:
+                lines.append(f"  {node_id}")
+        out = "Known field nodes:\n" + "\n".join(lines)
+        if stale:
+            out += (
+                f"\n\n⚠️ {stale} of {len(nodes)} need checking. A sensor marked "
+                "'no soil readings recently' is still on the mesh and will answer "
+                "commands -- it just is not measuring."
+            )
+        return out, None
     if command == "help":     return HELP_TEXT, None
     if command == "status":   return fmt_status(nodes), None
     if command == "soil":     return fmt_soil(nodes), None
