@@ -229,6 +229,12 @@ class NodeState:
     long_name: Optional[str] = None
     short_name: Optional[str] = None
     display_name: Optional[str] = None
+    # Meshtastic APP_VERSION as the node reported it in its last ack, e.g.
+    # "2.7.20.200289a". None until a node has acked anything since this Pi last
+    # restarted, or from a node whose firmware predates the field. Nothing else in
+    # the system records what build a node runs -- NodeInfo has no version field and
+    # DeviceMetadata never leaves the local serial/BLE link.
+    firmware_version: Optional[str] = None
     # Newest packet timestamp applied per payload kind, so a delayed or replayed
     # packet cannot overwrite a field with an older value. Deliberately per-kind
     # rather than one timestamp for the whole state: on startup the ingestor
@@ -281,6 +287,7 @@ class NodeState:
             "long_name": self.long_name,
             "short_name": self.short_name,
             "display_name": self.display_name,
+            "firmware_version": self.firmware_version,
             "last_packet_ts": self.last_seen_ts,
             # The fact that makes "present but never reporting" detectable at all.
             "soil_last_ts": self.soil_last_ts(),
@@ -308,6 +315,7 @@ def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "
         "long_name": state.long_name,
         "short_name": state.short_name,
         "display_name": state.display_name,
+        "firmware_version": state.firmware_version,
         "location_name": location_name,
         "node_type": node_type,
     }
@@ -334,6 +342,7 @@ def _state_from_dict(d: dict) -> NodeState:
         long_name=d.get("long_name"),
         short_name=d.get("short_name"),
         display_name=d.get("display_name"),
+        firmware_version=d.get("firmware_version"),
     )
 
 
@@ -528,9 +537,11 @@ class CommandLogWriter:
 
         cmd_id = payload.get("cmd_id")
         if cmd_id in (None, "", 0):
-            # An unsolicited ack (quiet mode self-expired) carries cmd_id 0. There is no
-            # request row to attach it to; the bridge already logged it, and the node's
-            # next reading is the real confirmation that it is transmitting again.
+            # An unsolicited ack carries cmd_id 0 -- either a quiet mode that self-expired
+            # or a node's boot announce. There is no request row to attach either to, and
+            # the bridge has already logged it. Nothing is lost by dropping it here: the
+            # boot announce's whole payload is its firmware version, which reaches
+            # mesh_nodes on its own retained topic rather than through this table.
             logger.info("Command log: ignoring status with no cmd_id: %s", payload)
             return
 
@@ -1072,6 +1083,7 @@ class MqttToDbIngestor:
             "battery": f"{self.cfg.root_nodes}/+/battery",
             "link": f"{self.cfg.root_nodes}/+/link",
             "info": f"{self.cfg.root_nodes}/+/info",
+            "firmware": f"{self.cfg.root_nodes}/+/firmware",
             # Not node-keyed; handled ahead of classify_topic in on_message().
             "cmd_status": f"{self.cfg.root_cmd}/status",
         }
@@ -1245,7 +1257,7 @@ class MqttToDbIngestor:
             if len(parts) != 2:
                 return None, None
             node_id, metric = parts
-            if metric in {"position", "battery", "link", "info"}:
+            if metric in {"position", "battery", "link", "info", "firmware"}:
                 return metric, node_id
             return None, None
 
@@ -1307,6 +1319,12 @@ class MqttToDbIngestor:
                 payload.get("shortName", payload.get("short_name"))
             )
             state.display_name = state.short_name or state.long_name
+        elif kind == "firmware":
+            # Guarded rather than assigned: this topic is retained, so a redelivery on
+            # reconnect must not be able to blank a version the node has since reported.
+            version = self._coerce_name(payload.get("firmwareVersion"))
+            if version:
+                state.firmware_version = version
 
     def write_outputs(self, state: NodeState, kind: str) -> None:
         # --- Local (primary — always write) ---

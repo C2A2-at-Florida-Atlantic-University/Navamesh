@@ -7,6 +7,12 @@ cmd_cli.py — Send a control command to a field node from a terminal, and wait 
     navamesh-cmd quiet    !0b9aed49 off    # resume
     navamesh-cmd ble      ^all 30          # every field node at once
     navamesh-cmd setloc   !0b9aed49 36.0721 -109.0450   # set its fixed position
+    navamesh-cmd interval !0b9aed49 30m    # same, in minutes; 2h also works
+    navamesh-cmd fwinfo   !0b9aed49        # what build is it running? changes nothing
+    navamesh-cmd fwinfo   ^all             # ...across the fleet
+
+Nodes announce their build unprompted at boot, so the Pi usually knows it already --
+`fwinfo` is for asking again without waiting for a reboot.
 
 This publishes to the MQTT command topic rather than opening the radio directly: the
 bridge process owns the serial port, and two processes cannot share it. The bridge does
@@ -37,6 +43,7 @@ from navamesh.processors.command_proto import (
     UNICAST_ONLY_VERBS,
     CommandValidationError,
     encode_command,
+    parse_interval_value,
 )
 
 # How long to wait for the node to answer. The firmware jitters acks by up to 4s to keep 18
@@ -58,9 +65,13 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("verb", choices=["ble", "interval", "quiet", "setloc"])
+    p.add_argument("verb", choices=["ble", "interval", "quiet", "setloc", "fwinfo"])
     p.add_argument("target", help="node id (!hex), or ^all except for setloc")
-    p.add_argument("value", help="minutes / seconds, on|off for quiet, or latitude for setloc")
+    # Optional because fwinfo takes none -- it asks a question rather than setting anything.
+    # _parse_value still requires one for every other verb, so a forgotten value is caught
+    # with a message about that verb rather than by argparse.
+    p.add_argument("value", nargs="?", default=None,
+                   help="minutes / seconds (or 30m, 2h) / on|off / latitude; none for fwinfo")
     # setloc is the only verb taking two values. A bare negative longitude is safe as a
     # positional: argparse treats -109.045 as a number rather than a flag, because this
     # parser defines no option that looks like a negative number.
@@ -81,6 +92,12 @@ def _parse_value(verb: str, raw: str, raw2: Optional[str] = None):
 
     Only setloc uses lat/lon, and only setloc uses raw2.
     """
+    if verb == "fwinfo":
+        if raw is not None:
+            raise CommandValidationError("fwinfo takes no value")
+        return None, None, None, None
+    if raw is None:
+        raise CommandValidationError(f"{verb} needs a value")
     if verb == "quiet":
         v = raw.strip().lower()
         if v not in ("on", "off"):
@@ -97,6 +114,13 @@ def _parse_value(verb: str, raw: str, raw2: Optional[str] = None):
             )
     if raw2 is not None:
         raise CommandValidationError(f"{verb} takes one value, got two")
+    if verb == "interval":
+        # Accepts "1800", "30m", "2h". Bare numbers stay seconds, so nothing scripted
+        # against this tool changes meaning.
+        seconds, error = parse_interval_value(raw)
+        if error:
+            raise CommandValidationError(error)
+        return seconds, None, None, None
     try:
         return int(raw), None, None, None
     except ValueError:
@@ -184,10 +208,19 @@ def main(argv: Optional[list] = None) -> int:
                 d = s.get("detail") or {}
                 applied = d.get("applied_value")
                 alat, alon = d.get("applied_lat"), d.get("applied_lon")
+                fw = d.get("firmware_version")
                 if alat is not None and alon is not None:
                     shown = f" = {alat:.6f}, {alon:.6f}"
+                elif args.verb == "fwinfo":
+                    # applied_value is 0 here: the verb applies nothing, and the version
+                    # *is* the answer. Without this the tool would print "ok" and drop it.
+                    shown = f" = {fw or 'no version reported (firmware predates the field)'}"
                 else:
                     shown = f" = {applied}" if applied else ""
+                    # Every ack carries it, so show it on all of them -- it is the cheapest
+                    # possible answer to "was this node even running the build I think?"
+                    if fw:
+                        shown += f"   [fw {fw}]"
                 print(f"ok    node applied {d.get('command_type', args.verb)}{shown}")
                 client.loop_stop()
                 return 0

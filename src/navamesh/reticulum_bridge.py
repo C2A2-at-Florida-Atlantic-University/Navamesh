@@ -101,7 +101,7 @@ except ImportError:
 
 from navamesh.config import load_config
 from navamesh.calibration import DAMP, DRY, WET, adc_to_band
-from navamesh.processors.command_proto import UNICAST_ONLY_VERBS
+from navamesh.processors.command_proto import UNICAST_ONLY_VERBS, parse_interval_value
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -308,6 +308,10 @@ class NodeSnapshot:
     # moves. The two drifting apart is what distinguishes a node that is present
     # but not measuring from one that is simply gone.
     soil_last_ts: Optional[int] = None
+    # The build this node last reported in an ack, e.g. "2.7.20.200289a". None means
+    # it has not acked since this Pi's database was last populated -- NOT that it is
+    # unflashed, which is a different question answered by soil_raw.
+    firmware_version: Optional[str] = None
 
 
 @dataclass
@@ -365,6 +369,7 @@ def _nodes_from_postgres(dsn: str) -> Dict[str, NodeSnapshot]:
             long_name=meta.get("long_name"),
             short_name=meta.get("short_name"),
             soil_last_ts=meta.get("soil_last_ts"),
+            firmware_version=meta.get("firmware_version"),
         )
     logger.debug("Loaded %d node(s) from Postgres.", len(snapshots))
     return snapshots
@@ -637,6 +642,40 @@ def fmt_link(nodes: Dict[str, NodeSnapshot]) -> str:
             lines.append(f"{_fmt_node(node_id)}: no link data yet")
     return "\n".join(lines)
 
+def fmt_firmware(nodes: Dict[str, NodeSnapshot]) -> str:
+    """What build each node last reported. A database read -- nothing goes on the air.
+
+    Grouped by version rather than listed per node, because the question this answers
+    during a rollout is "which ones still need doing", and eighteen lines of identical
+    version strings hides the two that differ.
+
+    "Not reported yet" is deliberately not "not flashed". A node only reports its version
+    when it acks something, and it announces once at boot -- so an unheard node and a node
+    whose firmware predates the field look the same here. soil_raw is what distinguishes
+    flashed from unflashed; this distinguishes one flashed build from another.
+    """
+    if not nodes:
+        return "No nodes in database yet."
+
+    by_version: Dict[str, List[str]] = {}
+    for node_id, snap in nodes.items():
+        by_version.setdefault(snap.firmware_version or "", []).append(node_id)
+
+    lines = [_header("🧬 Firmware")]
+    for version in sorted(v for v in by_version if v):
+        ids = sorted(by_version[version])
+        lines.append(f"{version} — {len(ids)} sensor{'s' if len(ids) != 1 else ''}")
+        lines.extend(f"    {_fmt_node(i)}" for i in ids)
+
+    unknown = sorted(by_version.get("", []))
+    if unknown:
+        lines.append(f"Not reported yet — {len(unknown)}")
+        lines.extend(f"    {_fmt_node(i)}" for i in unknown)
+        lines.append("  A sensor reports its version when it acks a command, and once")
+        lines.append("  when it boots. Send 'fwinfo <id|^all>' to ask now.")
+    return "\n".join(lines)
+
+
 # The control half of this used to describe itself the way the protocol does --
 # "set telemetry interval (live, no reboot)", "stop / resume transmitting" -- which
 # asked a farmer to know what telemetry is before they could find out how often
@@ -669,7 +708,7 @@ Change a sensor — the app asks you to confirm before any of these are sent:
       ble <id|^all> <minutes>
   Reporting interval — how often the sensor reports. Shorter gives finer data
       and uses more battery. Takes effect right away
-      interval <id|^all> <seconds>
+      interval <id|^all> <seconds|30m|2h>
   Messaging pause — the sensor stops sending but keeps listening, so you can
       resume it whenever. It also resumes by itself after a day, or on a reboot
       quiet <id|^all> on|off
@@ -677,10 +716,25 @@ Change a sensor — the app asks you to confirm before any of these are sent:
       stands. Stand next to it before sending. One sensor at a time
       setloc <id> <lat> <lon>"""
 
+# Operator verbs, kept out of HELP_TEXT on purpose -- see OPERATOR_VERB_LABELS. Written down
+# here so they are not undiscoverable: `firmware` lists what each node last reported (a
+# database read, no radio traffic), and `fwinfo <id|^all>` asks a node directly. Neither is
+# usually needed, because every node announces its version unprompted when it boots.
+OPERATOR_HELP_TEXT = """Navamesh Gateway — operator commands
+
+  firmware              — what build each sensor last reported (no radio traffic)
+  fwinfo <id|^all>      — ask a sensor its build now; changes nothing on it
+
+Nodes announce their build at boot, so 'firmware' is usually already current."""
+
 
 # Verbs that change deployed field hardware. Gated by AUTHORIZED_FARMER_HASHES; every
 # other verb in this gateway is read-only and safe to leave open.
-WRITE_VERBS = ("ble", "interval", "quiet", "setloc")
+# fwinfo is here despite changing nothing on a node. Two reasons it belongs with the writes
+# rather than the reads: it travels the same machinery (command bus, command_id, ack
+# correlation), and broadcasting it makes every node in range transmit -- so it is gated like
+# anything else that puts traffic on the air, not like a database query.
+WRITE_VERBS = ("ble", "interval", "quiet", "setloc", "fwinfo")
 
 # Which of those may never go to ^all -- see UNICAST_ONLY_VERBS in command_proto, which is
 # where it lives because the transmit path enforces the same rule independently.
@@ -735,12 +789,12 @@ _LAT_MIN_DEGREES, _LAT_MAX_DEGREES = -90.0, 90.0
 _LON_MIN_DEGREES, _LON_MAX_DEGREES = -180.0, 180.0
 
 BROADCAST_TARGET = "^all"
-
 _WRITE_EXAMPLE_ARGS = {
     "ble": "15",
     "interval": "1800",
     "quiet": "on",
     "setloc": "36.0721 -109.0450",
+    "fwinfo": "",
 }
 
 
@@ -756,7 +810,8 @@ def _parse_write_args(command: str, target: Optional[str]):
         example = _WRITE_EXAMPLE_ARGS.get(command, "15")
         who = "!a1b2c3d4" if command in UNICAST_ONLY_VERBS else BROADCAST_TARGET
         return None, None, None, None, (
-            f"'{command}' needs a target. Example: {command} {who} {example}"
+            f"'{command}' needs a target. "
+            f"Example: {' '.join(x for x in (command, who, example) if x)}"
         )
 
     bits = target.split()
@@ -790,9 +845,28 @@ def _parse_write_args(command: str, target: Optional[str]):
             )
         return node, None, None, (lat, lon), None
 
+    if command == "fwinfo":
+        # The only write-path verb that takes no argument: it asks a question rather than
+        # setting anything, and the answer rides the ack every command already returns.
+        # Anything trailing is a typo worth naming -- silently ignoring it would leave an
+        # operator believing they had scoped the probe somehow.
+        if arg is not None:
+            return None, None, None, None, (
+                f"'fwinfo' takes no value. Example: fwinfo {node}"
+            )
+        return node, None, None, None, None
+
     if arg is None:
         unit = "minutes" if command == "ble" else "seconds"
         return None, None, None, None, f"'{command}' needs a value in {unit}. Example: {command} {node} 15"
+
+    if command == "interval":
+        # Units handled here rather than by int() below, so "30m" and "2h" reach the same
+        # bounds check as a bare number. See parse_interval_value().
+        value, error = parse_interval_value(arg)
+        if error:
+            return None, None, None, None, error
+        return node, value, None, None, None
 
     try:
         value = int(arg)
@@ -802,11 +876,6 @@ def _parse_write_args(command: str, target: Optional[str]):
     if command == "ble" and not _BLE_MIN_MINUTES <= value <= _BLE_MAX_MINUTES:
         return None, None, None, None, (
             f"BLE window must be {_BLE_MIN_MINUTES}-{_BLE_MAX_MINUTES} minutes."
-        )
-    if command == "interval" and not _INTERVAL_MIN_SECONDS <= value <= _INTERVAL_MAX_SECONDS:
-        return None, None, None, None, (
-            f"Interval must be {_INTERVAL_MIN_SECONDS}-{_INTERVAL_MAX_SECONDS} seconds "
-            f"({_INTERVAL_MIN_SECONDS // 60} min to 24 h)."
         )
 
     return node, value, None, None, None
@@ -866,6 +935,8 @@ def _handle_write_command(
         what = f"Bluetooth on for {value} min"
     elif command == "interval":
         what = f"Reporting interval every {_friendly_seconds(value)}"
+    elif command == "fwinfo":
+        what = "Firmware version check"
     elif command == "setloc":
         what = f"Sensor location {lat:.6f}, {lon:.6f}"
     else:
@@ -887,9 +958,21 @@ VERB_LABELS = {
     "setloc": "Sensor location",
 }
 
+# Operator-only verbs. Deliberately NOT in VERB_LABELS: that dict is the farmer's vocabulary,
+# pinned by test_farmer_wording to both HELP_TEXT and the app's buttons, so anything added
+# there is a promise to show it to a farmer. A build hash is an operator's concern -- whoever
+# is running a rollout -- and a farmer needs DRY/DAMP/WET. Putting it in front of them would
+# re-introduce the protocol-facing surface cd60737 and the HELP_TEXT rewrite removed.
+#
+# These still get a readable name, because the operator sees the same outcome messages.
+OPERATOR_VERB_LABELS = {
+    "fwinfo": "Firmware version",
+}
+
 
 def _verb_label(verb) -> str:
-    return VERB_LABELS.get(str(verb), str(verb))
+    v = str(verb)
+    return VERB_LABELS.get(v) or OPERATOR_VERB_LABELS.get(v, v)
 
 
 def _friendly_seconds(seconds) -> str:
@@ -1648,6 +1731,8 @@ def handle_command(
                     "check power, or that it is still within range."
                 )
         return out, None
+    if command == "firmware": return fmt_firmware(nodes), None
+    if command in ("ophelp", "operator"): return OPERATOR_HELP_TEXT, None
     if command == "help":     return HELP_TEXT, None
     if command == "status":   return fmt_status(nodes), None
     if command == "soil":     return fmt_soil(nodes), None
@@ -1982,12 +2067,23 @@ class LxmfGateway:
         applied_lon = detail.get("applied_lon") if isinstance(detail, dict) else None
         reason = detail.get("reason") if isinstance(detail, dict) else None
 
+        firmware = detail.get("firmware_version") if isinstance(detail, dict) else None
+
         if state == "acked":
             body = f"{icon} {what} confirmed by {who}"
             # The node echoes back the coordinates it actually stored, so report those rather
             # than the ones we sent -- they are what the node will broadcast from now on.
             if applied_lat is not None and applied_lon is not None:
                 body += f" = {applied_lat:.6f}, {applied_lon:.6f}"
+            elif verb == "fwinfo":
+                # applied_value is 0 for this verb -- it applies nothing. The answer is the
+                # version, so without this the confirmation would report success and omit
+                # the one fact the command was sent to obtain.
+                body += f" = {firmware or 'no version reported (firmware too old to say)'}"
+            elif verb == "interval" and applied:
+                # In the farmer's units, not the protocol's. A node asked for "2h" that
+                # confirms "= 7200" leaves them converting back to check it took.
+                body += f" = every {_friendly_seconds(applied)}"
             elif applied:
                 body += f" = {applied}"
         elif state == "timeout":

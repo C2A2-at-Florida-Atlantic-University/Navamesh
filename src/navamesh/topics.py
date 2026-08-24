@@ -31,6 +31,22 @@ def node_battery(root_nodes: str, from_id: str) -> str:
 def node_info(root_nodes: str, from_id: str) -> str:
     return f"{root_nodes}/{from_id}/info"
 
+def node_firmware(root_nodes: str, from_id: str) -> str:
+    """The firmware version a node reported in its last ack.
+
+    Deliberately its own topic rather than a field on /info, which would have been the
+    obvious home. The ingestor's "info" branch assigns long_name/short_name/display_name
+    unconditionally, so a firmware-only payload published there would null a node's display
+    name -- and a NodeInfo packet, which carries no version, would null the firmware right
+    back. A separate topic also gets its own staleness timestamp, so the two cannot discard
+    each other's updates.
+
+    Retained: it changes only when a node is reflashed, and it must survive an ingestor
+    restart, since the alternative is waiting for the next command before the fleet's
+    versions are known again.
+    """
+    return f"{root_nodes}/{from_id}/firmware"
+
 
 # --- Downlink command bus -------------------------------------------------------
 #

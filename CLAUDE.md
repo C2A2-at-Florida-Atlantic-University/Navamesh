@@ -272,23 +272,42 @@ a reading-back ack are identical by construction. The read-back is confirmed pre
 flashed binary (its log strings are in the ELF) and only becomes *observable* when a node
 disagrees, which is the point of it.
 
-### Planned next, on the Mac (2026-08-24)
+### Built on the Mac, 2026-08-24
 
-Two features are being built there, not here. Context each will need:
+Both landed together in one firmware/Pi/app change; the firmware half had to precede the
+fleet flash and did (`1f179a7b8`, `2.7.20.1f179a7`).
 
-- **Manual entry for the reporting interval.** The app currently offers `value_presets`
-  only, deliberately — `command_registry.py` records a "no typing anywhere" rule, and a
-  preset list also makes an out-of-range value impossible to enter. The precedent for
-  breaking that is `set_location`'s "Enter coordinates" fallback, which exists because a
-  live position is the one value with nothing to preset. Whatever the manual field does, the
-  bounds stay **triplicated** — UI, then `processors/command_proto.py`, then the firmware
-  clamp (60-86400 s, with 300 s the firmware floor in practice) — so a bad value is caught
-  early, explained in the middle, and clamped as a last resort.
-- **Firmware version reported from the nodes.** See the `TODO.md` entry, which was wrong
-  about this being Pi-side-only and is now corrected: a remote node never broadcasts its
-  version, so this needs a field on the wire and therefore has to land *before* a flash. The
-  ack is the better home than `SoilReading` (airtime), and note "has this node been flashed
-  at all?" is already answerable from `soil_raw` being NULL.
+**Firmware version reporting.** A node announces its build unsolicited at boot, carries it on
+every ack, and answers `fwinfo <id|^all>` on demand. Full details in the firmware repo's
+`CLAUDE.md`; what matters here is the Pi half:
+
+- `_bridge.py` republishes any ack's version to `farm/nodes/<id>/firmware`, retained.
+  **Its own topic, deliberately not a field on `/info`** — the ingestor's `info` branch
+  assigns `long_name`/`short_name`/`display_name` unconditionally, so a firmware-only payload
+  there would null a node's display name, and a NodeInfo packet would null the firmware back.
+  Separate topics also get separate staleness timestamps.
+- `mqtt_to_db.py` stores it in `mesh_nodes.metadata->>'firmware_version'`, guarded so a
+  retained redelivery cannot blank a version already recorded.
+- **Operator surfaces only.** `navamesh-cmd fwinfo`, the gateway's `firmware` (a database
+  read, no radio traffic) and `ophelp` verbs. It is deliberately absent from `HELP_TEXT` and
+  from `VERB_LABELS` — that dict is the farmer's vocabulary and `test_farmer_wording` pins
+  everything in it into the help text, so adding a verb there is a promise to show a farmer a
+  build hash. `OPERATOR_VERB_LABELS` exists so those verbs still read well in outcomes.
+- "Never reported" stays NULL and renders as "Not reported yet". `soil_raw IS NULL` remains
+  the separate, independent answer to "flashed at all".
+
+**Units on the reporting interval.** `interval <id|^all> 30m` and `2h` now work alongside bare
+seconds, which still mean seconds — the app, `navamesh-cmd` and anything scripted are
+unchanged. `parse_interval_value()` lives in `processors/command_proto.py` rather than
+`reticulum_bridge.py` so `navamesh-cmd` can use it without importing the RNS/LXMF stack. The
+unit is applied *before* the bounds check, so a suffix cannot smuggle a value past a bound the
+equivalent number of seconds would fail. Out-of-range is refused, never clamped, and the error
+echoes both what was typed and what it came to.
+
+The app gained "Enter a time" beside the interval presets — a number plus a Minutes/Hours
+button, validated against the same `value_min`/`value_max` a preset would have been. The wire
+string is unchanged (`interval <id> <seconds>`), so neither the Pi nor the firmware had to
+learn a new format. Bounds stay triplicated: UI, `command_proto.py`, firmware clamp.
 
 ### Earlier in Aug 2026
 

@@ -92,8 +92,27 @@ failure is invisible from the app and indistinguishable from a weak link.
 
 ## Publish each node's firmware version
 
-**Status:** open, and now the highest-value open item. Blocked two separate diagnoses on
-2026-08-21.
+**Status:** closed 2026-08-24. Every node now reports its Meshtastic `APP_VERSION` string
+three ways: an unsolicited broadcast once at boot (`command_id 0`, `GET_FIRMWARE_INFO`,
+jittered 5-35 s so a fleet power-cycle does not collide), on every `NavameshAck`, and on
+request via `fwinfo <id|^all>`. The Pi publishes it to `farm/nodes/<id>/firmware` (retained,
+its own topic rather than a field on `/info`, which would have nulled a node's display name
+on every firmware-only payload) and stores it in `mesh_nodes.metadata->>'firmware_version'`.
+
+Operator surfaces only: `navamesh-cmd fwinfo`, the gateway's `firmware` and `ophelp` verbs,
+and the metadata column. Nothing reaches the app, and `test_operator_surface.py` pins that —
+`HELP_TEXT` is asserted not to contain "firmware", "version" or "build".
+
+"Never reported" stays distinguishable from a recorded value (NULL, shown as "Not reported
+yet") rather than defaulting to something that reads like an answer. Note reboots are not
+only reflashes, so hearing a version does not mean a node was just flashed.
+
+Needed a firmware change and therefore had to land before the flash, which it did:
+`1f179a7b8`, shipped as `2.7.20.1f179a7`.
+
+Original entry:
+
+Blocked two separate diagnoses on 2026-08-21.
 
 Sharper as of 2026-08-23: a fleet-wide flash is imminent, so a partially-updated fleet is
 about to be the normal state and "which nodes still need it" should be a query rather than

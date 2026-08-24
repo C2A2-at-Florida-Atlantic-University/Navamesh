@@ -155,17 +155,41 @@ def main():
                         "applied_value": ack["applied_value"],
                         "applied_lat": ack["applied_lat"],
                         "applied_lon": ack["applied_lon"],
+                        "firmware_version": ack["firmware_version"],
                         "unsolicited": ack["unsolicited"],
                     },
                     "ts": int(time.time()),
                 }
                 mqtt_pub.publish(topics.cmd_status(cfg.root_cmd), status, qos=1)
+
+                # Every ack carries the node's build, so this fires on all of them rather
+                # than only on the boot announce -- a node reflashed between two commands
+                # is corrected by its next ack of any kind, with no extra transmission.
+                # Empty means firmware older than the field, which stays absent rather than
+                # overwriting a known version with a blank.
+                if ack["firmware_version"]:
+                    mqtt_pub.publish(
+                        topics.node_firmware(cfg.root_nodes, from_id),
+                        {"ts": int(time.time()),
+                         "fromId": from_id,
+                         "firmwareVersion": ack["firmware_version"]},
+                        retain=True,
+                    )
+
                 if ack["unsolicited"]:
-                    print(f"[CMD] {from_id} self-resumed from quiet mode (unsolicited ack)")
+                    # Two different events arrive here now, and reporting the wrong one is
+                    # actively misleading: a boot announce logged as "self-resumed from quiet
+                    # mode" would invent a quiet period nobody asked for and hide a reboot.
+                    if ack["command_type_name"] == "GET_FIRMWARE_INFO":
+                        print(f"[CMD] {from_id} booted, running "
+                              f"{ack['firmware_version'] or 'an unreported build'}")
+                    else:
+                        print(f"[CMD] {from_id} self-resumed from quiet mode (unsolicited ack)")
                 else:
                     print(f"[CMD] {from_id} ack id={ack['command_id']} "
                           f"{ack['command_type_name']} ok={ack['ok']} "
-                          f"applied={ack['applied_value']}")
+                          f"applied={ack['applied_value']} "
+                          f"fw={ack['firmware_version'] or '?'}")
                 return
 
             # FORMAT C: navamesh.SoilReading protobuf on PortNum 256 (PRIVATE_APP).

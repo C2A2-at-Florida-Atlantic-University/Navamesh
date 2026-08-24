@@ -107,6 +107,24 @@ enum NavameshCommandType {
    * Never send this to NODENUM_BROADCAST: every node would claim the same spot.
    */
   SET_LOCATION = 5;
+
+  /*
+   * Report the node's firmware version and change nothing.
+   *
+   * Every other command in this enum mutates the node, which made "what build is
+   * this node running?" unanswerable without altering it -- and the version is
+   * exactly what you want *before* deciding whether to alter it. This is the one
+   * safe probe: it applies nothing, and the ack it elicits carries
+   * firmware_version like any other.
+   *
+   * A node also sends this UNSOLICITED once at boot (command_id = 0), so a node
+   * that has just been flashed reports its new build without being asked. That
+   * is what makes a partially-updated fleet a query rather than a guess.
+   *
+   * Safe to broadcast: the reply is the only effect. Expect one ack per node in
+   * radio range, which is why the firmware jitters them.
+   */
+  GET_FIRMWARE_INFO = 6;
 }
 
 /*
@@ -192,4 +210,25 @@ message NavameshAck {
    */
   sfixed32 applied_latitude_i = 5;
   sfixed32 applied_longitude_i = 6;
+
+  /*
+   * The node's firmware version, e.g. "2.7.20.200289a" -- Meshtastic's APP_VERSION,
+   * the same string the app and a serial console show, with the git short hash on
+   * the end.
+   *
+   * Carried on EVERY ack, not just GET_FIRMWARE_INFO ones, because the question it
+   * answers is usually asked about a command that already went wrong: an ok=False
+   * from a node running a build that predates the handler is indistinguishable from
+   * a value the handler rejected. Two diagnoses on 2026-08-21 were lost to exactly
+   * that. Answering it in the same packet costs no extra transmission.
+   *
+   * Deliberately the string rather than a 4-byte hash. Acks are only sent in reply
+   * to a command, so the airtime is bounded by operator traffic rather than by the
+   * reporting interval -- and the string is directly comparable to what the
+   * Meshtastic app shows and to the .zip filename that was flashed, which a hash
+   * would need a lookup table to match.
+   *
+   * Empty from a node running a build older than this field.
+   */
+  string firmware_version = 7;
 }
