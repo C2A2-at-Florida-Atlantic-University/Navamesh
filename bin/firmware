@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# firmware — which build is each field node running?
+#
+# A read of what the gateway has already recorded. Sends nothing, touches no radio,
+# and is safe to run as often as you like.
+#
+#   firmware              every node, grouped by build
+#
+# Nodes report their build unprompted when they boot, and again on every command ack,
+# so this is current without asking. To ask one node directly (which does put a packet
+# on the air), use:  navamesh-cmd fwinfo <id>
+#
+# Deliberately NOT a wrapper around `fwinfo ^all`. A broadcast makes every node reply at
+# once, and their combined airtime exceeds the window the firmware jitters replies across,
+# so the answers collide -- you learn that at least one node is alive, not what the fleet
+# is running. That is the whole reason this is a read.
+
+set -euo pipefail
+
+CONTAINER=navamesh_bridge
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "firmware: docker not found -- run this on the Pi that hosts the gateway." >&2
+    exit 2
+fi
+
+if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
+    # Distinguish "stopped" from "you cannot talk to docker at all", because the fix
+    # differs and the raw docker error for the second is about a socket, not a group.
+    if ! docker ps >/dev/null 2>&1; then
+        echo "firmware: cannot talk to docker. Is your user in the 'docker' group?" >&2
+        echo "          (log out and back in after being added)" >&2
+        exit 2
+    fi
+    echo "firmware: the '$CONTAINER' container is not running, so there is nothing" >&2
+    echo "          holding the node table. Start it with:" >&2
+    echo "              cd ~/Navamesh && docker compose up -d bridge" >&2
+    exit 2
+fi
+
+exec docker exec "$CONTAINER" navamesh-cmd firmware "$@"
