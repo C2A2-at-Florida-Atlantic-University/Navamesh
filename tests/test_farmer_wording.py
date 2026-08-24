@@ -212,3 +212,36 @@ def test_help_still_documents_the_wire_syntax():
     typing, and this is the only place the syntax is written down."""
     for verb in VERB_LABELS:
         assert f"{verb} <" in HELP_TEXT, f"help text no longer shows how to type {verb!r}"
+
+
+# ── Line width ──────────────────────────────────────────────────────────────────
+
+# The app renders gateway replies in a monospace Label on a phone, which wraps at about
+# 44 columns. Measured from a screenshot on a moto g play, 2026-08-24: the help text's
+# 76-char control lines broke mid-sentence, and because those lines already carry a
+# 6-space hanging indent for their continuations, the wrapped remainder landed at column
+# 0 *beside* deliberate column-6 text. The result was an alternating left edge that read
+# as corruption rather than as wrapping.
+#
+# 43 rather than 44, so a line that is exactly at the limit still has somewhere to go if
+# the font metrics differ slightly on another handset.
+HELP_MAX_COLUMNS = 43
+
+
+def test_help_text_fits_the_phone_without_wrapping():
+    """Anything wider than the phone's Label wraps to column 0, which collides with the
+    indented continuation lines and looks like a rendering fault."""
+    too_wide = [(len(line), line) for line in HELP_TEXT.split("\n")
+                if len(line) > HELP_MAX_COLUMNS]
+    assert not too_wide, (
+        f"help lines exceed {HELP_MAX_COLUMNS} columns and will wrap on a phone: {too_wide}"
+    )
+
+
+def test_every_reply_the_gateway_composes_by_hand_fits_too():
+    """The section rules are 30 columns wide, which is the width this whole surface was
+    designed around -- a formatter that drifts past the wrap point looks broken in the
+    same way the help text did."""
+    from navamesh.reticulum_bridge import _header
+    for line in _header("🌱 Something").split("\n"):
+        assert len(line) <= HELP_MAX_COLUMNS

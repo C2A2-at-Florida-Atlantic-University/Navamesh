@@ -691,29 +691,32 @@ def fmt_firmware(nodes: Dict[str, NodeSnapshot]) -> str:
 # VERB_LABELS so the two cannot drift again.
 HELP_TEXT = """🌱 Navamesh Gateway — Commands
 
-  status       — how every sensor is doing
-  soil         — how wet the soil is
-  battery      — battery level and how long each sensor has been up
-  position     — where each sensor is
-  link         — how strong each sensor's signal is
-  map          — a map picture of every sensor
-  map <id>     — a map picture of one sensor
-  nodes        — list every sensor the gateway knows
-  help         — this message
+  status    — how every sensor is doing
+  soil      — how wet the soil is
+  battery   — charge, and time since boot
+  position  — where each sensor is
+  link      — each sensor's signal strength
+  map       — a map picture of every sensor
+  map <id>  — a map picture of one sensor
+  nodes     — list every sensor known
+  help      — this message
 
-Change a sensor — the app asks you to confirm before any of these are sent:
+Change a sensor — you confirm first:
 
-  Bluetooth on — turns Bluetooth on for a while, then off again by itself, so
-      you can connect to the sensor while the window is open
+  Bluetooth on — on a while, then off
+      Connect while the window is open
       ble <id|^all> <minutes>
-  Reporting interval — how often the sensor reports. Shorter gives finer data
-      and uses more battery. Takes effect right away
+
+  Reporting interval — how often it reports
+      Shorter is finer data, more battery
       interval <id|^all> <seconds|30m|2h>
-  Messaging pause — the sensor stops sending but keeps listening, so you can
-      resume it whenever. It also resumes by itself after a day, or on a reboot
+
+  Messaging pause — stops sending, hears
+      Comes back by itself after a day
       quiet <id|^all> on|off
-  Sensor location — the sensor has no GPS of its own, so this tells it where it
-      stands. Stand next to it before sending. One sensor at a time
+
+  Sensor location — where the sensor stands
+      Stand next to it before you send this
       setloc <id> <lat> <lon>"""
 
 # Operator verbs, kept out of HELP_TEXT on purpose -- see OPERATOR_VERB_LABELS. Written down
