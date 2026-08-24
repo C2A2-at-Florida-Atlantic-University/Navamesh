@@ -212,21 +212,86 @@ def test_cached_view_choice_tries_higher_cached_zoom_before_failing():
 
 # ── handle_command: map <id> outside coverage ────────────────────────────────
 
-def test_map_id_outside_bounds_returns_text_and_no_image():
+def _record_render(monkeypatch):
+    """Capture render_map's arguments instead of drawing anything.
+
+    Every test below that cares about extent choice asserts on this rather than on
+    an image, so none of them touch a tile server -- the test config names the real
+    OSM fallback, and a test that reaches it is a test that fails on a train.
+    """
+    calls = []
+
+    def fake_render_map(nodes, cfg, bounds=None, highlight_node_id=None):
+        calls.append({"nodes": dict(nodes), "bounds": bounds, "highlight": highlight_node_id})
+        return None      # force the text fallback; extent choice is what is under test
+
+    monkeypatch.setattr("navamesh.reticulum_bridge.render_map", fake_render_map)
+    return calls
+
+
+def test_map_id_outside_bounds_renders_node_centered_instead_of_refusing(monkeypatch):
+    """`map <id>` outside the cached box takes the same path `map` already takes.
+
+    This used to return before render_map was ever called, so that an
+    out-of-coverage node could not pull uncached tiles. The protection was not
+    real: plain `map` renders those same nodes from the fallback tile server
+    without complaint, so the only thing the refusal reliably produced was two
+    adjacent commands disagreeing about the same node. Where tiles genuinely
+    cannot be fetched the render still fails and the text fallback still answers --
+    which is what the next test pins.
+    """
+    calls = _record_render(monkeypatch)
     nodes = {"!cbf78a20": NodeSnapshot(node_id="!cbf78a20", lat=27.50, lon=-80.10)}
     text, image = handle_command("map !cbf78a20", nodes, _cfg_with_bounds())
-    assert image is None
-    assert "outside offline map coverage" in text
-    assert "27.50000" in text and "-80.10000" in text   # GPS reported
+
+    assert len(calls) == 1, "render_map must be attempted, not short-circuited"
+    assert calls[0]["bounds"] is None, "node-centered extent, not the cached farm box"
+    assert calls[0]["highlight"] is None
+    assert "outside offline map coverage" not in text
+    assert "!cbf78a20" in text          # the node the farmer asked for is still named
+    assert image is None                # fake render returns None
 
 
-def test_map_id_outside_bounds_does_not_recenter_or_render():
-    # Even if rendering were available, an out-of-coverage node must return before
-    # render_map is ever called, so no tiles are requested.
+def test_map_id_inside_bounds_still_locks_to_the_cached_extent(monkeypatch):
+    """The bandwidth-safe path is unchanged for the nodes it was written for."""
+    calls = _record_render(monkeypatch)
+    nodes = {"!cbf78a20": NodeSnapshot(node_id="!cbf78a20", lat=NODE_LAT, lon=NODE_LON)}
+    handle_command("map !cbf78a20", nodes, _cfg_with_bounds())
+
+    assert len(calls) == 1
+    assert calls[0]["bounds"] == FARM_BOUNDS
+    assert calls[0]["highlight"] == "!cbf78a20"
+
+
+def test_map_id_outside_bounds_falls_back_to_text_when_no_tiles_are_reachable(monkeypatch):
+    """With no fallback tile server there is genuinely no way to draw it.
+
+    Strict offline behaviour is still expressible -- it just lives in whether a
+    fallback tile source is configured, rather than in which of two commands the
+    farmer happened to press.
+    """
+    calls = _record_render(monkeypatch)
+    cfg = _cfg_with_bounds(map_tile_fallback="")
     nodes = {"!faraway1": NodeSnapshot(node_id="!faraway1", lat=40.0, lon=-74.0)}
-    text, image = handle_command("map !faraway1", nodes, _cfg_with_bounds())
+    text, image = handle_command("map !faraway1", nodes, cfg)
+
+    assert len(calls) == 1
     assert image is None
-    assert "outside offline map coverage" in text
+    assert "!faraway1" in text
+    assert "Navamesh Map" in text       # the ordinary text summary, not a refusal
+
+
+def test_map_all_reports_how_many_nodes_are_outside_cache_coverage(monkeypatch):
+    """The warning existed in both replies but its counter was never incremented,
+    so it could not fire -- which left "not covered" looking like "not drawn"."""
+    _record_render(monkeypatch)
+    nodes = {
+        "!inside01": NodeSnapshot(node_id="!inside01", lat=NODE_LAT, lon=NODE_LON),
+        "!outside1": NodeSnapshot(node_id="!outside1", lat=40.0, lon=-74.0),
+        "!outside2": NodeSnapshot(node_id="!outside2", lat=41.0, lon=-75.0),
+    }
+    text, _ = handle_command("map", nodes, _cfg_with_bounds())
+    assert "2 GPS node(s) outside offline map coverage" in text
 
 
 @pytest.mark.skipif(not MAP_AVAILABLE, reason="staticmap/pillow not installed")
