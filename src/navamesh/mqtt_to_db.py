@@ -529,8 +529,15 @@ class CommandLogWriter:
         The bridge publishes twice per command (once on transmit, once when the node's
         ack arrives), so this has to be an upsert rather than an update.
 
-        `notified` is reset to false on every state change so the LXMF poller reports the
-        newest outcome rather than stopping after the first one.
+        `notified` is reset to false when the state actually CHANGES, so the LXMF poller
+        reports the newest outcome rather than stopping after the first one -- but does not
+        re-report the same outcome once per arriving ack.
+
+        That distinction is load-bearing for a broadcast. One `^all` command produces one ack
+        per node against a single row (this table is keyed by cmd_id), and the firmware now
+        spreads those replies across ~45 s so they do not collide. Resetting on every write
+        would turn that into an outcome message per poll cycle -- the farmer tapping "all
+        sensors" would get the same green confirmation eight or nine times.
         """
         if not self.enabled or self._conn is None:
             return
@@ -560,7 +567,11 @@ class CommandLogWriter:
                         state = EXCLUDED.state,
                         detail = EXCLUDED.detail,
                         updated_at = now(),
-                        notified = false
+                        notified = CASE
+                            WHEN public.command_log.state IS DISTINCT FROM EXCLUDED.state
+                            THEN false
+                            ELSE public.command_log.notified
+                        END
                     """,
                     (
                         str(cmd_id),
