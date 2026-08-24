@@ -81,6 +81,26 @@ The caller also needs to be in the `docker` group (`sudo usermod -aG docker <use
 log out and back in). Both scripts detect that case and say so, because docker's own error
 for it is about a socket and reads like the container is down.
 
+### A backwards clock silently mutes the whole fleet
+
+`command_id` is the firmware's replay guard, and a node **silently drops** any command at
+or below the last id it accepted — no ack, no error, and a retry carries a similarly low
+id, so the state cannot be retried out of and reads exactly like a dead radio.
+
+The id was a bare unix timestamp, which is monotonic only while the clock is. A Pi has no
+guaranteed RTC and a farm gateway may have no NTP, so one that loses power for a week comes
+back believing it is a week ago — and from then on **every node it has ever commanded
+ignores it**, permanently, with nothing in any log on the Pi to say why.
+
+Closed 2026-08-24: both `_next_cmd_id()` and `navamesh-cmd` now take their floor from
+`max(cmd_id)` in `command_log` rather than trusting the clock. Note the cast — `cmd_id` is a
+**TEXT** column, and lexicographic `max()` puts `"999999999"` above `"1787612909"` while
+being numerically smaller, i.e. it fails in exactly the case the guard exists for.
+
+`devpi` has an RTC and working NTP, so it was never exposed. **Check `spirit-farm-pi`**
+(`ls /dev/rtc0`, `timedatectl`) — the farm has no internet, which is the deployment this
+would actually happen to.
+
 ## Traps that have already cost real time
 
 **The test suite used to skip itself into a green run.** Closed in 83ec1cf, but know

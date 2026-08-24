@@ -135,3 +135,92 @@ def test_firmware_view_is_a_database_read_and_needs_no_command_bus():
     reply, attachment = handle_command("firmware", {"!aaa": _snap("!aaa", "2.7.20.abc")}, cfg)
     assert attachment is None
     assert "2.7.20.abc" in reply
+
+
+# ── Command id monotonicity ─────────────────────────────────────────────────────
+#
+# The firmware drops any command whose id is at or below the last one a node accepted,
+# and does it SILENTLY -- no ack, no error. A retry carries a similarly low id, so the
+# state is unrecoverable by retrying and looks exactly like a dead radio from the Pi.
+#
+# A bare timestamp is monotonic only while the clock is. A Pi has no guaranteed RTC and a
+# farm gateway may have no NTP, so one that loses power for a week returns believing it is
+# a week ago -- and every command it issues from then on is rejected by every node it has
+# ever commanded.
+
+import threading
+import types
+
+
+def _gateway_stub(highest_issued=0):
+    """Enough of LxmfGateway to exercise _next_cmd_id without standing up RNS."""
+    from navamesh.reticulum_bridge import LxmfGateway
+
+    stub = types.SimpleNamespace(
+        _cmd_seq_lock=threading.Lock(),
+        _cfg=types.SimpleNamespace(pg_dsn=""),   # so the DB read short-circuits to 0
+    )
+    stub._highest_issued_cmd_id = lambda: highest_issued
+    stub._next_cmd_id = LxmfGateway._next_cmd_id.__get__(stub)
+    return stub
+
+
+def test_ids_increase_even_when_the_clock_jumps_backwards():
+    """The failure this exists to prevent: a gateway that comes back believing it is a
+    week ago, and is thereafter ignored by every node it has ever talked to."""
+    from navamesh import reticulum_bridge as rb
+
+    gw = _gateway_stub()
+    real_time = rb.time.time
+    try:
+        rb.time.time = lambda: 1_800_000_000.0
+        first = gw._next_cmd_id()
+        # Power cut; the clock comes back a week earlier.
+        rb.time.time = lambda: 1_800_000_000.0 - 604_800
+        second = gw._next_cmd_id()
+    finally:
+        rb.time.time = real_time
+
+    assert second > first, "a backwards clock produced a non-increasing command id"
+
+
+def test_the_floor_comes_from_what_was_actually_issued():
+    """The in-memory counter is lost on restart, so the guard has to be reseeded from the
+    audit table or a restart plus a wrong clock reopens the hole."""
+    from navamesh import reticulum_bridge as rb
+
+    gw = _gateway_stub(highest_issued=1_900_000_000)
+    real_time = rb.time.time
+    try:
+        rb.time.time = lambda: 1_800_000_000.0   # clock is behind what we have issued
+        issued = gw._next_cmd_id()
+    finally:
+        rb.time.time = real_time
+
+    assert issued > 1_900_000_000
+
+
+def test_two_commands_in_the_same_second_do_not_collide():
+    """The original reason the counter existed; must survive the new seeding."""
+    from navamesh import reticulum_bridge as rb
+
+    gw = _gateway_stub()
+    real_time = rb.time.time
+    try:
+        rb.time.time = lambda: 1_800_000_000.0
+        ids = [gw._next_cmd_id() for _ in range(5)]
+    finally:
+        rb.time.time = real_time
+
+    assert ids == sorted(ids) and len(set(ids)) == 5
+
+
+def test_the_floor_query_casts_because_cmd_id_is_text():
+    """max() on a TEXT column is lexicographic: "999999999" sorts above "1787612909"
+    while being numerically smaller -- i.e. it fails precisely when the clock has gone
+    backwards, which is the only time this code matters."""
+    import inspect
+    from navamesh.reticulum_bridge import LxmfGateway
+    src = inspect.getsource(LxmfGateway._highest_issued_cmd_id)
+    assert "cmd_id::bigint" in src
+    assert "^[0-9]+$" in src, "a malformed row would break command dispatch entirely"

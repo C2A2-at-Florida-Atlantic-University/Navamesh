@@ -211,6 +211,50 @@ def _ago(seconds) -> str:
     return f"{s // 86400}d ago"
 
 
+def _allocate_cmd_id() -> int:
+    """A command id strictly above every id this deployment has already issued.
+
+    The firmware treats this as a replay guard and **silently drops** anything at or below
+    the last id a node accepted -- no ack, no error, and a retry carries a similarly low id,
+    so it looks exactly like a dead radio and retrying cannot fix it.
+
+    A bare timestamp is only monotonic while the clock is. A Pi has no guaranteed RTC and a
+    farm gateway may have no NTP, so one that loses power for a week can come back believing
+    it is a week ago, and every command after that is rejected by every node it has ever
+    talked to. Reading the floor out of command_log costs one query and removes the whole
+    failure mode.
+
+    Falls back to the clock if the table cannot be read: this tool has to keep working on a
+    machine where Postgres is down, and the clock is right far more often than it is wrong.
+    """
+    now = int(time.time())
+    try:
+        import os
+        import psycopg
+    except ImportError:
+        return now
+
+    dsn = os.getenv("PG_DSN")
+    if not dsn:
+        return now
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                # Cast: cmd_id is TEXT, and max() on text is lexicographic -- "999999999"
+                # sorts above "1787612909" while being numerically smaller, which is exactly
+                # the case this guard exists for.
+                cur.execute(
+                    "SELECT max(cmd_id::bigint) FROM public.command_log "
+                    "WHERE cmd_id ~ '^[0-9]+$'"
+                )
+                row = cur.fetchone()
+                highest = int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        return now
+
+    return now if now > highest else highest + 1
+
+
 def main(argv: Optional[list] = None) -> int:
     args = _build_parser().parse_args(argv)
 
@@ -242,7 +286,7 @@ def main(argv: Optional[list] = None) -> int:
             value = args.quiet_minutes
         # Validate here rather than letting the bridge reject it later, so a bad value is
         # reported before anything is transmitted. This is the same encoder the bridge uses.
-        cmd_id = int(time.time())
+        cmd_id = _allocate_cmd_id()
         encode_command(args.verb, cmd_id, value=value, quiet_on=quiet_on, lat=lat, lon=lon)
     except CommandValidationError as e:
         print(f"error: {e}", file=sys.stderr)

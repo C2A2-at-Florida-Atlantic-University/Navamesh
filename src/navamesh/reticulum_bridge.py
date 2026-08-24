@@ -1933,19 +1933,66 @@ class LxmfGateway:
         """True if this sender may issue control commands. See is_sender_authorized()."""
         return is_sender_authorized(sender_hash, self._cfg.authorized_farmer_hashes)
 
+    def _highest_issued_cmd_id(self) -> int:
+        """The largest command id this gateway has ever issued, from the audit table.
+
+        Returns 0 if it cannot be read, which degrades to the old clock-only behaviour
+        rather than refusing to send.
+
+        `cmd_id` is a TEXT column, so this must cast: max() on text is lexicographic, and
+        "999999999" sorts above "1787612909" while being numerically smaller -- i.e. it
+        would fail in exactly the situation this exists to survive. The regex guard keeps
+        one malformed row from breaking command dispatch entirely.
+        """
+        if _psycopg is None or not self._cfg.pg_dsn:
+            return 0
+        try:
+            with _psycopg.connect(self._cfg.pg_dsn, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT max(cmd_id::bigint) FROM public.command_log "
+                        "WHERE cmd_id ~ '^[0-9]+$'"
+                    )
+                    row = cur.fetchone()
+                    return int(row[0]) if row and row[0] is not None else 0
+        except Exception as exc:
+            logger.warning("Could not read the highest issued command id: %s", exc)
+            return 0
+
     def _next_cmd_id(self) -> int:
         """
         Allocate a command id.
 
-        The firmware uses this as a monotonic replay guard, so it must strictly increase
-        per node and survive a gateway restart. A second-resolution unix timestamp does
-        both without needing any persisted counter; the lock just prevents two commands
-        issued in the same second from colliding.
+        The firmware uses this as a monotonic replay guard: a node silently drops any
+        command whose id is below the last one it accepted -- no ack, no error, and a
+        retry carries a similarly low id, so it is indistinguishable from a dead radio
+        and cannot be recovered by trying again.
+
+        A second-resolution unix timestamp gives monotonicity for free *provided the clock
+        is monotonic*, which is the part an earlier version of this took on trust. A Pi has
+        no guaranteed RTC and a farm gateway may have no NTP, so one that loses power for a
+        week can come back believing it is a week ago -- and every command it then issues
+        is below what the nodes already hold. That is a fleet that has permanently stopped
+        answering, from a clock, with nothing in the logs to say so.
+
+        So the floor comes from what we have actually issued, read once from the audit
+        table, and the in-memory counter carries it from there.
         """
         with self._cmd_seq_lock:
+            if not getattr(self, "_cmd_id_seeded", False):
+                # Lazy rather than at startup: the database may not have been reachable
+                # then, and a gateway that came up before Postgres should still get the
+                # guard rather than silently going without it.
+                self._last_cmd_id = max(getattr(self, "_last_cmd_id", 0),
+                                        self._highest_issued_cmd_id())
+                self._cmd_id_seeded = True
+                logger.info("Command id floor set to %d", self._last_cmd_id)
+
             candidate = int(time.time())
             last = getattr(self, "_last_cmd_id", 0)
             if candidate <= last:
+                # Either two commands in the same second, or a clock that has moved
+                # backwards. Both are handled the same way and neither is an error.
                 candidate = last + 1
             self._last_cmd_id = candidate
             return candidate
