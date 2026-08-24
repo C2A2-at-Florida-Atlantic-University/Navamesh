@@ -223,9 +223,38 @@ for `Navamesh` and `navamesh-sideband-wrapper` once testing is done, then pull o
 the firmware stays on its fork branch. The schema changes here are `ON CONFLICT` clauses
 and metadata keys, so no migration is needed.
 
-The **command round-trip is not yet re-verified** against the new firmware ack read-back
-(app → Pi → gateway → node → ack): it needs a powered field node, and the three dev
-radios were unplugged when the rest was tested.
+### Verified end to end on the bench, 2026-08-23
+
+Three RAK4631s flashed with `cff0bd52f`, driven from the real app on a moto g play over
+adb. All five commands round-tripped app → LXMF → Pi → MQTT → LoRa → node → ack → app:
+`interval` (300 s applied), `setloc` from the phone's live GPS (±10 m, accepted by
+`is_fresh_fix()`), `quiet` on and off, and `ble` from an earlier run. Read commands all
+answered: `help`, `nodes`, `status`, `map`, `map <id>`.
+
+Notable confirmations:
+
+- **`map <id>` on an out-of-bounds node produced an image** — 27,024 bytes, 480×480,
+  OSM-sourced — where it used to refuse. That was the reported bug.
+- **`setloc` persisted, re-broadcast and ingested.** The bridge logged
+  `sent … (lat=26.2849999, lon=-80.2743025)` then `ack … ok=True`, and `mesh_nodes` holds
+  exactly those coordinates. So `!0b9aed49`'s storage-vs-broadcast divergence did not
+  reproduce, and the new freshness guard on `lat`/`lon` does not block a legitimate change
+  — worth knowing, since a guard that froze positions would look identical to a working one
+  until someone moved a node.
+- **The node picker had no `unknown` entry**, and all three nodes classified `reporting`.
+- **A wording bug the bench caught that no test could have.** `quiet on` acked
+  `applied=1440` — one day — while the app and the help text both promised "within 3 days".
+  4320 is only the firmware's clamp ceiling; 1440 is the default the app triggers by sending
+  no duration. Both texts now say "after a day", and a test pins it.
+
+**Both nodes were left at a 300-second reporting interval** for the test. That is 96× the
+SENSOR default and will not do for anything battery-powered — set them back with
+`./bin/navamesh-cmd interval <id> 28800` before they matter.
+
+One thing the bench cannot prove: with request and stored value agreeing, an echoing ack and
+a reading-back ack are identical by construction. The read-back is confirmed present in the
+flashed binary (its log strings are in the ELF) and only becomes *observable* when a node
+disagrees, which is the point of it.
 
 ### Earlier in Aug 2026
 
