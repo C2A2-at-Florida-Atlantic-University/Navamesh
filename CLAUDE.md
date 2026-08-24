@@ -288,8 +288,13 @@ every ack, and answers `fwinfo <id|^all>` on demand. Full details in the firmwar
   Separate topics also get separate staleness timestamps.
 - `mqtt_to_db.py` stores it in `mesh_nodes.metadata->>'firmware_version'`, guarded so a
   retained redelivery cannot blank a version already recorded.
-- **Operator surfaces only.** `navamesh-cmd fwinfo`, the gateway's `firmware` (a database
-  read, no radio traffic) and `ophelp` verbs. It is deliberately absent from `HELP_TEXT` and
+- **Operator surfaces only, and the census is Pi-side.** `navamesh-cmd firmware` is the
+  fleet view — a database read from inside the bridge container, no radio traffic, no phone
+  involved. `navamesh-cmd fwinfo <id>` asks one node directly. The gateway also answers
+  `firmware` and `ophelp` over LXMF for someone holding a phone instead of a terminal, but
+  that path needs free-text messaging, which **the farm app deliberately does not offer to a
+  gateway** — tapping a gateway opens the button dashboard, and `peer_chat` is for non-gateway
+  peers. So the terminal is the real surface; treat the LXMF verbs as the fallback. It is deliberately absent from `HELP_TEXT` and
   from `VERB_LABELS` — that dict is the farmer's vocabulary and `test_farmer_wording` pins
   everything in it into the help text, so adding a verb there is a promise to show a farmer a
   build hash. `OPERATOR_VERB_LABELS` exists so those verbs still read well in outcomes.

@@ -144,3 +144,38 @@ def test_quiet_self_expiry_is_still_told_apart_from_a_boot_announce():
     ack = extract_command_ack(pkt)
     assert ack["unsolicited"] is True
     assert ack["command_type_name"] == "QUIET_MODE_EXIT"
+
+
+# ── The operator's census ───────────────────────────────────────────────────────
+
+def test_firmware_census_takes_no_target():
+    """It reports the whole fleet, so a target is a misunderstanding worth naming --
+    most likely someone reaching for `fwinfo <id>`."""
+    from navamesh.cmd_cli import main
+    assert main(["firmware", "!0b9aed49"]) == 2
+
+
+def test_every_other_verb_still_requires_a_target():
+    """Making target optional for `firmware` must not let a bare `ble` through to a
+    place where the missing target reads as some other error."""
+    from navamesh.cmd_cli import main
+    for verb in ("ble", "interval", "quiet", "setloc", "fwinfo"):
+        assert main([verb]) == 2, f"{verb} accepted a missing target"
+
+
+def test_the_census_is_reachable_without_the_rns_stack():
+    """navamesh-cmd runs inside the bridge container, which has no RNS/LXMF. Importing
+    the gateway's fmt_firmware would have been the obvious reuse and is not available
+    there -- which is why this lives in cmd_cli."""
+    import navamesh.cmd_cli as cli
+    assert hasattr(cli, "_print_firmware_census")
+    import inspect
+    assert "reticulum_bridge" not in inspect.getsource(cli)
+
+
+@pytest.mark.parametrize("seconds,expected", [
+    (30, "30s ago"), (300, "5m ago"), (7200, "2h ago"), (300000, "3d ago"),
+])
+def test_age_column_is_scannable(seconds, expected):
+    from navamesh.cmd_cli import _ago
+    assert _ago(seconds) == expected

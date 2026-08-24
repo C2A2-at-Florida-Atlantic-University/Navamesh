@@ -10,6 +10,7 @@ cmd_cli.py — Send a control command to a field node from a terminal, and wait 
     navamesh-cmd interval !0b9aed49 30m    # same, in minutes; 2h also works
     navamesh-cmd fwinfo   !0b9aed49        # what build is it running? changes nothing
     navamesh-cmd fwinfo   ^all             # ...across the fleet
+    navamesh-cmd firmware                  # the fleet census; reads the DB, no radio
 
 Nodes announce their build unprompted at boot, so the Pi usually knows it already --
 `fwinfo` is for asking again without waiting for a reboot.
@@ -65,8 +66,11 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("verb", choices=["ble", "interval", "quiet", "setloc", "fwinfo"])
-    p.add_argument("target", help="node id (!hex), or ^all except for setloc")
+    p.add_argument("verb", choices=["ble", "interval", "quiet", "setloc", "fwinfo", "firmware"])
+    # Optional because `firmware` addresses nobody -- it reads what the gateway already
+    # recorded. Every other verb still requires one; see the check in main().
+    p.add_argument("target", nargs="?", default=None,
+                   help="node id (!hex), or ^all except for setloc; omit for firmware")
     # Optional because fwinfo takes none -- it asks a question rather than setting anything.
     # _parse_value still requires one for every other verb, so a forgotten value is caught
     # with a message about that verb rather than by argparse.
@@ -127,8 +131,101 @@ def _parse_value(verb: str, raw: str, raw2: Optional[str] = None):
         raise CommandValidationError(f"{raw!r} is not a number")
 
 
+def _print_firmware_census() -> int:
+    """Print what build each node last reported. Reads the database; sends nothing.
+
+    This is the operator's census, and it is deliberately a *read*. `fwinfo ^all` looks
+    like the way to ask the fleet, but a broadcast elicits one ack per node into a jitter
+    window narrower than their combined airtime, so the replies collide and the tool
+    returns on whichever arrives first. It answers "at least one node is alive", not
+    "here is the fleet".
+
+    What makes the read sufficient is that nodes announce their build unprompted at boot,
+    and every ack carries it -- so this table is already current without asking. The
+    gateway's `firmware` verb renders the same data over LXMF for whoever is holding a
+    phone instead of a terminal.
+    """
+    import os
+    try:
+        import psycopg
+    except ImportError:
+        print("error: psycopg is not installed in this container", file=sys.stderr)
+        return 2
+
+    dsn = os.getenv("PG_DSN")
+    if not dsn:
+        print("error: PG_DSN is not set; cannot read the node table", file=sys.stderr)
+        return 2
+
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT node_id, metadata->>'firmware_version', "
+                    "       EXTRACT(EPOCH FROM (now() - last_seen))::bigint "
+                    "FROM mesh_nodes ORDER BY node_id"
+                )
+                rows = cur.fetchall()
+    except Exception as exc:
+        print(f"error: could not read mesh_nodes: {exc}", file=sys.stderr)
+        return 2
+
+    if not rows:
+        print("No nodes recorded yet.")
+        return 0
+
+    by_version = {}
+    for node_id, version, age in rows:
+        by_version.setdefault(version or "", []).append((node_id, age))
+
+    for version in sorted(v for v in by_version if v):
+        nodes = sorted(by_version[version])
+        print(f"{version}  ({len(nodes)} node{'s' if len(nodes) != 1 else ''})")
+        for node_id, age in nodes:
+            print(f"    {node_id}   last heard {_ago(age)}")
+
+    unknown = sorted(by_version.get("", []))
+    if unknown:
+        print(f"not reported  ({len(unknown)})")
+        for node_id, age in unknown:
+            print(f"    {node_id}   last heard {_ago(age)}")
+        # Deliberately not "not flashed": a node reports its build at boot and on any ack,
+        # so this is "we have not heard one", which a node that has simply been quiet since
+        # this database was populated also satisfies. soil_raw answers "flashed at all".
+        print("\n  Not the same as unflashed -- it means no boot announce or ack has been")
+        print("  heard from it yet. Send 'navamesh-cmd fwinfo <id>' to ask one directly.")
+    return 0
+
+
+def _ago(seconds) -> str:
+    """Coarse age, for a column an operator scans rather than reads."""
+    if seconds is None:
+        return "never"
+    s = int(seconds)
+    if s < 90:
+        return f"{s}s ago"
+    if s < 5400:
+        return f"{s // 60}m ago"
+    if s < 172800:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
 def main(argv: Optional[list] = None) -> int:
     args = _build_parser().parse_args(argv)
+
+    # A pure database read: no config, no broker, no radio.
+    if args.verb == "firmware":
+        if args.target is not None:
+            print("error: 'firmware' takes no target -- it reports the whole fleet. "
+                  "Use 'fwinfo <id>' to ask one node directly.", file=sys.stderr)
+            return 2
+        return _print_firmware_census()
+
+    if args.target is None:
+        print(f"error: {args.verb} needs a target (a node id, or ^all)", file=sys.stderr)
+        return 2
+
     cfg = load_config()
 
     target = args.target.strip()
