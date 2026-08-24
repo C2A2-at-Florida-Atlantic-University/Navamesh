@@ -64,14 +64,35 @@ the reverse. Then `docker compose build <service> && docker compose up -d <servi
 
 ## Traps that have already cost real time
 
-**The test suite skips itself into a green run.** Without `rns/lxmf/staticmap/dotenv`
-installed, every bridge test module skips at collection and the summary still says
-"passed". See "Running the tests" in `README.md`. Read the skip count.
+**The test suite used to skip itself into a green run.** Closed in 83ec1cf, but know
+how: without `rns/lxmf/staticmap/dotenv`, every bridge test module skips at collection
+and the summary still said "passed". `tests/conftest.py` now ends any such run with a
+section naming what did not execute, and `NAVAMESH_REQUIRE_FULL_TESTS=1` makes it a
+failed run — set that in CI and before shipping to a Pi. A correct run is **296 passed,
+0 skipped**.
+
+Note `reticulum_bridge` raises **`SystemExit`**, not `ImportError`, when its deps are
+missing, and pytest does not treat a SystemExit during collection as a collection error.
+A module importing it without a guard takes the entire run down with `INTERNALERROR`
+before any summary prints. All four bridge test modules are guarded; keep it that way.
 
 **The Pi's `.env` is test-bench configuration, not deployment configuration.** It is
 gitignored, so it cannot leak into a deployment — but do not copy it around or treat it as
 canonical. On the test Pi the cloud targets (`PG_CLOUD_DSN`, `INFLUX_CLOUD_*`) are
 commented out deliberately, because a test node's readings should not reach the cloud.
+**On `spirit-farm-pi` they must stay enabled** — that Pi is the live public demonstration
+and its cloud writes are the point.
+
+Its `CACHE_*` box is also still around the **FAU farm** (26.370–26.382, −80.104 to
+−80.092), so development radios anywhere else are outside offline map coverage. That is
+not a bug; it is why `map` falls back to OSM on the dev bench.
+
+**`PostgresWriter.enabled` is evaluated once, at construction** (`_enabled = bool(dsn)`).
+Commenting a DSN out of `.env` changes nothing until the container restarts — which is the
+real explanation for "four items queued within a minute of disabling cloud sync". Related
+and still open: the sync flusher retries every queued target regardless of whether that
+writer is enabled, so a disabled cloud target spins on its backlog forever (observed at
+attempt 6199 on the dev Pi). Log noise, not data loss.
 
 **`IGNORED_NODES` filters silently.** A node on that list transmits normally, appears in
 the Meshtastic app and the bridge logs, and never reaches the database or the app's node
@@ -84,17 +105,45 @@ that works: region → role `SENSOR` → channel/PSK at **index 1** → **reboot
 interval. The reboot is required: `EnvironmentTelemetry.cpp` returns early at init when
 environment telemetry is off, so the sensor list is fixed at boot.
 
+**Flashing does not set the role** — the config lives in LittleFS and a DFU flash does not
+erase it, so a node keeps whatever role it had. See the firmware repo's `CLAUDE.md`. The Pi
+can now *detect* this state rather than only suffering it: `classify_node_health()` returns
+`not_reporting` for a node with a recent `last_seen` and no recent soil reading, which is
+exactly the CLIENT-role signature.
+
 **Channel index matters.** `navamesh` must be a *secondary* channel at index 1; the Pi
 sends commands there (`PRIVATE_CHANNEL_INDEX=1`). A node with only the default channel
 still shows up — the default PSK is public — while being deaf to every command.
 
 **Nothing records a node's firmware version**, so "this build lacks the handler" and "the
 handler rejected the value" look identical from the Pi. Meshtastic embeds the build hash
-in its version string, visible over serial or BLE (`2.7.20.a36db94`).
+in its version string, visible over serial or BLE (`2.7.20.a36db94`). Still open — see
+`TODO.md`.
 
-**The Pi's ssh host key is stale** under `raspberrypi.local`. Either
-`ssh-keygen -R raspberrypi.local` once, or connect with
-`-o HostKeyAlias=raspberrypi`, which is already trusted.
+**`metadata->>'status'` is write-time only and must not be read as current.** A row is
+only rewritten when that node is heard from, so a node that stops reporting keeps whatever
+was stored last. Derive liveness from `last_seen` and `soil_last_ts` via
+`classify_node_health()`. The key is retained solely because `Navamesh-Cloud` still selects
+it.
+
+**`->` on a JSON null yields the jsonb literal `'null'`, not SQL NULL.** So `COALESCE`
+happily chooses it and a carry-forward silently does nothing. `NULLIF(x, 'null'::jsonb)`
+is load-bearing in the `mesh_nodes` upsert for exactly this reason. It was caught by
+running the statement against the real schema, not by reading it — worth doing for any
+change to that upsert, in a `BEGIN; … ROLLBACK;` against the dev Pi's PostGIS.
+
+**Reaching the dev Pi is fiddly and the failures look like different problems.** Its
+DHCP lease moves (`192.168.1.114` → `.153` mid-session on 2026-08-23), and
+`raspberrypi.local` is not a reliable substitute: avahi answers it with an **IPv6**
+address while `/etc/nsswitch.conf` uses `mdns4_minimal` (IPv4 only) followed by
+`[NOTFOUND=return]`, so `getaddrinfo` dead-ends before ever trying DNS. It appears to
+work whenever an A record happens to be cached, then stops. The Fedora box's
+`~/.ssh/config` has a `devpi` host pointing at the current address; a DHCP reservation
+or putting the Pi on the tailnet is the real fix.
+
+The stored **host key is under `raspberrypi`**, so any other name needs
+`-o HostKeyAlias=raspberrypi` (already trusted) or a one-time
+`ssh-keygen -R raspberrypi.local`.
 
 ## Conventions worth matching
 
@@ -109,10 +158,81 @@ and what closing them would take — not a bullet list of tasks. Match that shap
 
 ## Recent work (Aug 2026)
 
-Ends at: app **1.9.18**, Pi `781e61d`, firmware `a36db9409`.
+Ends at: app **1.9.18** (unchanged), Pi `51cb0f5`, firmware `cff0bd52f`.
+
+### 2026-08-23 — silent-failure sweep, all verified on the dev Pi
+
+Nothing in the app changed, so **no APK rebuild or OTA is needed for any of it**. The
+`help` text and every farmer-facing reply are rendered by the Pi; the app only sends the
+verb and displays what comes back.
+
+- **Packets are attributed by nodenum, not by a name that may not have arrived.**
+  `fromId` is filled in by the Meshtastic library from its own node DB, so it is empty for
+  any node transmitting before its NodeInfo is heard — normal after a gateway restart.
+  Those readings were filed under `unknown`, which also sat in the picker and put a pin on
+  the map. `processors/node_id.py` resolves `fromId` → NodeInfo user id → numeric `from`
+  (masked; a uint32 nodenum arrives sign-extended on some paths). The deployment Pi has a
+  real `unknown` row from this. The same fallback was in four more places than the TODO
+  said, and `node_info` was dropping app renames outright.
+- **A replayed packet can no longer rewrite recency or position.** Two layers, because
+  either alone leaves the hole open: `apply_payload()` rejects a packet older than the
+  newest already applied **per payload kind** (per-kind because retained topics all arrive
+  at once on connect with their own original timestamps, so one rule for the whole state
+  would let the first arrival discard the rest), and the upsert backstops with `GREATEST`
+  plus a freshness `CASE` on `lat`/`lon`/`geom`/`metadata`. Without the in-memory half, a
+  stale position lands in the cache and the next genuine packet of any other kind carries
+  it to Postgres under a current timestamp.
+- **A node that is gone reads differently from one present but not measuring.**
+  `metadata.soil_last_ts` records when soil specifically was last heard — `last_seen`
+  moves on any packet, which is why it could never see this — and
+  `classify_node_health()` returns `reporting` / `not_reporting` / `unheard` at 2.5
+  expected intervals (`NODE_EXPECTED_INTERVAL_SECONDS`, `NODE_STALE_INTERVALS`). "No
+  readings in a while", not "none ever", so a probe that dies after a month is caught too.
+  Stale nodes are **flagged in the node list, not filtered out of it** — one still
+  standing in a field is worse forgotten — and each state gets its own guidance.
+- **`map <id>` no longer refuses what `map` would draw.** Only `map <id>` consulted the
+  `CACHE_*` box, so the same sensor was mapped or not depending on which button was
+  pressed, while `map` fetched those very tiles from `MAP_TILE_FALLBACK`. Order is now
+  offline cache → fallback tile server → text, for in-bounds and out-of-bounds nodes
+  alike. Strict offline behaviour is expressed by leaving `MAP_TILE_FALLBACK` empty — a
+  property of the link, not of which command was typed. Also revived the
+  "outside offline map coverage" warning, whose counter nothing had ever incremented.
+- **`help` speaks the farmer's language**, pinned by tests to `VERB_LABELS` so the
+  buttons, the confirmations and the help text cannot be reworded apart again.
+- **A run that skipped the bridge tests says so, and CI can refuse it** —
+  `tests/conftest.py` plus `NAVAMESH_REQUIRE_FULL_TESTS=1`.
+- **The gateway watchdog no longer reports success for a radio it cannot fix.** It now
+  verifies a serial port came back under `/dev/serial/by-id`, escalates at error level
+  with a consecutive-failure count in `/run`, and exits non-zero. The hardware half — a
+  per-port-switchable hub or the RAK reset line on a GPIO — is still open.
+
+### Where this leaves the deployment
+
+Heads: `Navamesh` `51cb0f5`, `navamesh-sideband-wrapper` `884a3ec` (**untouched**),
+`meshtastic-soil-sensor` `cff0bd52f`.
+
+**Two Pis, and only one is safe to touch.** `raspberrypi` / `devpi` (`tj@`, on the LAN) is
+the test bench and is where all work happens. **`spirit-farm-pi` (`pi@`, on the tailnet, in
+Navajo, New Mexico) is live and READ ONLY** — it feeds the public site and is receiving real
+field data. Read it for context freely; change nothing on it without saying so first.
+
+`spirit-farm-pi` is on branch **`main`** and has **native Postgres and InfluxDB** under
+systemd rather than containers — deliberate, so a second farm's Pi keeps its own data.
+Its cloud writes are always on. The plan is to merge `raw-adc-private-app` into `main`
+for `Navamesh` and `navamesh-sideband-wrapper` once testing is done, then pull on that Pi;
+the firmware stays on its fork branch. The schema changes here are `ON CONFLICT` clauses
+and metadata keys, so no migration is needed.
+
+The **command round-trip is not yet re-verified** against the new firmware ack read-back
+(app → Pi → gateway → node → ack): it needs a powered field node, and the three dev
+radios were unplugged when the rest was tested.
+
+### Earlier in Aug 2026
 
 - **`SET_LOCATION`** — set a node's fixed position from the phone's GPS over LoRa, since
-  the nodes have no receiver of their own. Verified end to end on three nodes.
+  the nodes have no receiver of their own. Verified end to end on three nodes. The ack now
+  reports the position read back from the nodeDB rather than echoing the request — see the
+  firmware repo.
 - **OTA app updates that survive sleep** — handed to Android's `DownloadManager`, because
   an in-process download died the moment the screen went off and restarted from byte 0.
   This exposed that cleartext HTTP is blocked for Android's own network stack but never

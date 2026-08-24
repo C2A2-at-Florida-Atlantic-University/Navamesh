@@ -154,7 +154,7 @@ pip install pytest rns lxmf staticmap pillow python-dotenv meshtastic paho-mqtt 
 PYTHONPATH=src pytest tests/ -q
 ```
 
-A correct run reports **282 passed, 0 skipped**.
+A correct run reports **296 passed, 0 skipped**.
 
 In CI, or before shipping anything to a Pi, set `NAVAMESH_REQUIRE_FULL_TESTS=1`:
 

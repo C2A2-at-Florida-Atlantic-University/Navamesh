@@ -30,7 +30,12 @@ unexpectedly would cost real experiment data.
 
 ## Make an ignored node visibly ignored
 
-**Status:** open. Cost real debugging time on 2026-08-21.
+**Status:** closed as won't-do, 2026-08-23. The list is wanted exactly as it is: it holds
+the gateways, and one person maintains it and the `.env` it lives in. Revisit only if
+someone else starts diagnosing missing nodes, or if node hardware is recycled between
+roles again. The context below is kept because the failure it describes will recur then.
+
+Original entry:
 
 `IGNORED_NODES` in `.env` drops a node's DB writes entirely, and does it silently. A node
 on that list transmits normally, appears in the Meshtastic app, shows up in the bridge
@@ -51,7 +56,18 @@ person who wrote the `.env` has to diagnose a missing node.
 
 ## Detect a node that is present but never reports
 
-**Status:** open. This is the failure that looked like broken hardware.
+**Status:** closed 2026-08-23 in f690b0e. `metadata.soil_last_ts` records when soil
+specifically was last heard, and `classify_node_health()` in `reticulum_bridge.py` returns
+`reporting` / `not_reporting` / `unheard` from that against `last_seen` at 2.5 expected
+intervals. Deliberately "no readings in a while" rather than "none ever", so a probe that
+dies after a month of good data is caught as well as one that never worked. A Pi-side
+query, no radio traffic: a broadcast probe would have been worse, since a CLIENT-role node
+answers it correctly — acking is the one thing that role does well.
+
+The written provisioning checklist is still worth having, and note the firmware repo now
+records that **flashing does not set the role** at all.
+
+Original entry:
 
 A field node left in `CLIENT` role acks control commands, broadcasts NodeInfo, appears in
 the node picker, and reports a healthy link — while never sending a single soil reading.
@@ -76,7 +92,14 @@ failure is invisible from the app and indistinguishable from a weak link.
 
 ## Publish each node's firmware version
 
-**Status:** open. Blocked two separate diagnoses on 2026-08-21.
+**Status:** open, and now the highest-value open item. Blocked two separate diagnoses on
+2026-08-21.
+
+Sharper as of 2026-08-23: a fleet-wide flash is imminent, so a partially-updated fleet is
+about to be the normal state and "which nodes still need it" should be a query rather than
+a guess. It also pairs with what the firmware repo now records — that **flashing does not
+set the role**, so knowing the build a node runs is not the same as knowing it is
+provisioned. `classify_node_health()` covers the second half of that; this is the first.
 
 Nothing in the system records what firmware a node runs. Not MQTT, not `mesh_nodes`, not
 the bridge logs. When `setloc` came back `ok=False`, the only way to tell "this firmware has
@@ -95,7 +118,16 @@ normal state and "which nodes still need it" should be a query rather than a gue
 
 ## Stop replayed packets rewriting a node's recency
 
-**Status:** open. Observed corrupting live data.
+**Status:** closed 2026-08-23 in f9d6abf. Needed two layers, not the one this entry
+assumed: `apply_payload()` rejects a packet older than the newest already applied **per
+payload kind**, and the upsert backstops with `GREATEST` plus a freshness `CASE` on
+`lat`/`lon`/`geom`/`metadata`. Without the in-memory half a stale position lands in the
+cache and the next genuine packet of any other kind carries it to Postgres under a current
+timestamp, passing any SQL check. Per-kind because retained topics all arrive at once on
+connect carrying their own original timestamps, so one rule for the whole state would let
+the first arrival discard the rest.
+
+Original entry:
 
 The `mesh_nodes` upsert ends `last_seen = EXCLUDED.last_seen` with no guard, and the value
 comes from the packet (`state.last_seen_ts`) rather than ingest time. A queued or replayed
@@ -108,7 +140,19 @@ replay can currently also overwrite a newer position.
 
 ## Age nodes out instead of calling everything online
 
-**Status:** open.
+**Status:** the read half is closed 2026-08-23 in f690b0e; the stored literal remains.
+
+Liveness is now derived at read time by `classify_node_health()`, and the node list flags
+stale nodes rather than filtering them — a node the farmer has forgotten is still standing
+in their field either way, and hiding it is how it gets forgotten. Each state gets its own
+guidance, since telling someone a sensor "will answer commands" when nothing has been heard
+from it sends them after the wrong fault.
+
+`metadata->>'status'` is still written as the literal `"online"`, deliberately, because
+`Navamesh-Cloud` still selects it. It is documented as write-time-only. Removing it belongs
+with the Navamesh-Cloud work below.
+
+Original entry:
 
 Every `mesh_nodes` row carries `"status": "online"` in its metadata regardless of
 `last_seen`, including one node unheard since 2026-07-20. Nothing ever transitions a node to
@@ -124,7 +168,14 @@ picker. Deleting rows is not a fix — retained MQTT and queued replays recreate
 
 ## Attribute packets that arrive before their NodeInfo
 
-**Status:** open. Causes real measurement misattribution.
+**Status:** closed 2026-08-23 in de04769. `processors/node_id.py` resolves `fromId` →
+NodeInfo user id → numeric `from` (masked, since a uint32 nodenum arrives sign-extended on
+some paths). The fallback turned out to be in four more places than this entry found —
+`link`, `position` and `telemetry` each had their own copy, and `node_info` was dropping
+app renames outright rather than falling back. `spirit-farm-pi` has a real `unknown` row
+from this, last seen 2026-08-19, which is worth cleaning up when that Pi is next updated.
+
+Original entry:
 
 `src/navamesh/_bridge.py` does `from_id = packet.get("fromId") or "unknown"` in three
 places, including the authoritative soil path. `fromId` is resolved from the interface's
@@ -141,7 +192,44 @@ even that is missing, which should be never.
 
 ## Bound the cloud sync queue
 
-**Status:** open. Reached 62,000 items and was still growing.
+**Status:** deliberately deferred 2026-08-23, and **two of the claims below are wrong** —
+read the correction before acting on it.
+
+Deferred because an outage on the deployment Pi gets attended to quickly, so the queue is
+not expected to stack up. Measured for the decision: 18 nodes, 16 heard within the hour,
+several MQTT topics per report ≈ 90 items/hour ≈ 65,000/month — so the 62,000 figure was
+roughly a month of continuous downtime, not a test-bench artifact. `cloud_sync_queue.db` on
+`spirit-farm-pi` is 12 KB and last modified in May, so the uplink there has never actually
+backed up.
+
+If it is ever picked up, the shape that fits a public historical timeline is a cap high
+enough that a realistic outage never reaches it (500k ≈ 7 months, ~150-250 MB of SQLite),
+and **downsampling the oldest region** rather than dropping it — one reading per node per
+hour keeps the curve continuous and only loses resolution during the outage.
+
+**Corrections.** The queue is far more built out than this entry suggests: `sync_dead_letter`
+exists, and the flusher already classifies failures four ways — `DROP_RETENTION` deletes,
+`PERMANENT` dead-letters, `UNKNOWN` dead-letters after `CLOUD_QUEUE_MAX_ATTEMPTS` (50), and
+connectivity/429/5xx stay queued forever *deliberately*. There is also a guard stopping
+Influx from silently no-op'ing a row into deletion while disconnected. What is genuinely
+missing is only the size cap.
+
+- *"Each flush attempt replays queued packets through the local write path"* — it does not.
+  `_flush()` writes only to `self._pg`/`self._influx`, both cloud handles. On the machine
+  where rows reappeared, `PG_CLOUD_DSN` and the local DSN most likely resolved to the same
+  database.
+- *"Something enqueues cloud pg writes even when `pg_cloud.enabled` is false"* — the only
+  `enqueue("pg")` call site is inside `if self.pg_cloud.enabled:`. The real cause is that
+  `PostgresWriter._enabled = bool(dsn)` is evaluated **once at construction**, so commenting
+  a DSN out of `.env` changes nothing until the container restarts.
+
+**A real, separate bug found while verifying this:** the flusher retries every queued
+target regardless of whether that writer is enabled, so a disabled cloud target spins on
+its backlog forever — observed at attempt 6199 on the dev Pi, one log line every 30
+seconds. No data loss, but it will make the deployment Pi's logs hard to read during the
+rollout. Three-line fix: skip a target whose writer is disabled.
+
+Original entry:
 
 With the cloud Postgres unreachable, `sync_queue` grows without limit — there is no
 `MAX_QUEUE`, `maxlen`, or equivalent in `mqtt_to_db.py`. Worse, each flush attempt replays
@@ -161,7 +249,21 @@ every farm deployment.
 
 ## Teach the gateway watchdog about a radio that will not enumerate
 
-**Status:** open. The watchdog reported success for ~17 hours while the radio was dead.
+**Status:** the reporting half is closed 2026-08-23 in 4a05fcd; the hardware half is open.
+
+The toggle is now verified against a serial port reappearing under `/dev/serial/by-id`
+rather than against a fixed sleep — the sysfs device directory deliberately is not the
+check, since the 2026-08-20 failure kept a directory while never configuring an interface.
+A recovery producing no port logs at error level, says a replug or power cycle is required,
+exits non-zero so systemd records it, and counts consecutive failures in `/run` so an
+unrecoverable radio reports its own history instead of repeating one line twelve times an
+hour. Detection verified against the live gateway.
+
+**Still open, and unreachable from software:** an actual remote recovery path needs a
+per-port-switchable USB hub or the RAK's reset line on a Pi GPIO. Worth putting on the
+deployment hardware list.
+
+Original entry:
 
 `navamesh-gateway-watchdog` recovers a hung radio by toggling the USB device's `authorized`
 flag, which worked for the hangs on 2026-08-17 and 2026-08-18 — those hung the CDC-ACM layer
@@ -188,11 +290,30 @@ Kept here so they are not lost, though they belong elsewhere:
 - **`meshtastic-soil-sensor`** — `!0b9aed49` acked `SET_LOCATION ok=True` and persisted the
   position, but kept broadcasting its previous coordinates ~2 km away. Storage path works,
   broadcast path did not follow. Needs reproducing on a second node to tell a firmware bug
-  from stale state on that one radio.
+  from stale state on that one radio. **Partly addressed 2026-08-23** (`cff0bd52f`): the ack
+  now reports the position read back out of the nodeDB instead of echoing the request, so a
+  write that does not persist is visible. That catches a *storage* divergence; this case was
+  a *broadcast* one, so reproducing it is still the open work.
+- **`meshtastic-soil-sensor`** — a SENSOR node with environment telemetry disabled is now
+  self-repaired at boot (`cff0bd52f`), which closes the "passes a role check and still
+  reports nothing" hole. Worth re-checking after any future rebase on upstream Meshtastic,
+  since the hole came from `loadFromDisk()` defaulting `config` and `moduleConfig`
+  independently without applying role defaults.
 
 ## Stop the test suite from skipping itself into a green CI
 
-**Status:** open. Hid the coverage gap that motivated tests/test_farmer_wording.py.
+**Status:** closed 2026-08-23 in 83ec1cf. `tests/conftest.py` ends any run that skipped a
+module with a section naming what did not execute, and `NAVAMESH_REQUIRE_FULL_TESTS=1`
+makes it a failed run. Verified in a venv holding only pytest+dotenv: 151 passed / exit 0
+without the flag — the exact green-but-empty run — and exit 1 with it.
+
+Writing it surfaced something worse than the documented problem.
+`tests/test_handle_write_command.py` had **no collection guard**, and `reticulum_bridge`
+raises `SystemExit` rather than `ImportError`; pytest does not treat a SystemExit during
+collection as a collection error, so a half-installed environment killed the whole run with
+`INTERNALERROR` before any summary could print. Guarded now, like its three siblings.
+
+Original entry:
 
 Every module that imports `reticulum_bridge` guards collection like this:
 
@@ -256,6 +377,20 @@ roughly in increasing effort:
 **To close it:** pick one, and whichever it is, make the map popup on the site agree with
 the app. Two farmer-facing surfaces disagreeing about the same node is worse than either
 choice.
+
+**Decided 2026-08-23: the third option — plot the raw ADC as the series, with the band as
+the label.** It is monotonic, invents no calibration, agrees with the app, and it makes the
+site the viewer for the very dataset the eventual calibration will be fitted against.
+Implementation belongs to a separate session on that repo, which is not cloned on the
+Fedora box.
+
+Two things that session will need. The ingestor now also writes `metadata.soil_last_ts`,
+which is what liveness should be derived from — `metadata->>'status'` is a write-time
+literal and is only still written because `api.py` selects it; removing it is part of this
+work. And note `spirit-farm-pi` currently has **no** `soil_raw`, `soil_band` or
+`calibration.py`, because it is on `main`: the raw series only begins once that Pi is
+updated and the nodes are reflashed. Nothing is being lost in the meantime, but the
+calibration window opens then, not now.
 
 Worth doing before: the site is shown to anyone who would compare it against the app, or
 before the percentage is quoted anywhere it might be read as calibrated.
