@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -229,6 +229,14 @@ class NodeState:
     long_name: Optional[str] = None
     short_name: Optional[str] = None
     display_name: Optional[str] = None
+    # Newest packet timestamp applied per payload kind, so a delayed or replayed
+    # packet cannot overwrite a field with an older value. Deliberately per-kind
+    # rather than one timestamp for the whole state: on startup the ingestor
+    # receives every retained topic for a node at once, in arbitrary order and
+    # with each topic's own original timestamp, so a single "newer than anything
+    # seen" rule would let the first retained message arriving discard all the
+    # others. Ingest bookkeeping only -- not serialized to the cloud queue.
+    applied_ts: Dict[str, int] = field(default_factory=dict, repr=False)
 
     def metadata(self, location_name: str, node_type: str) -> Dict[str, Any]:
         return {
@@ -667,6 +675,12 @@ class PostgresWriter:
         metadata_json = json.dumps(state.metadata(location_name, node_type))
         has_coords = state.lat is not None and state.lon is not None
         table = self._table_name
+        # Backstop for anything that reaches Postgres with an older timestamp
+        # than the row already holds -- chiefly the cloud sync flusher, which
+        # replays serialized states carrying their original last_seen_ts long
+        # after newer ones have been written. >= rather than > so a reading and
+        # a position stamped the same second both land.
+        fresh = f"EXCLUDED.last_seen >= {table}.last_seen"
 
         try:
             with self._conn.cursor() as cur:
@@ -683,11 +697,11 @@ class PostgresWriter:
                             %s::jsonb
                         )
                         ON CONFLICT (node_id) DO UPDATE SET
-                            last_seen = EXCLUDED.last_seen,
-                            lat       = EXCLUDED.lat,
-                            lon       = EXCLUDED.lon,
-                            geom      = EXCLUDED.geom,
-                            metadata  = EXCLUDED.metadata;
+                            last_seen = GREATEST({table}.last_seen, EXCLUDED.last_seen),
+                            lat       = CASE WHEN {fresh} THEN EXCLUDED.lat  ELSE {table}.lat  END,
+                            lon       = CASE WHEN {fresh} THEN EXCLUDED.lon  ELSE {table}.lon  END,
+                            geom      = CASE WHEN {fresh} THEN EXCLUDED.geom ELSE {table}.geom END,
+                            metadata  = CASE WHEN {fresh} THEN EXCLUDED.metadata ELSE {table}.metadata END;
                         """,
                         (state.node_id, ts, state.lat, state.lon, state.lon, state.lat, metadata_json),
                     )
@@ -697,10 +711,10 @@ class PostgresWriter:
                         INSERT INTO {table} (node_id, last_seen, lat, lon, metadata)
                         VALUES (%s, to_timestamp(%s), %s, %s, %s::jsonb)
                         ON CONFLICT (node_id) DO UPDATE SET
-                            last_seen = EXCLUDED.last_seen,
-                            lat       = EXCLUDED.lat,
-                            lon       = EXCLUDED.lon,
-                            metadata  = EXCLUDED.metadata;
+                            last_seen = GREATEST({table}.last_seen, EXCLUDED.last_seen),
+                            lat       = CASE WHEN {fresh} THEN EXCLUDED.lat ELSE {table}.lat END,
+                            lon       = CASE WHEN {fresh} THEN EXCLUDED.lon ELSE {table}.lon END,
+                            metadata  = CASE WHEN {fresh} THEN EXCLUDED.metadata ELSE {table}.metadata END;
                         """,
                         (state.node_id, ts, state.lat, state.lon, metadata_json),
                     )
@@ -710,8 +724,8 @@ class PostgresWriter:
                         INSERT INTO {table} (node_id, last_seen, metadata)
                         VALUES (%s, to_timestamp(%s), %s::jsonb)
                         ON CONFLICT (node_id) DO UPDATE SET
-                            last_seen = EXCLUDED.last_seen,
-                            metadata  = EXCLUDED.metadata;
+                            last_seen = GREATEST({table}.last_seen, EXCLUDED.last_seen),
+                            metadata  = CASE WHEN {fresh} THEN EXCLUDED.metadata ELSE {table}.metadata END;
                         """,
                         (state.node_id, ts, metadata_json),
                     )
@@ -1200,7 +1214,26 @@ class MqttToDbIngestor:
 
     def apply_payload(self, state: NodeState, kind: str, payload: Dict[str, Any]) -> None:
         ts = self._coerce_int(payload.get("ts")) or int(datetime.now(tz=timezone.utc).timestamp())
-        state.last_seen_ts = ts
+
+        # A packet older than the newest one already applied for this kind is a
+        # delayed delivery or a replay, not news. Applying it would rewrite a
+        # field with a stale value that the next fresh packet of any other kind
+        # then carries into the database under a current timestamp -- which is
+        # how a live node's position jumped 2 km and its last_seen went
+        # backwards three days while it was reporting normally.
+        previous = state.applied_ts.get(kind)
+        if previous is not None and ts < previous:
+            logger.info(
+                "Ignoring stale %s for %s: packet ts %d is older than applied ts %d.",
+                kind, state.node_id, ts, previous,
+            )
+            return
+        state.applied_ts[kind] = ts
+
+        # max(), not assignment: recency is the newest packet from this node in
+        # any kind, and a stale packet that survives the check above (equal ts)
+        # must not pull it back either.
+        state.last_seen_ts = max(state.last_seen_ts or 0, ts)
 
         if kind == "soil_raw":
             state.soil_raw = self._coerce_float(payload.get("value"))
