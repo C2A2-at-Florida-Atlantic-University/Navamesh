@@ -1,9 +1,11 @@
 import time
 from typing import Optional, Dict
 
+from .node_id import resolve_node_id
+
 def extract_link(packet: dict) -> Optional[Dict]:
     ts = int(time.time())
-    from_id = packet.get("fromId") or packet.get("user", {}).get("id") or "unknown"
+    from_id = resolve_node_id(packet) or "unknown"
 
     rx_rssi = packet.get("rxRssi")
     rx_snr = packet.get("rxSnr")

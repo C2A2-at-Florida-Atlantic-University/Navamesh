@@ -1,6 +1,8 @@
 import time
 from typing import Optional, Dict
 
+from .node_id import resolve_node_id
+
 
 def _clean_name(value) -> Optional[str]:
     """Return a stripped non-empty string, else None."""
@@ -35,7 +37,7 @@ def extract_node_info(packet: dict) -> Optional[Dict]:
     if long_name is None and short_name is None:
         return None
 
-    from_id = _clean_name(user.get("id")) or _clean_name(packet.get("fromId"))
+    from_id = resolve_node_id(packet)
     if from_id is None:
         return None
 

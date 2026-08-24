@@ -1,6 +1,8 @@
 import time
 from typing import Optional, Dict
 
+from .node_id import resolve_node_id
+
 def extract_battery(packet: dict) -> Optional[Dict]:
     """
     Extract battery/voltage from Meshtastic TELEMETRY_APP packets.
@@ -19,7 +21,7 @@ def extract_battery(packet: dict) -> Optional[Dict]:
     if not isinstance(dm, dict):
         return None
 
-    from_id = packet.get("fromId") or packet.get("user", {}).get("id") or "unknown"
+    from_id = resolve_node_id(packet) or "unknown"
     ts = int(time.time())
 
     # Some fields may be missing depending on firmware/settings

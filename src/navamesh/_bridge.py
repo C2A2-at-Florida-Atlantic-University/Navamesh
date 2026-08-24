@@ -32,6 +32,7 @@ from navamesh.processors.link import extract_link
 from navamesh.processors.position import extract_position
 from navamesh.processors.telemetry import extract_battery
 from navamesh.processors.node_info import extract_node_info
+from navamesh.processors.node_id import resolve_node_id
 
 
 def _should_bridge(packet: dict, private_channel_index: int) -> bool:
@@ -144,7 +145,7 @@ def main():
             # the old shared-256 scheme there is no decode-order requirement here.
             ack = extract_command_ack(packet)
             if ack is not None:
-                from_id = packet.get("fromId") or "unknown"
+                from_id = resolve_node_id(packet) or "unknown"
                 status = {
                     "cmd_id": ack["command_id"],
                     "node_id": from_id,
@@ -173,7 +174,7 @@ def main():
             # TEXT_MESSAGE_APP early-return below, which would otherwise drop it.
             reading = extract_soil_reading(packet)
             if reading is not None:
-                from_id = packet.get("fromId") or "unknown"
+                from_id = resolve_node_id(packet) or "unknown"
                 raw_pl, pct_pl, band_pl, bat_pl = make_soil_mqtt_payloads(
                     from_id, reading
                 )
@@ -225,7 +226,7 @@ def main():
             mqtt_pub.publish(topics.raw_text(cfg.root_raw), packet)
 
             text    = decoded.get("text") or ""
-            from_id = packet.get("fromId") or "unknown"
+            from_id = resolve_node_id(packet) or "unknown"
 
             # FORMAT B (LEGACY): "Soil: 47% | Bat: 82% | Up: 1h 23m"
             #
