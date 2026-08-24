@@ -288,8 +288,8 @@ every ack, and answers `fwinfo <id|^all>` on demand. Full details in the firmwar
   Separate topics also get separate staleness timestamps.
 - `mqtt_to_db.py` stores it in `mesh_nodes.metadata->>'firmware_version'`, guarded so a
   retained redelivery cannot blank a version already recorded.
-- **Operator surfaces only, and the census is Pi-side.** `navamesh-cmd firmware` is the
-  fleet view — a database read from inside the bridge container, no radio traffic, no phone
+- **Operator surfaces only, and the census is Pi-side.** On the Pi, plain **`firmware`**
+  (installed at `/usr/local/bin/firmware`, a symlink to `bin/firmware`) is the fleet view — a database read from inside the bridge container, no radio traffic, no phone
   involved. `navamesh-cmd fwinfo <id>` asks one node directly. The gateway also answers
   `firmware` and `ophelp` over LXMF for someone holding a phone instead of a terminal, but
   that path needs free-text messaging, which **the farm app deliberately does not offer to a
