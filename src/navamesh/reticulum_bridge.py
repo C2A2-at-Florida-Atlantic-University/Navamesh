@@ -2099,6 +2099,14 @@ class LxmfGateway:
                 # In the farmer's units, not the protocol's. A node asked for "2h" that
                 # confirms "= 7200" leaves them converting back to check it took.
                 body += f" = every {_friendly_seconds(applied)}"
+            elif verb == "quiet" and applied:
+                # applied_value is MINUTES here, not seconds -- this is the node's
+                # auto-resume ceiling, and it answers 1440 to an unqualified pause.
+                # Rendered raw it read "Messaging pause confirmed = 1440", which is the
+                # protocol talking on a screen that says "after a day" everywhere else.
+                # Caught on the bench, 2026-08-24, after the interval case was fixed and
+                # this one was not.
+                body += f" = for {_friendly_seconds(int(applied) * 60)}"
             elif applied:
                 body += f" = {applied}"
         elif state == "timeout":

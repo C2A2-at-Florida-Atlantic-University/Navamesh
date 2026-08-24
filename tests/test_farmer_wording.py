@@ -261,3 +261,15 @@ def test_every_reply_the_gateway_composes_by_hand_fits_too():
     from navamesh.reticulum_bridge import _header
     for line in _header("🌱 Something").split("\n"):
         assert len(line) <= HELP_MAX_COLUMNS
+
+
+def test_an_applied_duration_is_reported_in_the_farmers_units():
+    """Two verbs carry a duration in their ack and neither should surface the raw number.
+
+    interval's applied_value is seconds; quiet's is MINUTES -- the node's auto-resume
+    ceiling, which answers 1440 to an unqualified pause. "Messaging pause confirmed =
+    1440" is the protocol talking, on the one screen that says "after a day" everywhere
+    else. The interval case was fixed first and this one was missed; the bench caught it.
+    """
+    assert _friendly_seconds(2700) == "45 minutes"
+    assert _friendly_seconds(1440 * 60) == "1 day"
