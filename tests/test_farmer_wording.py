@@ -13,6 +13,7 @@ import pytest
 try:
     from navamesh.reticulum_bridge import (
         NodeSnapshot,
+        HELP_TEXT,
         VERB_LABELS,
         _verb_label,
         _friendly_seconds,
@@ -168,3 +169,33 @@ def test_map_label_maps_legacy_percentages_onto_band_words():
 def test_map_label_no_data_is_explicit():
     from navamesh.generate_map import moisture_label
     assert moisture_label(None, None) == "No reading"
+
+
+# ── help text ────────────────────────────────────────────────────────────────
+
+def test_help_names_each_control_command_the_way_the_app_does():
+    """help is the one screen a farmer opens *because* they do not already know
+    what the commands do, so it is the last place that should assume they do.
+
+    Pinned to VERB_LABELS rather than to literal strings: the app's buttons, the
+    command confirmations and this help text are three renderings of the same
+    four verbs, and the failure being prevented is one of them being reworded
+    alone -- which is what happened when cd60737 rewrote the confirmations and
+    left the help text speaking protocol.
+    """
+    for label in VERB_LABELS.values():
+        assert label in HELP_TEXT, f"help text does not name {label!r} as the app does"
+
+
+def test_help_does_not_describe_commands_in_protocol_terms():
+    """Each of these appeared in the help text while the app said something a
+    person could act on."""
+    for jargon in ("telemetry interval", "RSSI", "SNR", "auto-close", "transmitting"):
+        assert jargon not in HELP_TEXT, f"help text still says {jargon!r}"
+
+
+def test_help_still_documents_the_wire_syntax():
+    """The farmer taps buttons, but the operator drives the same gateway by
+    typing, and this is the only place the syntax is written down."""
+    for verb in VERB_LABELS:
+        assert f"{verb} <" in HELP_TEXT, f"help text no longer shows how to type {verb!r}"

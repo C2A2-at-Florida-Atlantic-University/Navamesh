@@ -559,23 +559,45 @@ def fmt_link(nodes: Dict[str, NodeSnapshot]) -> str:
             lines.append(f"{_fmt_node(node_id)}: no link data yet")
     return "\n".join(lines)
 
+# The control half of this used to describe itself the way the protocol does --
+# "set telemetry interval (live, no reboot)", "stop / resume transmitting" -- which
+# asked a farmer to know what telemetry is before they could find out how often
+# their sensor reports. The app's buttons were rewritten in the farmer's words in
+# cd60737 and this was missed, so the one screen a farmer opens *because* they do
+# not already know what the commands do was the one still written for us.
+#
+# Each control entry now leads with the same name the app's button carries (see
+# VERB_LABELS, and command_registry.py in the app repo) and says what happens to
+# the sensor. The wire syntax stays underneath: the farmer never types it, but the
+# operator drives this same gateway by typing, and dropping it would take away the
+# only place it is written down. test_farmer_wording.py pins the labels to
+# VERB_LABELS so the two cannot drift again.
 HELP_TEXT = """🌱 Navamesh Gateway — Commands
 
-  status       — full summary of all nodes
-  soil         — soil moisture readings
-  battery      — battery levels & uptime
-  position     — GPS coordinates
-  link         — RSSI/SNR link quality
-  map          — rendered map image (all nodes)
-  map <id>     — rendered map image (one node)
-  nodes        — list all known node IDs
+  status       — how every sensor is doing
+  soil         — how wet the soil is
+  battery      — battery level and how long each sensor has been up
+  position     — where each sensor is
+  link         — how strong each sensor's signal is
+  map          — a map picture of every sensor
+  map <id>     — a map picture of one sensor
+  nodes        — list every sensor the gateway knows
   help         — this message
 
-Control commands (change the field nodes):
-  ble <id|^all> <min>      — open a Bluetooth window, then auto-close
-  interval <id|^all> <sec> — set telemetry interval (live, no reboot)
-  quiet <id|^all> on|off   — stop / resume transmitting
-  setloc <id> <lat> <lon>  — set the node's fixed position (one node only)"""
+Change a sensor — the app asks you to confirm before any of these are sent:
+
+  Bluetooth on — turns Bluetooth on for a while, then off again by itself, so
+      you can connect to the sensor while the window is open
+      ble <id|^all> <minutes>
+  Reporting interval — how often the sensor reports. Shorter gives finer data
+      and uses more battery. Takes effect right away
+      interval <id|^all> <seconds>
+  Messaging pause — the sensor stops sending but keeps listening, so you can
+      resume it whenever. It also resumes by itself within 3 days, or on a reboot
+      quiet <id|^all> on|off
+  Sensor location — the sensor has no GPS of its own, so this tells it where it
+      stands. Stand next to it before sending. One sensor at a time
+      setloc <id> <lat> <lon>"""
 
 
 # Verbs that change deployed field hardware. Gated by AUTHORIZED_FARMER_HASHES; every
@@ -1545,28 +1567,37 @@ def handle_command(
 
         if target:
             snap = nodes[target]
-            if (
-                bounds is not None
-                and snap.lat is not None
-                and snap.lon is not None
-                and not _within_bounds(snap.lat, snap.lon, bounds)
-            ):
-                # Outside cached coverage — don't render (would pull uncached tiles).
-                return (
-                    f"Node {target} is outside offline map coverage. "
-                    f"GPS: {snap.lat:.5f}, {snap.lon:.5f}",
-                    None,
-                )
-            # Explicitly requested node — never cluster-filter. Plot it onto the
-            # cached farm extent when configured, else legacy single-node render.
+            # Explicitly requested node — never cluster-filter.
             sel = MeshSelection(plotted=dict(geo), omitted=[])
-            if bounds is not None:
+            if bounds is not None and _within_bounds(snap.lat, snap.lon, bounds):
+                # Inside the cached farm box: lock the render to that fixed extent,
+                # which keeps a single requested node from recentering or
+                # over-zooming the map, and keeps the render entirely offline.
                 render_bounds = bounds
                 highlight     = target
+            # Outside it (or no cache configured), render_bounds stays None and we
+            # take the node-centered path, which is allowed to reach the fallback
+            # tile server. This used to refuse outright, on the reasoning that
+            # rendering would pull uncached tiles -- but plain `map` pulls those
+            # same tiles for those same nodes without complaint, so the refusal
+            # only ever told the operator that one of two adjacent commands had a
+            # rule the other did not. A node the farmer explicitly asked for is a
+            # worse thing to withhold than a few tiles are to fetch; where there is
+            # genuinely no way to get tiles, the render fails and the text fallback
+            # below answers, as it already does for every other tile failure.
         else:
-            # Plain `map` keeps the original main-mesh behavior. Cache-constrained
-            # fixed extents are only used for `map <id>`, which was the failing path.
+            # Plain `map` keeps the original main-mesh behavior: a node-centered
+            # extent, so the cached box constrains which nodes are reported as
+            # out-of-coverage but never the extent itself.
             sel = _select_main_mesh(geo, cfg)
+            if bounds is not None:
+                # Populate the warning that has been in both replies all along.
+                # Counting it here rather than leaving it at zero is the whole
+                # reason the operator can tell "not drawn" from "not covered".
+                outside_count = sum(
+                    1 for snap in geo.values()
+                    if not _within_bounds(snap.lat, snap.lon, bounds)
+                )
             if sel.omitted:
                 logger.info(
                     "Map outlier guard omitted %d node(s): %s",
