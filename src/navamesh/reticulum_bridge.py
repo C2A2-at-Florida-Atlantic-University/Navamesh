@@ -671,7 +671,7 @@ Change a sensor — the app asks you to confirm before any of these are sent:
       and uses more battery. Takes effect right away
       interval <id|^all> <seconds>
   Messaging pause — the sensor stops sending but keeps listening, so you can
-      resume it whenever. It also resumes by itself within 3 days, or on a reboot
+      resume it whenever. It also resumes by itself after a day, or on a reboot
       quiet <id|^all> on|off
   Sensor location — the sensor has no GPS of its own, so this tells it where it
       stands. Stand next to it before sending. One sensor at a time

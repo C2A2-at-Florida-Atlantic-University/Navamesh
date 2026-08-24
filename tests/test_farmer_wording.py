@@ -187,6 +187,19 @@ def test_help_names_each_control_command_the_way_the_app_does():
         assert label in HELP_TEXT, f"help text does not name {label!r} as the app does"
 
 
+def test_help_states_the_quiet_auto_resume_the_node_actually_uses():
+    """The app sends no duration, so the node applies NAVAMESH_QUIET_DEFAULT_MINUTES
+    = 1440, i.e. one day. 4320 (three days) is only the clamp ceiling.
+
+    Caught on the bench: the ack came back `applied=1440` while this text promised
+    "within 3 days". Not false, but wrong in the direction that matters -- a farmer
+    who pauses a sensor and expects up to three days of quiet gets it back after
+    one, and one who wants it back sooner thinks they must wait three.
+    """
+    assert "after a day" in HELP_TEXT
+    assert "3 days" not in HELP_TEXT
+
+
 def test_help_does_not_describe_commands_in_protocol_terms():
     """Each of these appeared in the help text while the app said something a
     person could act on."""
