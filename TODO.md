@@ -135,7 +135,19 @@ with raw ADC, and the Pi only ever populates `soil_raw` from that path. A row wi
 what it cannot do is tell one *new* build from another, which is what the next rollout needs.
 
 **Then:** carry `firmware_version` into `farm/nodes/<id>/info` and into the `mesh_nodes`
-metadata, and show it wherever the operator picks a node to command.
+metadata.
+
+**Surface it to the operator, not to the farmer.** "Wherever the operator picks a node to
+command" — as an earlier draft of this put it — reads as the app's node picker, which is the
+wrong place: that picker belongs to a farmer who needs DRY/DAMP/WET and has no use for a
+build hash, and putting one there re-introduces the protocol-facing surface cd60737 and the
+`HELP_TEXT` rewrite removed. The operator's surfaces are `navamesh-cmd`, a query against
+`mesh_nodes`, and whatever health view gets built; that is where it belongs.
+
+The node should announce it **unsolicited at boot** rather than answer a request for it —
+the value changes only on a reflash and a reflash always reboots, so boot is exactly when it
+is worth sending, and nothing has to poll. See the firmware repo's `CLAUDE.md`, including the
+jitter needed so a fleet power-cycle does not have 18 nodes broadcasting at once.
 
 Worth doing before: the next fleet-wide flash, where a partially-updated fleet is the
 normal state and "which nodes still need it" should be a query rather than a guess.
