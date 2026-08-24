@@ -7,14 +7,22 @@ are the guardrails, not decoration.
 
 import pytest
 
-from navamesh.reticulum_bridge import (
-    WRITE_VERBS,
-    is_lxmf_destination,
-    NodeSnapshot,
-    ReticulumBridgeConfig,
-    handle_command,
-    is_sender_authorized,
-)
+# Same collection guard as the other bridge test modules. Without it this module
+# was the one that took the whole run down rather than skipping: reticulum_bridge
+# raises SystemExit at import when rns/lxmf are missing, and pytest does not treat
+# a SystemExit during collection as a collection error, so the run died with
+# INTERNALERROR before any summary could say what happened.
+try:
+    from navamesh.reticulum_bridge import (
+        WRITE_VERBS,
+        is_lxmf_destination,
+        NodeSnapshot,
+        ReticulumBridgeConfig,
+        handle_command,
+        is_sender_authorized,
+    )
+except (ImportError, SystemExit) as exc:  # rns/lxmf/staticmap/dotenv not installed
+    pytest.skip(f"reticulum_bridge unavailable: {exc}", allow_module_level=True)
 
 KNOWN_NODE = "!abc12345"
 

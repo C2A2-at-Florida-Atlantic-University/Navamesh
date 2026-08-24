@@ -154,7 +154,18 @@ pip install pytest rns lxmf staticmap pillow python-dotenv meshtastic paho-mqtt 
 PYTHONPATH=src pytest tests/ -q
 ```
 
-A correct run reports **248 passed, 0 skipped**.
+A correct run reports **282 passed, 0 skipped**.
+
+In CI, or before shipping anything to a Pi, set `NAVAMESH_REQUIRE_FULL_TESTS=1`:
+
+```bash
+NAVAMESH_REQUIRE_FULL_TESTS=1 PYTHONPATH=src pytest tests/ -q
+```
+
+That turns a run which skipped the bridge modules into a **failed** run instead of a
+passing one. Without it those skips still get a loud terminal section naming exactly
+which modules did not execute — but the exit status stays 0, which is how a green run
+covering none of the bridge tests slipped through before.
 
 ### Read the skip count, not just the pass count
 
@@ -178,8 +189,15 @@ covering it. The gap only surfaced when the dependencies were installed delibera
 the skip count dropped to zero.
 
 So: if `pytest` finishes suspiciously fast, or reports skips, the bridge tests did not
-run. See the "Stop the test suite from skipping itself into a green CI" entry in
-`TODO.md`.
+run. `tests/conftest.py` now says so explicitly at the end of every such run, and
+`NAVAMESH_REQUIRE_FULL_TESTS=1` makes it a failure rather than something to notice.
+
+Worth knowing what that turned up: with `dotenv` installed but `rns` missing — a
+half-installed environment, the likeliest CI accident —
+`tests/test_handle_write_command.py` had no collection guard, and
+`reticulum_bridge` raises `SystemExit` at import rather than `ImportError`. pytest does
+not treat a `SystemExit` during collection as a collection error, so the whole run died
+with `INTERNALERROR` before printing any summary. It is guarded like the others now.
 
 ## Trouble Shooting:
 Port in use / access denied
