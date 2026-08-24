@@ -62,6 +62,25 @@ Three containers build from **this** repo, and picking the wrong one wastes a re
 Deploy by pushing from the dev machine and pulling on the Pi (`/home/tj/Navamesh`), never
 the reverse. Then `docker compose build <service> && docker compose up -d <service>`.
 
+### Putting `bin/` on PATH (per machine, not in git)
+
+`bin/firmware` and `bin/navamesh-cmd` are wrappers around `docker exec navamesh_bridge`.
+They live in the repo, but **being callable by name is machine-local state that git does
+not carry** — a fresh Pi has the scripts and not the symlinks, so `firmware` there is
+"command not found" while the file plainly exists. On `devpi` they are installed:
+
+```bash
+sudo ln -sf "$PWD/bin/firmware"     /usr/local/bin/firmware
+sudo ln -sf "$PWD/bin/navamesh-cmd" /usr/local/bin/navamesh-cmd
+```
+
+Run from the repo root. The symlinks point at the working tree, so a `git pull` updates
+the commands; moving the clone breaks them visibly rather than silently.
+
+The caller also needs to be in the `docker` group (`sudo usermod -aG docker <user>`, then
+log out and back in). Both scripts detect that case and say so, because docker's own error
+for it is about a socket and reads like the container is down.
+
 ## Traps that have already cost real time
 
 **The test suite used to skip itself into a green run.** Closed in 83ec1cf, but know
@@ -289,7 +308,7 @@ every ack, and answers `fwinfo <id|^all>` on demand. Full details in the firmwar
 - `mqtt_to_db.py` stores it in `mesh_nodes.metadata->>'firmware_version'`, guarded so a
   retained redelivery cannot blank a version already recorded.
 - **Operator surfaces only, and the census is Pi-side.** On the Pi, plain **`firmware`**
-  (installed at `/usr/local/bin/firmware`, a symlink to `bin/firmware`) is the fleet view — a database read from inside the bridge container, no radio traffic, no phone
+  is the fleet view — a database read from inside the bridge container, no radio traffic, no phone
   involved. `navamesh-cmd fwinfo <id>` asks one node directly. The gateway also answers
   `firmware` and `ophelp` over LXMF for someone holding a phone instead of a terminal, but
   that path needs free-text messaging, which **the farm app deliberately does not offer to a
