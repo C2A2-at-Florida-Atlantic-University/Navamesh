@@ -207,11 +207,27 @@ def test_help_does_not_describe_commands_in_protocol_terms():
         assert jargon not in HELP_TEXT, f"help text still says {jargon!r}"
 
 
-def test_help_still_documents_the_wire_syntax():
-    """The farmer taps buttons, but the operator drives the same gateway by
-    typing, and this is the only place the syntax is written down."""
+def test_the_farmer_help_carries_no_wire_syntax():
+    """The farmer taps buttons and never types a command, so a line reading
+    `ble <id|^all> <minutes>` asks them to parse a format to use their own sensor.
+
+    This used to assert the opposite, because HELP_TEXT was the only place the syntax
+    was written down. It is now in OPERATOR_HELP_TEXT instead -- see the test below,
+    which keeps that guarantee rather than dropping it."""
     for verb in VERB_LABELS:
-        assert f"{verb} <" in HELP_TEXT, f"help text no longer shows how to type {verb!r}"
+        assert f"{verb} <" not in HELP_TEXT, (
+            f"farmer help shows the wire syntax for {verb!r}; it belongs in OPERATOR_HELP_TEXT"
+        )
+
+
+def test_the_operator_help_still_documents_the_wire_syntax():
+    """The operator drives this same gateway by typing, and this is now the only place
+    the syntax is written down. Removing it from the farmer's help must not lose it."""
+    from navamesh.reticulum_bridge import OPERATOR_HELP_TEXT
+    for verb in VERB_LABELS:
+        assert f"{verb} <" in OPERATOR_HELP_TEXT, (
+            f"operator help no longer shows how to type {verb!r}"
+        )
 
 
 # ── Line width ──────────────────────────────────────────────────────────────────

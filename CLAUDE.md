@@ -296,6 +296,19 @@ every ack, and answers `fwinfo <id|^all>` on demand. Full details in the firmwar
 - "Never reported" stays NULL and renders as "Not reported yet". `soil_raw IS NULL` remains
   the separate, independent answer to "flashed at all".
 
+**The farmer's `help` carries no wire syntax.** Removed 2026-08-24: a farmer taps buttons
+and never types a command, so `ble <id|^all> <minutes>` asked them to parse a format to use
+their own sensor. It is not lost — `OPERATOR_HELP_TEXT` (reachable as `ophelp`) now carries
+every typed form, and `test_farmer_wording` asserts both halves: absent from `HELP_TEXT`,
+present in `OPERATOR_HELP_TEXT`. That test previously asserted the opposite, so read its
+docstring before "restoring" anything.
+
+**Reply text must fit 43 columns.** The app renders replies in a monospace Label that wraps
+at ~44 on the deployed handsets. Over-wide lines wrap to column 0 and collide with the
+6-space continuation indents, which reads as corruption rather than as wrapping — that is
+what the help text looked like on a phone before 2026-08-24. Pinned by
+`test_help_text_fits_the_phone_without_wrapping`.
+
 **Units on the reporting interval.** `interval <id|^all> 30m` and `2h` now work alongside bare
 seconds, which still mean seconds — the app, `navamesh-cmd` and anything scripted are
 unchanged. `parse_interval_value()` lives in `processors/command_proto.py` rather than

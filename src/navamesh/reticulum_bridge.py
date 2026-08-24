@@ -705,19 +705,15 @@ Change a sensor — you confirm first:
 
   Bluetooth on — on a while, then off
       Connect while the window is open
-      ble <id|^all> <minutes>
 
   Reporting interval — how often it reports
       Shorter is finer data, more battery
-      interval <id|^all> <seconds|30m|2h>
 
   Messaging pause — stops sending, hears
       Comes back by itself after a day
-      quiet <id|^all> on|off
 
   Sensor location — where the sensor stands
-      Stand next to it before you send this
-      setloc <id> <lat> <lon>"""
+      Stand next to it before you send this"""
 
 # Operator verbs, kept out of HELP_TEXT on purpose -- see OPERATOR_VERB_LABELS. Written down
 # here so they are not undiscoverable: `firmware` lists what each node last reported (a
@@ -725,10 +721,26 @@ Change a sensor — you confirm first:
 # usually needed, because every node announces its version unprompted when it boots.
 OPERATOR_HELP_TEXT = """Navamesh Gateway — operator commands
 
-  firmware              — what build each sensor last reported (no radio traffic)
-  fwinfo <id|^all>      — ask a sensor its build now; changes nothing on it
+The farmer's 'help' is for someone tapping
+buttons and carries no wire syntax. This is
+where the typed form is written down.
 
-Nodes announce their build at boot, so 'firmware' is usually already current."""
+  ble <id|^all> <minutes>
+  interval <id|^all> <seconds|30m|2h>
+  quiet <id|^all> on|off
+  setloc <id> <lat> <lon>
+
+  firmware
+  fwinfo <id|^all>
+
+'firmware' reads what each sensor last
+reported, with no radio traffic. 'fwinfo'
+asks one now and changes nothing on it.
+Nodes announce their build at boot, so
+'firmware' is usually already current.
+
+<id> is a node id like !0b9aed49.
+^all reaches every node; setloc refuses it."""
 
 
 # Verbs that change deployed field hardware. Gated by AUTHORIZED_FARMER_HASHES; every
