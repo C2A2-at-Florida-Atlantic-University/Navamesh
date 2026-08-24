@@ -1620,15 +1620,23 @@ def handle_command(
             and MAP_AVAILABLE
             and target in geo
         ):
-            # Requested node is inside the cache box, but the render extent still
-            # needs tiles the offline cache lacks (or preflight failed). Explain
-            # that specifically rather than emitting a normal no-image summary.
-            snap = geo[target]
-            return (
-                f"Map image unavailable because required offline tiles are missing "
-                f"or outside cache coverage. Node GPS: {snap.lat:.5f}, {snap.lon:.5f}",
-                None,
-            )
+            # Inside the cache box, but the cached extent still could not be drawn:
+            # tiles absent from the cache, or a square viewport spilling past it.
+            # Retry node-centered before giving up. That is the same path a node
+            # outside the box already takes, and unlike the fixed-extent render it
+            # is allowed to reach the fallback tile server -- so the order is
+            # offline first, online second, text last, for every node. Without
+            # this retry a node *inside* the farm box would be the only one that
+            # could not fall back, which is the same inconsistency in miniature
+            # that made `map <id>` refuse what `map` drew.
+            image_result = render_map(plotted, cfg, bounds=None, highlight_node_id=None)
+            if image_result is None:
+                snap = geo[target]
+                return (
+                    f"Map image unavailable because required offline tiles are missing "
+                    f"or outside cache coverage. Node GPS: {snap.lat:.5f}, {snap.lon:.5f}",
+                    None,
+                )
 
         def _sep_str(m: float) -> str:
             return f"{m / 1000:.1f} km" if m >= 1000 else f"{m:.0f} m"

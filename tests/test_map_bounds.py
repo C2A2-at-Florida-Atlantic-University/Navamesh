@@ -252,15 +252,32 @@ def test_map_id_outside_bounds_renders_node_centered_instead_of_refusing(monkeyp
     assert image is None                # fake render returns None
 
 
-def test_map_id_inside_bounds_still_locks_to_the_cached_extent(monkeypatch):
-    """The bandwidth-safe path is unchanged for the nodes it was written for."""
+def test_map_id_inside_bounds_tries_the_cached_extent_first(monkeypatch):
+    """The bandwidth-safe path is still attempted first for the nodes it was
+    written for -- the offline cache stays the first choice, not a fallback."""
     calls = _record_render(monkeypatch)
     nodes = {"!cbf78a20": NodeSnapshot(node_id="!cbf78a20", lat=NODE_LAT, lon=NODE_LON)}
     handle_command("map !cbf78a20", nodes, _cfg_with_bounds())
 
-    assert len(calls) == 1
     assert calls[0]["bounds"] == FARM_BOUNDS
     assert calls[0]["highlight"] == "!cbf78a20"
+
+
+def test_map_id_inside_bounds_retries_online_when_the_cache_cannot_draw_it(monkeypatch):
+    """Offline first, online second, text last -- for in-bounds nodes as well.
+
+    The fake render_map always fails, standing in for tiles missing from the
+    cache. Without the retry a node inside the farm box would be the only one
+    unable to fall back to the tile server, which is the inconsistency that made
+    `map <id>` refuse what `map` drew, just one level down.
+    """
+    calls = _record_render(monkeypatch)
+    nodes = {"!cbf78a20": NodeSnapshot(node_id="!cbf78a20", lat=NODE_LAT, lon=NODE_LON)}
+    handle_command("map !cbf78a20", nodes, _cfg_with_bounds())
+
+    assert len(calls) == 2, "cached extent, then a node-centered retry"
+    assert calls[0]["bounds"] == FARM_BOUNDS      # offline attempt
+    assert calls[1]["bounds"] is None             # online-capable retry
 
 
 def test_map_id_outside_bounds_falls_back_to_text_when_no_tiles_are_reachable(monkeypatch):
@@ -298,9 +315,13 @@ def test_map_all_reports_how_many_nodes_are_outside_cache_coverage(monkeypatch):
 def test_map_id_in_bounds_but_render_fails_gives_specific_text():
     # Tiny cache box that contains the node, but a square render viewport spills
     # past it → the containment gate refuses to render (no tile server needed).
+    # map_tile_fallback="" so the node-centered retry has nowhere to go either:
+    # this test is about the message shown once every route has been tried, and a
+    # test that reaches the real OSM to prove that is a test that fails offline.
     cfg = _cfg(
         cache_lat_min=26.384, cache_lat_max=26.385,
         cache_lon_min=-80.103, cache_lon_max=-80.102,
+        map_tile_fallback="",
     )
     nodes = {"!cbf78a20": NodeSnapshot(node_id="!cbf78a20", lat=26.3845, lon=-80.1025)}
     text, image = handle_command("map !cbf78a20", nodes, cfg)
