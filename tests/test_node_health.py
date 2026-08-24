@@ -124,12 +124,38 @@ def test_nodes_flags_stale_nodes_without_hiding_them():
     assert "1 of 2 need checking" in text
 
 
-def test_nodes_explains_that_a_quiet_sensor_still_answers_commands():
+def test_nodes_explains_a_quiet_sensor_still_answers_commands():
     """Otherwise the warning reads as "this node is unreachable", and the farmer
     stops trying to fix the thing that is actually wrong."""
-    nodes = {"!quiet001": NodeSnapshot(node_id="!quiet001", ts=None, soil_last_ts=None)}
+    import time as _time
+    now = int(_time.time())
+    # Heard a minute ago, but no soil reading ever: present, not measuring.
+    nodes = {"!quiet001": NodeSnapshot(node_id="!quiet001", ts=now - 60, soil_last_ts=None)}
     text, _ = handle_command("nodes", nodes, _cfg())
-    assert "will answer" in text and "not measuring" in text
+    assert "will answer commands" in text and "not measuring" in text
+    assert "check power" not in text          # not this node's problem
+
+
+def test_nodes_explains_an_unheard_sensor_differently():
+    """Caught by running it: a list of nodes nothing has been heard from was being
+    annotated with advice about sensors that answer commands, which sends the
+    reader after the wrong fault."""
+    nodes = {"!gone0001": NodeSnapshot(node_id="!gone0001", ts=None, soil_last_ts=None)}
+    text, _ = handle_command("nodes", nodes, _cfg())
+    assert "not answering at all" in text and "check power" in text
+    assert "will answer commands" not in text
+
+
+def test_nodes_explains_both_states_when_both_are_present():
+    import time as _time
+    now = int(_time.time())
+    nodes = {
+        "!quiet001": NodeSnapshot(node_id="!quiet001", ts=now - 60, soil_last_ts=None),
+        "!gone0001": NodeSnapshot(node_id="!gone0001", ts=None, soil_last_ts=None),
+    }
+    text, _ = handle_command("nodes", nodes, _cfg())
+    assert "2 of 2 need checking" in text
+    assert "will answer commands" in text and "check power" in text
 
 
 def test_nodes_stays_quiet_when_every_node_is_healthy():

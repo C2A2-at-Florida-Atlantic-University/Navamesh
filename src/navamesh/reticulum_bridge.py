@@ -1619,21 +1619,34 @@ def handle_command(
         # in the list they tap to send a command.
         now = int(time.time())
         lines = []
-        stale = 0
+        quiet = 0        # heard, but not measuring
+        unheard = 0      # nothing at all
         for node_id in sorted(nodes):
-            note = _health_note(nodes[node_id], now)
-            if note:
-                stale += 1
-                lines.append(f"  {node_id}  ⚠️ {note}")
-            else:
-                lines.append(f"  {node_id}")
+            snap = nodes[node_id]
+            state = classify_node_health(now, snap.ts, snap.soil_last_ts)
+            note = _health_note(snap, now)
+            if state == NODE_NOT_REPORTING:
+                quiet += 1
+            elif state == NODE_UNHEARD:
+                unheard += 1
+            lines.append(f"  {node_id}  ⚠️ {note}" if note else f"  {node_id}")
         out = "Known field nodes:\n" + "\n".join(lines)
-        if stale:
-            out += (
-                f"\n\n⚠️ {stale} of {len(nodes)} need checking. A sensor marked "
-                "'no soil readings recently' is still on the mesh and will answer "
-                "commands -- it just is not measuring."
-            )
+        if quiet or unheard:
+            out += f"\n\n⚠️ {quiet + unheard} of {len(nodes)} need checking."
+            # Each state gets its own sentence, and only when a node is actually in
+            # it. Explaining the wrong one is worse than explaining neither: a list
+            # of nodes nothing has been heard from, annotated with advice about
+            # sensors that answer commands, sends the reader after the wrong fault.
+            if quiet:
+                out += (
+                    "\n  A sensor with no recent soil readings is still on the mesh "
+                    "and will answer commands -- it just is not measuring."
+                )
+            if unheard:
+                out += (
+                    "\n  A sensor not heard from recently is not answering at all: "
+                    "check power, or that it is still within range."
+                )
         return out, None
     if command == "help":     return HELP_TEXT, None
     if command == "status":   return fmt_status(nodes), None
