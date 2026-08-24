@@ -120,6 +120,22 @@ handler rejected the value" look identical from the Pi. Meshtastic embeds the bu
 in its version string, visible over serial or BLE (`2.7.20.a36db94`). Still open — see
 `TODO.md`.
 
+**A missing ack is not a failed command, and RSSI is how you tell the two apart.**
+Measured 2026-08-23/24: `spirit-farm-pi`'s 18 field nodes sit at **-65 to -90 dBm, SNR
+5.0-7.5** — a healthy LoRa link, usable range being roughly -40 to -120. The dev bench sat
+at **-10 to -16 dBm**, i.e. three nodes and the gateway on one desk, and *that* is where
+commands and acks were dropped intermittently in both directions: one broadcast was applied
+on the node (confirmed over serial) while its ack never arrived, and two unicasts never
+reached the node at all. It flapped rather than settled — a `setloc` succeeded and the next
+command 30 s later did not.
+
+Too *strong* a signal, not too weak: near-field desense plus collisions from radios inches
+apart. So do not read bench ack loss as a mesh problem, and do not read a single timeout as
+a failure. `setloc` is the one command with no broadcast fallback, so it is the most exposed;
+retry it, and confirm with `position` or `map <id>` rather than inferring from the silence.
+Note also that RSSI here is what the gateway *hears from* a node — the uplink. Commands go
+the other way, and the two directions can drop independently.
+
 **`metadata->>'status'` is write-time only and must not be read as current.** A row is
 only rewritten when that node is heard from, so a node that stops reporting keeps whatever
 was stored last. Derive liveness from `last_seen` and `soil_last_ts` via
@@ -255,6 +271,24 @@ One thing the bench cannot prove: with request and stored value agreeing, an ech
 a reading-back ack are identical by construction. The read-back is confirmed present in the
 flashed binary (its log strings are in the ELF) and only becomes *observable* when a node
 disagrees, which is the point of it.
+
+### Planned next, on the Mac (2026-08-24)
+
+Two features are being built there, not here. Context each will need:
+
+- **Manual entry for the reporting interval.** The app currently offers `value_presets`
+  only, deliberately — `command_registry.py` records a "no typing anywhere" rule, and a
+  preset list also makes an out-of-range value impossible to enter. The precedent for
+  breaking that is `set_location`'s "Enter coordinates" fallback, which exists because a
+  live position is the one value with nothing to preset. Whatever the manual field does, the
+  bounds stay **triplicated** — UI, then `processors/command_proto.py`, then the firmware
+  clamp (60-86400 s, with 300 s the firmware floor in practice) — so a bad value is caught
+  early, explained in the middle, and clamped as a last resort.
+- **Firmware version reported from the nodes.** See the `TODO.md` entry, which was wrong
+  about this being Pi-side-only and is now corrected: a remote node never broadcasts its
+  version, so this needs a field on the wire and therefore has to land *before* a flash. The
+  ack is the better home than `SoilReading` (airtime), and note "has this node been flashed
+  at all?" is already answerable from `soil_raw` being NULL.
 
 ### Earlier in Aug 2026
 

@@ -110,8 +110,32 @@ SET_LOCATION, rather than `a36db94`).
 The nodes already send this: Meshtastic embeds the build hash in its version string, and
 the bridge receives NodeInfo/DeviceMetadata.
 
-**To close it:** carry `firmware_version` into `farm/nodes/<id>/info` and into the
-`mesh_nodes` metadata, and show it wherever the operator picks a node to command.
+**This is NOT a Pi-side-only change, contrary to what this entry used to say.** Checked on
+2026-08-23: `meshtastic_User`, which is what NodeInfo carries, has **no version field at
+all**. Only `DeviceMetadata` has `firmware_version[18]`, and it is produced in exactly two
+places — `PhoneAPI.cpp:300`, the *local* serial/BLE link, and `AdminModule.cpp:1234`, in
+reply to an admin-channel `get_device_metadata_request` that needs the session handshake and
+`admin_channel_enabled` (false by default). A remote field node never broadcasts its version
+over LoRa. Neither of our own protos carries it either: `SoilReading` is `raw_adc`,
+`battery_percent`, `battery_mv`.
+
+So closing this needs a **field on the wire**, which means firmware, which means it has to
+land **before** a flash rather than after. Planned as Mac-side work (2026-08-24).
+
+**Put it in the ack, not in `SoilReading`.** A version string on every reading costs LoRa
+airtime forever; acks are already sent, and any command elicits one, which also turns "which
+nodes still need updating" into something the Pi can actively poll rather than wait for. A
+4-byte hash rather than the 18-char string would be cheaper again if airtime matters.
+
+**What is already answerable, today, with no changes:** "has this node been flashed?" The
+legacy firmware sends a percentage as text; the new firmware sends a `SoilReading` protobuf
+with raw ADC, and the Pi only ever populates `soil_raw` from that path. A row with
+`soil_percent` set and `soil_raw` NULL has not been flashed — which is exactly what all 18
+`spirit-farm-pi` nodes look like right now. That covers the current legacy → new rollout;
+what it cannot do is tell one *new* build from another, which is what the next rollout needs.
+
+**Then:** carry `firmware_version` into `farm/nodes/<id>/info` and into the `mesh_nodes`
+metadata, and show it wherever the operator picks a node to command.
 
 Worth doing before: the next fleet-wide flash, where a partially-updated fleet is the
 normal state and "which nodes still need it" should be a query rather than a guess.
