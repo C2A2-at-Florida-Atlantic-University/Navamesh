@@ -74,9 +74,16 @@ def test_label_values_usb_wins_over_battery_level():
 
 # ── node display labels (Meshtastic NODEINFO_APP names) ──────────────────────
 
-def test_reticulum_node_label_prefers_short_name():
+def test_text_takes_the_long_name_and_the_pin_takes_the_short_one():
+    """The two labels disagree on purpose, so keep them pinned together.
+
+    A pin is drawn beside a dot with a whole map to share and takes the shortest
+    thing that identifies the node. A line of text has room for the name the
+    farmer actually chose, and showing them "NF01" there wasted it -- every
+    status/position/battery/link reply said "Node 1234" or a four-character code
+    long after the app rename had arrived and was sitting in the database."""
     snap = NodeSnapshot(node_id="!abcd1234", short_name="NF01", long_name="North Field")
-    assert _node_label("!abcd1234", snap) == "NF01"
+    assert _node_label("!abcd1234", snap) == "North Field"
     assert _map_pin_label("!abcd1234", snap) == "NF01"
 
 

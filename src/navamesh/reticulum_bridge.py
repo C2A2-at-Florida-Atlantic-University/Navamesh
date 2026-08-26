@@ -493,6 +493,11 @@ def _health_note(snap: "NodeSnapshot", now: Optional[int] = None) -> Optional[st
 # ── Formatters ────────────────────────────────────────────────────────────────
 
 def _fmt_node(node_id: str) -> str:
+    """Last-resort label from the id alone. Only for callers with no NodeSnapshot
+    to hand -- anything holding one should call _node_label(), which can show the
+    name the farmer gave the node. This taking no snapshot is why every text reply
+    said "Node bb41" long after the app renames had arrived and were in the
+    database: the name was there, the formatter simply could not see it."""
     return f"Node {node_id[-4:]}" if node_id.startswith("!") else node_id
 
 
@@ -521,10 +526,21 @@ def _label_candidates(node_id: str, snap: Optional[NodeSnapshot], order: Tuple[s
 
 
 def _node_label(node_id: str, snap: Optional[NodeSnapshot] = None) -> str:
-    """Human label for text replies: Meshtastic display/short/long name, then a
-    configured alias, then the legacy 'Node <last4>' fallback."""
+    """Human label for text replies: the Meshtastic long name, then display/short
+    name, then a configured alias, then the legacy 'Node <last4>' fallback.
+
+    Long name first, unlike the map pins, and the two differ on purpose. A pin is
+    drawn beside a dot with a whole map to share, so it takes the shortest thing
+    that identifies the node; a line of text has room for the name the farmer
+    actually chose. Preferring display_name here would defeat that -- the ingestor
+    sets it to `short_name or long_name`, so it resolves to the short name
+    whenever one exists, which is nearly always.
+
+    Deliberately NOT truncated, unlike the pin label: a text reply has the room,
+    and test_map_pin_label_truncates_long_names_for_image_only pins that the
+    shortening is the image's business alone."""
     for cand in _label_candidates(
-        node_id, snap, ("display_name", "short_name", "long_name")
+        node_id, snap, ("long_name", "display_name", "short_name")
     ):
         return cand
     return _fmt_node(node_id)
@@ -631,7 +647,7 @@ def fmt_status(nodes: Dict[str, NodeSnapshot]) -> str:
         return "No node data in database yet. Are field nodes transmitting?"
     lines = [_header("🌱 Navamesh Status")]
     for node_id, snap in sorted(nodes.items()):
-        lines.append(f"[ {_fmt_node(node_id)} ]  {node_id}")
+        lines.append(f"[ {_node_label(node_id, snap)} ]  {node_id}")
         note = _health_note(snap)
         if note:
             lines.append(f"  ⚠️  {note}")
@@ -658,9 +674,9 @@ def fmt_soil(nodes: Dict[str, NodeSnapshot]) -> str:
     for node_id, snap in sorted(nodes.items()):
         soil = _fmt_soil_reading(snap)
         if soil is None:
-            lines.append(f"{_fmt_node(node_id)}: no soil data yet")
+            lines.append(f"{_node_label(node_id, snap)}: no soil data yet")
         else:
-            lines.append(f"{_fmt_node(node_id)}: {soil}  ({_fmt_ts(snap.ts)})")
+            lines.append(f"{_node_label(node_id, snap)}: {soil}  ({_fmt_ts(snap.ts)})")
     return "\n".join(lines)
 
 def fmt_battery(nodes: Dict[str, NodeSnapshot]) -> str:
@@ -672,7 +688,7 @@ def fmt_battery(nodes: Dict[str, NodeSnapshot]) -> str:
         )
         volt = f"  {snap.voltage:.2f}V" if snap.voltage is not None else ""
         up   = f"  up {_fmt_uptime(snap.uptime_seconds)}" if snap.uptime_seconds else ""
-        lines.append(f"{_fmt_node(node_id)}: {bat}{volt}{up}  ({_fmt_ts(snap.ts)})")
+        lines.append(f"{_node_label(node_id, snap)}: {bat}{volt}{up}  ({_fmt_ts(snap.ts)})")
     return "\n".join(lines)
 
 def fmt_position(nodes: Dict[str, NodeSnapshot]) -> str:
@@ -681,9 +697,9 @@ def fmt_position(nodes: Dict[str, NodeSnapshot]) -> str:
     for node_id, snap in sorted(nodes.items()):
         if snap.lat is not None:
             alt = f"  alt={snap.alt}m" if snap.alt is not None else ""
-            lines.append(f"{_fmt_node(node_id)}: {snap.lat:.6f}, {snap.lon:.6f}{alt}  ({_fmt_ts(snap.ts)})")
+            lines.append(f"{_node_label(node_id, snap)}: {snap.lat:.6f}, {snap.lon:.6f}{alt}  ({_fmt_ts(snap.ts)})")
         else:
-            lines.append(f"{_fmt_node(node_id)}: no GPS fix yet")
+            lines.append(f"{_node_label(node_id, snap)}: no GPS fix yet")
     return "\n".join(lines)
 
 def fmt_link(nodes: Dict[str, NodeSnapshot]) -> str:
@@ -691,9 +707,9 @@ def fmt_link(nodes: Dict[str, NodeSnapshot]) -> str:
     lines = [_header("📡 Link Quality")]
     for node_id, snap in sorted(nodes.items()):
         if snap.rx_rssi is not None:
-            lines.append(f"{_fmt_node(node_id)}: RSSI={snap.rx_rssi} dBm  SNR={snap.rx_snr} dB  ({_fmt_ts(snap.ts)})")
+            lines.append(f"{_node_label(node_id, snap)}: RSSI={snap.rx_rssi} dBm  SNR={snap.rx_snr} dB  ({_fmt_ts(snap.ts)})")
         else:
-            lines.append(f"{_fmt_node(node_id)}: no link data yet")
+            lines.append(f"{_node_label(node_id, snap)}: no link data yet")
     return "\n".join(lines)
 
 def fmt_firmware(nodes: Dict[str, NodeSnapshot]) -> str:
@@ -719,12 +735,12 @@ def fmt_firmware(nodes: Dict[str, NodeSnapshot]) -> str:
     for version in sorted(v for v in by_version if v):
         ids = sorted(by_version[version])
         lines.append(f"{version} — {len(ids)} sensor{'s' if len(ids) != 1 else ''}")
-        lines.extend(f"    {_fmt_node(i)}" for i in ids)
+        lines.extend(f"    {_node_label(i, nodes.get(i))}" for i in ids)
 
     unknown = sorted(by_version.get("", []))
     if unknown:
         lines.append(f"Not reported yet — {len(unknown)}")
-        lines.extend(f"    {_fmt_node(i)}" for i in unknown)
+        lines.extend(f"    {_node_label(i, nodes.get(i))}" for i in unknown)
         lines.append("  A sensor reports its version when it acks a command, and once")
         lines.append("  when it boots. Send 'fwinfo <id|^all>' to ask now.")
     return "\n".join(lines)
@@ -1844,7 +1860,27 @@ def handle_command(
                 quiet += 1
             elif state == NODE_UNHEARD:
                 unheard += 1
-            lines.append(f"  {node_id}  ⚠️ {note}" if note else f"  {node_id}")
+            # The id sits alone on its line, and anything else about the node goes
+            # on a continuation line beneath it. That is a wire format, not a
+            # layout choice: the app's parse_nodes_reply() keeps each line that
+            # starts with "!" *whole* and uses it as the node id, so a suffix on
+            # this line becomes part of the id. A flagged node's picker entry was
+            # literally "!79d4bb41  ⚠️ no readings in 2h", and every command
+            # aimed at it went to that string. The continuation line is dropped by
+            # the same parser (it does not start with "!"), so this reaches an
+            # unchanged app -- no APK rebuild, which is the point.
+            #
+            # The leading "·" also guarantees the continuation can never itself
+            # start with "!", which a node long-named "!foo" otherwise would.
+            lines.append(f"  {node_id}")
+            detail = []
+            label = _node_label(node_id, snap)
+            if label != _fmt_node(node_id):
+                detail.append(label)
+            if note:
+                detail.append(f"⚠️ {note}")
+            if detail:
+                lines.append(f"    · {'  '.join(detail)}")
         out = "Known field nodes:\n" + "\n".join(lines)
         if quiet or unheard:
             out += f"\n\n⚠️ {quiet + unheard} of {len(nodes)} need checking."

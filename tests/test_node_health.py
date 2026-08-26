@@ -117,10 +117,34 @@ def test_nodes_flags_stale_nodes_without_hiding_them():
     text, image = handle_command("nodes", nodes, _cfg())
     assert image is None
     assert "!live0001" in text and "!quiet001" in text      # neither is hidden
-    live_line = next(l for l in text.splitlines() if "!live0001" in l)
-    quiet_line = next(l for l in text.splitlines() if "!quiet001" in l)
-    assert "⚠️" not in live_line
-    assert "⚠️" in quiet_line
+
+    lines = text.splitlines()
+
+    # The id line carries the id and nothing else, for every node, flagged or not.
+    # This is the app's wire format, not a layout preference: parse_nodes_reply()
+    # keeps each "!"-prefixed line WHOLE and uses it as the node id, so a warning
+    # appended here became part of the id and every command aimed at that node
+    # went to "!quiet001  ⚠️ no readings in ...". Anything to say about a node
+    # goes on the continuation line beneath it, which that parser drops.
+    for node_id in ("!live0001", "!quiet001"):
+        id_line = next(l for l in lines if node_id in l)
+        assert id_line.strip() == node_id
+
+    # Flagged, not filtered: the quiet one still says so, on the continuation
+    # line belonging to it. Collected by walking from each id to the next one so
+    # the assertion does not depend on listing order, or on a node that has
+    # nothing to add emitting a continuation line at all.
+    def detail_for(node_id: str) -> str:
+        start = next(i for i, l in enumerate(lines) if l.strip() == node_id)
+        out = []
+        for line in lines[start + 1:]:
+            if line.strip().startswith("!") or not line.strip():
+                break
+            out.append(line)
+        return "\n".join(out)
+
+    assert "⚠️" in detail_for("!quiet001")
+    assert "⚠️" not in detail_for("!live0001")
     assert "1 of 2 need checking" in text
 
 
