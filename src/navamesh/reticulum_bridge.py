@@ -151,6 +151,26 @@ def _image_profile() -> dict:
     return profile
 
 
+# Default zoom for a view of a single node, on either render path: the
+# cached-farm one (`map <id>` on an in-cache node) and the node-centered one
+# (`_best_zoom()` with one point). Both express the same question -- "where
+# exactly is this node" -- and the scale that answers it is the one plain `map`
+# already lands on for a tight cluster, z18. Shared so the two paths cannot
+# drift apart again, which is how `map <id>` came to draw a wider view than
+# `map` did of the same nodes.
+#
+# CACHE_ZOOM_MIN/MAX cannot express this: they bound which zooms the offline
+# cache holds, so they can stop a view being too close but cannot ask for one.
+# Overridable per deployment as MAP_SINGLE_NODE_ZOOM -- see load_rns_config(),
+# which clamps it to what a tile server will actually serve.
+_SINGLE_NODE_ZOOM = 18
+
+# Highest zoom OSM-style tile servers serve; also the ceiling cache_tiles.py
+# will pre-download. Past it every tile request 404s and the map falls back to
+# text, so a typo in .env is clamped rather than silently costing the image.
+_MAX_SERVED_ZOOM = 19
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -188,6 +208,11 @@ class ReticulumBridgeConfig:
     authorized_farmer_hashes: Tuple[str, ...] = ()
     # How long to wait for a node's ack before reporting a timeout to the operator.
     cmd_ack_timeout_seconds: int = 120
+    # Zoom for a view of a single node -- `map <id>`, or plain `map` when only one
+    # node has a fix. Distinct from cache_zoom_min/max, which say which zooms the
+    # offline cache holds: those bound this, they cannot ask for it. Defaulted
+    # (rather than positional) so every existing construction keeps working.
+    map_single_node_zoom: int = _SINGLE_NODE_ZOOM
 
 
 def load_rns_config() -> ReticulumBridgeConfig:
@@ -224,6 +249,25 @@ def load_rns_config() -> ReticulumBridgeConfig:
             return int(v)
         except ValueError:
             return None
+
+    def _single_node_zoom() -> int:
+        """MAP_SINGLE_NODE_ZOOM, clamped to what a tile server will serve.
+
+        Out of range is clamped rather than refused: the cost of a bad value is
+        a map that silently arrives as text (every tile 404s), which reads as a
+        broken gateway rather than as a bad setting, and this is a knob someone
+        reaches for in the field with a demo waiting. The cached-farm path
+        clamps further, down to CACHE_ZOOM_MAX, since that path may only use
+        tiles that were pre-downloaded.
+        """
+        raw = _int("MAP_SINGLE_NODE_ZOOM", _SINGLE_NODE_ZOOM)
+        z = max(1, min(raw, _MAX_SERVED_ZOOM))
+        if z != raw:
+            logger.warning(
+                "MAP_SINGLE_NODE_ZOOM=%d is outside 1..%d — using z%d",
+                raw, _MAX_SERVED_ZOOM, z,
+            )
+        return z
 
     def _hash_list(name: str) -> Tuple[str, ...]:
         """
@@ -280,6 +324,7 @@ def load_rns_config() -> ReticulumBridgeConfig:
         pg_dsn=os.getenv("PG_DSN", ""),
         authorized_farmer_hashes=_hash_list("AUTHORIZED_FARMER_HASHES"),
         cmd_ack_timeout_seconds=_int("CMD_ACK_TIMEOUT_SECONDS", 120),
+        map_single_node_zoom=_single_node_zoom(),
     )
 
 
@@ -496,15 +541,6 @@ _MAP_LABEL_MAX = 12
 _PIN_RADIUS_PX = 9
 _PIN_HIGHLIGHT_RADIUS_PX = 13
 
-# Zoom for a view of a single node, on either render path: the cached-farm one
-# (`map <id>` on an in-cache node) and the node-centered one (`_best_zoom()` with
-# one point). Both express the same question -- "where exactly is this node" --
-# and the scale that answers it is the one plain `map` already lands on for a
-# tight cluster, z18. Shared so the two paths cannot drift apart again, which is
-# how `map <id>` came to draw a wider view than `map` did of the same nodes.
-# The cached path clamps it to the cache's top zoom; the fallback path does not
-# need to, since a tile server has every zoom.
-_SINGLE_NODE_ZOOM = 18
 
 
 def _map_pin_label(node_id: str, snap: Optional[NodeSnapshot] = None) -> str:
@@ -1082,15 +1118,15 @@ def _lonlat_to_pixel(lon, lat, center_lon, center_lat, zoom, w, h):
     return int((px - cx) * 256 + w / 2), int((py - cy) * 256 + h / 2)
 
 
-def _best_zoom(lats, lons, px: int) -> int:
+def _best_zoom(lats, lons, px: int, single_zoom: int = _SINGLE_NODE_ZOOM) -> int:
     if len(lats) < 2:
         # One point has no extent to fit, so the zoom is a straight choice about
         # how close to stand. It answers `map <id>` on the node-centered path --
         # the one taken whenever the node is outside the offline cache box, e.g.
-        # anywhere the kit is carried to -- so leaving it below _SINGLE_NODE_ZOOM
-        # reintroduced, on the fallback-tile path, the same "one node draws wider
-        # than all of them" gap that the cached path was fixed for.
-        return _SINGLE_NODE_ZOOM
+        # anywhere the kit is carried to -- so leaving it below the single-node
+        # zoom reintroduced, on the fallback-tile path, the same "one node draws
+        # wider than all of them" gap that the cached path was fixed for.
+        return single_zoom
     pad = 0.25
     def _merc_y(lat_d):
         r = math.radians(lat_d)
@@ -1499,7 +1535,7 @@ def render_map(
             # below against the same cache tile range, so this stays offline;
             # only the centre and the target zoom differ.
             center_lat, center_lon = highlighted.lat, highlighted.lon
-            desired_zoom = _SINGLE_NODE_ZOOM
+            desired_zoom = cfg.map_single_node_zoom
             if cfg.cache_zoom_max is not None:
                 desired_zoom = min(desired_zoom, cfg.cache_zoom_max)
         else:
@@ -1560,7 +1596,9 @@ def render_map(
         lats_list  = [s.lat for s in geo_nodes.values()]
         center_lon = (min(lons_list) + max(lons_list)) / 2
         center_lat = (min(lats_list) + max(lats_list)) / 2
-        zoom       = _best_zoom(lats_list, lons_list, render_size)
+        zoom       = _best_zoom(
+            lats_list, lons_list, render_size, cfg.map_single_node_zoom
+        )
 
     # Pin radii are in OUTPUT pixels and scaled into render space here, because
     # render_size is not a constant: the cache-containment search shrinks it
