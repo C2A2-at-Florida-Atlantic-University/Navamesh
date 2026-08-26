@@ -488,6 +488,24 @@ def _node_label(node_id: str, snap: Optional[NodeSnapshot] = None) -> str:
 # Image labels stay compact so they don't crowd the map or spill off the frame.
 _MAP_LABEL_MAX = 12
 
+# Map pin sizes, in pixels of the *delivered* image (max_dimension), not of the
+# internal render. See render_map() for why the distinction is load-bearing.
+# 9 px reproduces exactly what the all-nodes map has always drawn (radius 18 at
+# a 960 px render thumbnailed to 480), which is the size operators read the
+# bench maps at; the highlight is a deliberate step up from it, not a new scale.
+_PIN_RADIUS_PX = 9
+_PIN_HIGHLIGHT_RADIUS_PX = 13
+
+# Zoom for a view of a single node, on either render path: the cached-farm one
+# (`map <id>` on an in-cache node) and the node-centered one (`_best_zoom()` with
+# one point). Both express the same question -- "where exactly is this node" --
+# and the scale that answers it is the one plain `map` already lands on for a
+# tight cluster, z18. Shared so the two paths cannot drift apart again, which is
+# how `map <id>` came to draw a wider view than `map` did of the same nodes.
+# The cached path clamps it to the cache's top zoom; the fallback path does not
+# need to, since a tile server has every zoom.
+_SINGLE_NODE_ZOOM = 18
+
 
 def _map_pin_label(node_id: str, snap: Optional[NodeSnapshot] = None) -> str:
     """Short label for map-image pins: prefers short_name, truncates anything
@@ -1066,7 +1084,13 @@ def _lonlat_to_pixel(lon, lat, center_lon, center_lat, zoom, w, h):
 
 def _best_zoom(lats, lons, px: int) -> int:
     if len(lats) < 2:
-        return 17
+        # One point has no extent to fit, so the zoom is a straight choice about
+        # how close to stand. It answers `map <id>` on the node-centered path --
+        # the one taken whenever the node is outside the offline cache box, e.g.
+        # anywhere the kit is carried to -- so leaving it below _SINGLE_NODE_ZOOM
+        # reintroduced, on the fallback-tile path, the same "one node draws wider
+        # than all of them" gap that the cached path was fixed for.
+        return _SINGLE_NODE_ZOOM
     pad = 0.25
     def _merc_y(lat_d):
         r = math.radians(lat_d)
@@ -1192,6 +1216,7 @@ def _cached_view_choice(
     desired_zoom: int,
     desired_render_size: int,
     min_render_size: int = 480,
+    center: Optional[Tuple[float, float]] = None,
 ) -> Optional[Tuple[int, int, Tuple[int, int, int, int], Tuple[int, int, int, int]]]:
     """Pick a zoom/render-size pair whose viewport is fully inside cache tiles.
 
@@ -1199,10 +1224,19 @@ def _cached_view_choice(
     square viewport. If the first viewport spills outside the cache, try higher
     cached zooms and, if needed, shrink the internal render size instead of
     immediately falling back to text.
+
+    ``center`` is the (lat, lon) the viewport will actually be rendered around,
+    defaulting to the middle of ``bounds``. It has to be passed rather than
+    assumed: `map <id>` centres on the requested node, and containment must be
+    checked for the viewport that will really be drawn -- checking a
+    bounds-centred one would clear a render whose tiles sit somewhere else.
     """
     lat_min, lat_max, lon_min, lon_max = bounds
-    center_lon = (lon_min + lon_max) / 2
-    center_lat = (lat_min + lat_max) / 2
+    if center is not None:
+        center_lat, center_lon = center
+    else:
+        center_lon = (lon_min + lon_max) / 2
+        center_lat = (lat_min + lat_max) / 2
     min_zoom = cfg.cache_zoom_min if cfg.cache_zoom_min is not None else 14
     max_zoom = cfg.cache_zoom_max if cfg.cache_zoom_max is not None else desired_zoom
     min_zoom = min(min_zoom, max_zoom)
@@ -1427,14 +1461,17 @@ def render_map(
     bounds: Optional[Tuple[float, float, float, float]] = None,
     highlight_node_id: Optional[str] = None,
 ) -> Optional[Tuple[str, bytes, str]]:
-    """Render a node map to a JPEG. When ``bounds`` is given the map is locked to
-    that fixed cached-farm extent (center and zoom derived from the bounds, not
-    the nodes) and is rendered only if every required tile lives inside the
-    offline cache — the cache is the authority, node placement secondary. When
-    ``bounds`` is None the legacy node-centered behavior is preserved.
+    """Render a node map to a JPEG. When ``bounds`` is given the render is
+    constrained to the offline cache — it happens only if every tile the viewport
+    needs lives inside the cached tile range, the cache being the authority and
+    node placement secondary. Within that constraint the extent depends on what
+    was asked for: with ``highlight_node_id`` set the view centres on that node
+    and zooms in (`map <id>` asks where one node is), otherwise it falls back to
+    the fixed cached-farm extent derived from the bounds. When ``bounds`` is None
+    the legacy node-centered behavior is preserved.
 
-    ``highlight_node_id`` draws that node's marker larger so a requested node
-    stands out. Returns None (so callers fall back to text) on any failure,
+    ``highlight_node_id`` also draws that node's marker larger so a requested
+    node stands out. Returns None (so callers fall back to text) on any failure,
     including missing/uncached tiles."""
     if not MAP_AVAILABLE:
         return None
@@ -1450,19 +1487,37 @@ def render_map(
     render_size = max(max_dimension * 2, 480)
 
     if bounds is not None:
-        # Fixed cached-farm extent — center/zoom come from the bounds, never the
-        # nodes, so a single requested node can't recenter or over-zoom the map.
         lat_min, lat_max, lon_min, lon_max = bounds
-        center_lon = (lon_min + lon_max) / 2
-        center_lat = (lat_min + lat_max) / 2
-        desired_zoom = _best_zoom([lat_min, lat_max], [lon_min, lon_max], render_size)
+        highlighted = geo_nodes.get(highlight_node_id) if highlight_node_id else None
+        if highlighted is not None:
+            # A node was explicitly asked for, so centre on it and zoom in. The
+            # extent used to be locked to the whole cached farm box for every
+            # bounded render, which guaranteed cached tiles but answered
+            # "where exactly is this node" with a z16 view of the entire farm --
+            # wider than plain `map` draws for the same nodes, and the one case
+            # where a wide view is least useful. Containment is still enforced
+            # below against the same cache tile range, so this stays offline;
+            # only the centre and the target zoom differ.
+            center_lat, center_lon = highlighted.lat, highlighted.lon
+            desired_zoom = _SINGLE_NODE_ZOOM
+            if cfg.cache_zoom_max is not None:
+                desired_zoom = min(desired_zoom, cfg.cache_zoom_max)
+        else:
+            # Fixed cached-farm extent — centre/zoom come from the bounds, never
+            # the nodes, so an unhighlighted bounded render can't be recentred or
+            # over-zoomed by wherever the nodes happen to sit.
+            center_lon = (lon_min + lon_max) / 2
+            center_lat = (lat_min + lat_max) / 2
+            desired_zoom = _best_zoom([lat_min, lat_max], [lon_min, lon_max], render_size)
 
         # Tile-range containment gate: refuse to render if the square viewport
         # needs any tile outside the cached tile range (catches the padding /
         # square-aspect spill that lat/lon bounds alone don't cover). If the
         # first choice spills, try cached zooms/smaller internal render sizes
         # before falling back to text.
-        choice = _cached_view_choice(bounds, cfg, desired_zoom, render_size)
+        choice = _cached_view_choice(
+            bounds, cfg, desired_zoom, render_size, center=(center_lat, center_lon)
+        )
         if choice is None:
             fallback_zoom = desired_zoom
             if cfg.cache_zoom_max is not None:
@@ -1507,10 +1562,27 @@ def render_map(
         center_lat = (min(lats_list) + max(lats_list)) / 2
         zoom       = _best_zoom(lats_list, lons_list, render_size)
 
+    # Pin radii are in OUTPUT pixels and scaled into render space here, because
+    # render_size is not a constant: the cache-containment search shrinks it
+    # (576 for a fixed-extent render, 960 for a node-centered one) and the image
+    # is thumbnailed to max_dimension at the very end. A radius handed straight
+    # to StaticMap is therefore in whichever render space happened to be chosen,
+    # so the same nominal value came out ~2.4x larger on `map <id>` than on
+    # `map` -- a ~56 m blob rather than a ~10 m dot, which hides the very
+    # position the farmer asked for. Scaling by render_size/max_dimension makes
+    # the pin the same size on screen no matter which path rendered it.
+    pin_scale = render_size / max_dimension if max_dimension else 1.0
+    pin_radii = {
+        node_id: max(3, round((_PIN_HIGHLIGHT_RADIUS_PX if node_id == highlight_node_id
+                               else _PIN_RADIUS_PX) * pin_scale))
+        for node_id in geo_nodes
+    }
+
     smap = StaticMap(render_size, render_size, url_template=tile_url)
     for node_id, snap in geo_nodes.items():
-        radius = 26 if node_id == highlight_node_id else 18
-        smap.add_marker(CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), radius))
+        smap.add_marker(
+            CircleMarker((snap.lon, snap.lat), _pin_color(snap, cfg), pin_radii[node_id])
+        )
 
     try:
         if bounds is not None:
@@ -1529,11 +1601,13 @@ def render_map(
     except TypeError:
         font = ImageFont.load_default()
 
-    pin_r  = 18
     margin = max(14, render_size // 80)
 
     # Pixel center + collision box for every pin, so labels can avoid covering
-    # pins other than the one they belong to.
+    # pins other than the one they belong to. The box uses each pin's own radius:
+    # this was a fixed 18 while the drawn radius was already 18-or-26 and is now
+    # render-scale dependent, so a highlighted or shrunk pin had a collision box
+    # that did not match the circle and labels were placed over it.
     pin_centers: Dict[str, Tuple[int, int]] = {}
     pin_boxes: Dict[str, Tuple[int, int, int, int]] = {}
     for node_id, snap in geo_nodes.items():
@@ -1541,6 +1615,7 @@ def render_map(
             snap.lon, snap.lat, center_lon, center_lat,
             zoom, render_size, render_size,
         )
+        pin_r = pin_radii[node_id]
         pin_centers[node_id] = (px, py)
         pin_boxes[node_id] = (px - pin_r, py - pin_r, px + pin_r, py + pin_r)
 
@@ -1561,6 +1636,10 @@ def render_map(
 
     for node_id, snap in geo_nodes.items():
         px, py = pin_centers[node_id]
+        # This node's own radius: label distance is measured from the edge of the
+        # circle it belongs to, so a highlighted pin pushes its label out further
+        # rather than having it land on top of itself.
+        pin_r = pin_radii[node_id]
         soil_str, bat_str = _label_values(snap)
         id_text = _map_pin_label(node_id, snap)
 
