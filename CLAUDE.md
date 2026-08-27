@@ -107,8 +107,23 @@ would actually happen to.
 how: without `rns/lxmf/staticmap/dotenv`, every bridge test module skips at collection
 and the summary still said "passed". `tests/conftest.py` now ends any such run with a
 section naming what did not execute, and `NAVAMESH_REQUIRE_FULL_TESTS=1` makes it a
-failed run — set that in CI and before shipping to a Pi. A correct run is **296 passed,
-0 skipped**.
+failed run — set that in CI and before shipping to a Pi. A correct run is **356 passed,
+0 skipped** (2026-08-26; it was 296 when this was written, so trust "0 skipped" over the
+count).
+
+**There is no pytest on `devpi` — not anywhere.** Not in `~/Navamesh/.venv`, not in the
+system python, not in the `navamesh-*` images. The stale `~/Navamesh/.pytest_cache` makes
+it look otherwise. Installing it on the host does not help either: the suite needs
+`rns`/`lxmf`/`staticmap`/`dotenv`, which exist only inside the images. Run it in a
+throwaway container off an already-built image, with the repo mounted:
+
+```bash
+cd ~/Navamesh && docker run --rm --network host --env-file .env \
+  -v /home/tj/Navamesh:/repo -w /repo navamesh-reticulum \
+  sh -c "pip install -q pytest; NAVAMESH_REQUIRE_FULL_TESTS=1 python3 -m pytest -q"
+```
+
+`--rm` throws the pytest install away, so nothing on the Pi is mutated.
 
 Note `reticulum_bridge` raises **`SystemExit`**, not `ImportError`, when its deps are
 missing, and pytest does not treat a SystemExit during collection as a collection error.
@@ -213,7 +228,73 @@ and what closing them would take — not a bullet list of tasks. Match that shap
 
 ## Recent work (Aug 2026)
 
-Ends at: app **1.9.18** (unchanged), Pi `51cb0f5`, firmware `cff0bd52f`.
+Ends at: app **1.9.23**, Pi `eefb8e2`, firmware `2133f6a42` (fleet flashed with
+`7d66535` / `2.7.20.7d66535`).
+
+**`main` and `raw-adc-private-app` are level again** for this repo and the app, as of
+2026-08-26 — both fast-forwarded, nothing divergent. That was the long-standing
+precondition for `spirit-farm-pi` (which is on `main`) to pull any of this. The firmware
+stays on its fork branch.
+
+### 2026-08-26 — a demo bench, and three silent failures found by measuring
+
+The dev Pi was cut down to two nodes for a conference demo: **`!061d8b62` = Node A**,
+**`!79d4bb41` = Node B**. Everything below was verified on that bench.
+
+**Clearing a node out of the database means clearing its retained MQTT topics too.**
+Deleting the `mesh_nodes` rows alone does nothing lasting: the ingestor replays every
+retained `farm/nodes/<id>/*` and `farm/sensors/soil/<id>/*` topic on its next connect and
+puts the rows straight back. Order that works: stop the ingestor, publish an empty
+retained message to each of that node's topics, delete the rows, restart, confirm they
+stay gone. `command_log` was deliberately left alone — it is invisible to the app, and it
+is where `_next_cmd_id()` reads its replay-guard floor.
+
+**`map <id>` drew a *wider* view than `map` did of the same nodes**, with a pin big
+enough to hide the answer: measured 1233 m across with a 111 m pin, against 514 m and a
+19 m pin for plain `map`. Two independent causes, either alone enough. The extent was
+locked to the whole cached farm box for any bounded render, and the only command that
+renders bounded-with-highlight is `map <id>` — so the guard applied exclusively to the one
+case where a farm-wide view is useless. And pin radii went to StaticMap in *render-space*
+pixels while `render_size` is not constant (576 for a fixed-extent render, 960 for a
+node-centered one) before being thumbnailed to `max_dimension`, so the same nominal radius
+came out ~2.4x larger on one path. Radii are now in delivered pixels and scaled by
+`render_size/max_dimension`; 9 px reproduces exactly what `map` always drew, so that
+output is unchanged. `_best_zoom()` returning 17 for a single point put the same gap back
+on the node-centered path (the one taken outside the cache box, i.e. anywhere the kit is
+carried), so both paths now share `MAP_SINGLE_NODE_ZOOM`.
+
+**`MAP_SINGLE_NODE_ZOOM`** (default 18) is new in `.env`. `CACHE_ZOOM_MIN/MAX` could not
+express this: they say which zooms the offline cache *holds*, so they bound the view but
+cannot ask for one. It applies on `docker compose up -d reticulum` with no rebuild, which
+is the point — it is a knob for someone standing in a field. Out of range clamps to 1..19
+with a warning rather than being refused, because past 19 every tile 404s and the map
+arrives as text, which reads as a broken gateway rather than a bad setting.
+
+**Every text reply said "Node bb41" while the names sat in the database.** `_fmt_node()`
+takes a node id and nothing else, so it could only ever render hex — and `fmt_status`,
+`fmt_soil`, `fmt_battery`, `fmt_position`, `fmt_link` and `fmt_firmware` all called it
+while holding the `NodeSnapshot` that had the name in it. They call `_node_label(node_id,
+snap)` now. That helper also prefers the **long** name where it used to prefer
+`display_name`; the ingestor sets `display_name = short_name or long_name`, so preferring
+it meant the short name whenever one existed, and a farmer who named a sensor "North
+Field" got "NF01". Map pins still take the short name and still truncate — a pin has a map
+to share, a line of text has room. One test pins both directions.
+
+**The `nodes` reply is a wire format, not a layout.** The app's `parse_nodes_reply()`
+keeps each line starting with `!` **whole** and uses it as the node id, so the health flag
+appended to that line became part of the id: a stale node's picker entry was literally
+`!79d4bb41  ⚠️ no readings in 2h`, and every command aimed at it went to that string. The
+id now sits alone on its line and everything else goes on a `·` continuation line beneath,
+which that parser drops. The `·` also guarantees the continuation can never be mistaken
+for an id line, including for a node whose long name begins with `!`. Verified against the
+app's own parser, flagged and unflagged. **An unchanged app fixes itself when the Pi is
+deployed — no APK rebuild.**
+
+**Still open: `processors/position.py` throws away `precisionBits`.** The node transmits
+it on every position packet and nothing stores it, which is why a position blurred to a
+~5.8 km grid by a channel's `position_precision` was indistinguishable from "setloc never
+applied" — see the firmware repo's `CLAUDE.md` for the full diagnosis. Storing it and
+warning when it is below 32 would turn an invisible 3 km error into a sentence.
 
 ### 2026-08-23 — silent-failure sweep, all verified on the dev Pi
 
@@ -273,10 +354,17 @@ field data. Read it for context freely; change nothing on it without saying so f
 
 `spirit-farm-pi` is on branch **`main`** and has **native Postgres and InfluxDB** under
 systemd rather than containers — deliberate, so a second farm's Pi keeps its own data.
-Its cloud writes are always on. The plan is to merge `raw-adc-private-app` into `main`
-for `Navamesh` and `navamesh-sideband-wrapper` once testing is done, then pull on that Pi;
-the firmware stays on its fork branch. The schema changes here are `ON CONFLICT` clauses
-and metadata keys, so no migration is needed.
+Its cloud writes are always on. **The merge that was planned here happened on 2026-08-26**:
+`raw-adc-private-app` was fast-forwarded into `main` for both `Navamesh` and
+`navamesh-sideband-wrapper` and pushed, so that Pi can now pull `main` and get everything.
+The firmware stays on its fork branch. The schema changes are `ON CONFLICT` clauses and
+metadata keys, so no migration is needed.
+
+Two things to remember when deploying there, both of which make it unlike `devpi`:
+its services are **systemd, not containers**, so deploying is a service restart rather
+than `docker compose build`; and its update path is `/home/pi/navamesh-updates` (not
+`/home/tj/...`), which was still serving **1.9.8** as of 2026-08-23 against the app's
+current 1.9.23.
 
 ### Verified end to end on the bench, 2026-08-23
 
