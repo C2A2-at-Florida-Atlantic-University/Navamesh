@@ -376,12 +376,8 @@ restart. Its update path is `/home/pi/navamesh-updates`, not `/home/tj/...`.
 - **All 18 nodes report no `firmware_version` at all**, i.e. none has ever acked a command:
   they predate the NavameshCommand module. `setloc` and every other write verb will simply
   time out on that fleet until it is reflashed. Plan around it.
-- **Their coordinates were therefore written straight into `mesh_nodes`** (lat/lon plus
-  PostGIS `geom`), from a surveyed list, matched on `long_name` so a wrong id could not
-  silently mis-place a sensor. That is safe to do precisely because these nodes never send
-  position: the upsert only touches `lat`/`lon`/`geom` on a packet that carries
-  coordinates, so battery/link/info traffic leaves them alone. Once the fleet is reflashed,
-  prefer `setloc` — it puts the position on the node, where it belongs.
+- **Their surveyed coordinates were therefore injected as retained `position` topics** —
+  see the subsection below, which is the part to read before touching positions on that Pi.
 - All 18 sit inside the farm `CACHE_*` box with z14-19 tiles present, so maps render fully
   offline. Confirmed: `map` plots 18, `map <id>` plots 1 at the same scale.
 - **`soil_last_ts` and `soil_raw` are NULL for the whole fleet**, so `classify_node_health()`
@@ -393,8 +389,75 @@ restart. Its update path is `/home/pi/navamesh-updates`, not `/home/tj/...`.
 - Its `/home/pi/Navamesh` working tree carries ~22 untracked junk files (`[bridge]`,
   `exporting`, `transferring`, influx tarballs, an `mqtt_to_db.py.bak`) from a word-split
   build command. Harmless, and none collide with tracked files, so pulls are unaffected.
+- **Open: the cloud table has four rows the Pi no longer feeds.** `mesh_nodes_farm2` holds
+  22 rows against the farm's 18 — `unknown`, `!da6338b4`, `!6c730dac`, `!04b595ed`, all
+  last seen 13-19 Aug, and three of them *with* coordinates. All four are in the farm's
+  `IGNORED_NODES`, so the Pi stopped writing them and the rows simply persist; the local
+  table is clean. Anything reading `mesh_nodes_farm2` directly — the public site — still
+  sees them. Deleting them is a write to Azure that affects nextg-ag.org, so ask first.
 - To close the open question above: that Pi **has** `/dev/rtc0` and NTP is active and
   synchronized, so the backwards-clock `cmd_id` trap does not apply to it.
+
+#### Positions on `spirit-farm-pi` are injected, not measured — and the timestamp is a trap
+
+**This subsection is about `spirit-farm-pi` only.** `devpi`'s nodes take a real `setloc`;
+do not carry any of this over to the bench.
+
+None of that fleet's 18 nodes has a GPS or firmware that answers `setloc`, so on
+**2026-08-27** the deployment team's surveyed coordinates were injected as **retained
+`farm/nodes/<id>/position` messages**, one per node, and the ingestor picked them up as if
+they had arrived over the air.
+
+Retained MQTT rather than `UPDATE mesh_nodes`, and the difference is not cosmetic. A direct
+SQL write reaches the local table and **nothing else**: the cloud writer is fed by this
+process's in-memory `NodeState`, not by reading the table back, and it shares the
+`has_coords = state.lat is not None` gate — so a node that never transmits a position keeps
+NULL coordinates in `mesh_nodes_farm2` on Azure forever, and `Navamesh-Cloud` never sees
+them. Coordinates were written directly first and the cloud did stay empty; publishing the
+same values as retained topics filled local Postgres, the cloud table and both InfluxDBs in
+one pass, and survives an ingestor restart because the broker replays them. Verified: 36
+upserts logged `coords=True`, sync queue and dead-letter both 0.
+
+Node ids were resolved from `metadata->>'long_name'` rather than typed in, so a
+transcription slip could mis-name a node but never mis-*place* one.
+
+**A real `setloc` overrides all of this once the fleet is reflashed** — verified through all
+four layers, not assumed:
+
+| layer | why the real one wins |
+|---|---|
+| `extract_position()` | stamps `ts = int(time.time())`, the **Pi's receipt time**, not the node's clock — so any later packet is newer by construction |
+| broker | `_bridge.py` publishes positions `retain=True` on the **same topic**, so a real one replaces the injected message rather than coexisting |
+| `apply_payload()` | rejects only `ts < applied_ts["position"]` |
+| the upsert | `fresh = "EXCLUDED.last_seen >= {table}.last_seen"` — note `>=`, so even an equal timestamp still rewrites `lat`/`lon`/`geom` |
+
+So nothing needs cleaning up later: flash the fleet, `setloc` whatever moved, done.
+
+**NEVER stamp a position with a future `ts`.** It is the one input that turns both guards
+against you, permanently and silently — exactly the frozen-position failure this repo has
+warned about since 2026-08-23. A future `ts` lands in `state.applied_ts["position"]`, so
+every genuine position afterwards is *older* and is dropped; it also flows into
+`last_seen` via `max()` and then `GREATEST()` in SQL, which means `last_seen` can never come
+back down on its own. And because `fresh` gates `metadata` as well as the coordinates, the
+node stops recording battery, voltage, link and soil too — it reads as a dead sensor that is
+plainly still transmitting. Stamp `date +%s` and assert it is not ahead of now.
+
+The tell, in `docker logs navamesh_ingestor`:
+
+```
+Ignoring stale position for !xxxxxxxx: packet ts <real> is older than applied ts <future>
+```
+
+If it has already happened, all four steps are needed and **step 3 is the one people miss** —
+without it the poisoned `last_seen` keeps `fresh` false no matter what else is fixed:
+
+1. Clear the retained topic, or it re-poisons on the next ingestor start:
+   `mosquitto_pub -h 127.0.0.1 -t "farm/nodes/<id>/position" -r -n`
+2. Restart the ingestor so the in-memory `applied_ts` is rebuilt from what is left.
+3. Repair the row — `last_seen` back to something sane, and `lat`/`lon`/`geom` to the
+   correct value or NULL:
+   `UPDATE mesh_nodes SET last_seen = now(), lat = ..., lon = ..., geom = ST_SetSRID(ST_MakePoint(lon, lat), 4326) WHERE node_id = '<id>';`
+4. Do the same on `mesh_nodes_farm2` in the cloud if the bad write propagated — it will have.
 
 ### Verified end to end on the bench, 2026-08-23
 
