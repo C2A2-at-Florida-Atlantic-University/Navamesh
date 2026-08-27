@@ -15,13 +15,19 @@ bites. Read the one for whichever you are touching; this file is only the map be
 | `Navamesh` | the Pi: gateway, ingest, map, farmer replies | this file's repo |
 | `navamesh-sideband-wrapper` | the Android app (a Sideband fork) | `CLAUDE.md` in that repo |
 | `meshtastic-soil-sensor` | the node firmware (a Meshtastic fork) | `CLAUDE.md` in that repo |
-| `Navamesh-Cloud` | the public site, nextg-ag.org (Flask + frontend) | — |
+| `Navamesh-Cloud` | the public site, nextg-ag.org (Flask + frontend) | `CLAUDE.md` in that repo |
 
-**`Navamesh-Cloud` is a fourth consumer that is easy to forget.** It reads this Pi's
-Postgres directly, on branch `main` rather than `raw-adc-private-app`, and it is not part
-of the mesh path below — which is exactly why a farmer-facing change here can leave it
-contradicting the app. It currently still shows soil as a percentage while the app and map
-show DRY/DAMP/WET; see `TODO.md`. Check it whenever you change what a reading *means*.
+**`Navamesh-Cloud` is a fourth consumer that is easy to forget.** It reads the **cloud**
+Postgres (`mesh_nodes_farm2` on Azure), not this Pi's, on branch `main` rather than
+`raw-adc-private-app`, and it is not part of the mesh path below — which is exactly why a
+farmer-facing change here can leave it contradicting the app. It no longer prints a
+percentage (closed 2026-08-26): it derives DRY/DAMP/WET like everything else, falling back
+to the legacy percentage only to classify it, and marks that case `uncal.`. Two consequences
+worth carrying: **nothing written straight into this Pi's Postgres reaches it** — the cloud
+writer is fed by the ingestor's in-memory state, not by reading the local table back — and
+it has **no equivalent of the map's outlier guard**, so a stray public-channel node with a
+GPS fix becomes a pin on the public site. Its own `CLAUDE.md` has the detail. Check it
+whenever you change what a reading *means*.
 
 **Local directory names vary by machine and do not match the GitHub names everywhere** —
 one machine has them flat under a parent (`Navamesh-Dev/`), another nests the firmware
