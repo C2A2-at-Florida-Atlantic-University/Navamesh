@@ -249,6 +249,29 @@ class NodeState:
     # wrong role, or with a dead probe, keeps producing the others indefinitely.
     SOIL_KINDS = ("soil_raw", "soil_percent", "soil_band")
 
+    # Battery arrives either bundled in a sensor reading or on its own from
+    # TELEMETRY_APP, so it needs its own stamp for the same reason soil does:
+    # last_seen moves on a NodeInfo beacon, which says nothing about whether the
+    # battery figure beside it was measured minutes or days ago.
+    BATTERY_KINDS = ("battery",)
+
+    def _last_ts_of(self, kinds) -> Optional[int]:
+        stamps = [self.applied_ts[k] for k in kinds if k in self.applied_ts]
+        return max(stamps) if stamps else None
+
+    def battery_last_ts(self) -> Optional[int]:
+        """When this node last reported a battery level, or None if it never has.
+
+        The counterpart to soil_last_ts, and needed for the same reason. On the
+        legacy text firmware battery rides the same message as soil, so the two
+        move together and a reader could get away with conflating them; on the
+        raw-ADC firmware, and on any node sending device telemetry, they do not.
+        Storing it here rather than deriving it downstream means every consumer
+        of every gateway gets a dateable battery reading -- the alternative was
+        each one reaching into its own time series and inventing an answer.
+        """
+        return self._last_ts_of(self.BATTERY_KINDS)
+
     def soil_last_ts(self) -> Optional[int]:
         """When this node last sent a soil reading, or None if it never has.
 
@@ -258,8 +281,7 @@ class NodeState:
         the two timestamps drifting apart is the signature of that failure and of
         a dead probe. Nothing else in the system could tell them apart.
         """
-        stamps = [self.applied_ts[k] for k in self.SOIL_KINDS if k in self.applied_ts]
-        return max(stamps) if stamps else None
+        return self._last_ts_of(self.SOIL_KINDS)
 
     def metadata(self, location_name: str, node_type: str) -> Dict[str, Any]:
         return {
@@ -289,8 +311,11 @@ class NodeState:
             "display_name": self.display_name,
             "firmware_version": self.firmware_version,
             "last_packet_ts": self.last_seen_ts,
-            # The fact that makes "present but never reporting" detectable at all.
+            # The pair that makes "present but never reporting" detectable at all,
+            # and that lets a consumer date each figure rather than assuming the
+            # newest packet vouches for all of them.
             "soil_last_ts": self.soil_last_ts(),
+            "battery_last_ts": self.battery_last_ts(),
         }
 
 
@@ -719,6 +744,34 @@ class PostgresWriter:
                 logger.info("PostGIS not available, geom column skipped: %s", e)
                 self._postgis = False
 
+    # The keys whose stored value must survive an incoming null. A restart
+    # empties the in-memory applied_ts these are derived from; retained MQTT
+    # refills it within seconds, but a live battery or link packet arriving first
+    # would write a null over a perfectly good stored value in the meantime --
+    # briefly wrong, then self-healing, which is the failure shape that is hardest
+    # to ever catch in the act.
+    CARRIED_METADATA_KEYS = ("soil_last_ts", "battery_last_ts")
+
+    def _metadata_carry_forward_sql(self) -> str:
+        """The ON CONFLICT metadata expression, built from one list of keys.
+
+        Extracted rather than inlined for two reasons: it is asserted directly by
+        a test, and generating it from CARRIED_METADATA_KEYS means a third stamp
+        added to NodeState.metadata() cannot be quietly left uncarried.
+
+        NULLIF is load-bearing. `->` on a JSON null yields the jsonb literal
+        'null', which is not SQL NULL, so COALESCE would happily choose it and the
+        carry-forward would do nothing at all. Verified against the real schema
+        rather than by reading it.
+        """
+        table = self._table_name
+        pairs = ", ".join(
+            f"'{key}', COALESCE(NULLIF(EXCLUDED.metadata->'{key}', 'null'::jsonb), "
+            f"{table}.metadata->'{key}')"
+            for key in self.CARRIED_METADATA_KEYS
+        )
+        return f"EXCLUDED.metadata || jsonb_build_object({pairs})"
+
     def upsert_node(self, state: NodeState, location_name: str, node_type: str) -> None:
         if self._conn is None:
             if not self._try_reconnect():
@@ -743,11 +796,7 @@ class PostgresWriter:
         # NULLIF is load-bearing: `->` on a JSON null yields the jsonb literal
         # 'null', which is not SQL NULL, so COALESCE would happily choose it and the
         # carry-forward would silently do nothing. Verified against the real schema.
-        metadata_expr = (
-            f"EXCLUDED.metadata || jsonb_build_object('soil_last_ts', "
-            f"COALESCE(NULLIF(EXCLUDED.metadata->'soil_last_ts', 'null'::jsonb), "
-            f"{table}.metadata->'soil_last_ts'))"
-        )
+        metadata_expr = self._metadata_carry_forward_sql()
 
         try:
             with self._conn.cursor() as cur:

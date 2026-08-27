@@ -242,3 +242,68 @@ def test_write_outputs_uses_the_timestamp_apply_payload_recorded_for_that_kind()
     assert calls == [("soil", AUG_22)], (
         "the battery reading must be stamped 2026-08-22, not dragged to 2026-08-26"
     )
+
+
+# ── battery_last_ts: the same guarantee soil_last_ts gives, for battery ──────
+#
+# Stored on the gateway rather than derived by each consumer, so that any Pi
+# running this project dates its battery readings the same way. Deriving it
+# downstream meant every reader reaching into its own time series and reaching
+# its own conclusion -- and a reader with no time series (the farmer's app)
+# having no way to tell a fresh 91% from a five-day-old one at all.
+
+def test_battery_last_ts_tracks_battery_not_any_packet():
+    ing = _bare_ingestor()
+    state = NodeState(node_id="!045de249")
+
+    ing.apply_payload(state, "battery", {"ts": AUG_22, "batteryLevel": 91.0})
+    assert state.battery_last_ts() == AUG_22
+
+    # A NodeInfo beacon four days later moves recency and must not move this.
+    ing.apply_payload(state, "info", {"ts": AUG_26, "longName": "Node F"})
+    ing.apply_payload(state, "link", {"ts": AUG_26, "rxRssi": -73, "rxSnr": 6.0})
+    assert state.last_seen_ts == AUG_26
+    assert state.battery_last_ts() == AUG_22, (
+        "a beacon says the radio was heard, never that the battery was measured"
+    )
+
+
+def test_battery_and_soil_stamps_are_independent():
+    """On the legacy text firmware both ride one message, so conflating them
+    looks harmless. On raw-ADC firmware, and on any node sending device
+    telemetry, they diverge -- which is when a single stamp starts lying."""
+    ing = _bare_ingestor()
+    state = NodeState(node_id="!045de249")
+    ing.apply_payload(state, "soil_percent", {"ts": AUG_22, "value": 100})
+    ing.apply_payload(state, "battery", {"ts": AUG_26, "batteryLevel": 91.0})
+    assert state.soil_last_ts() == AUG_22
+    assert state.battery_last_ts() == AUG_26
+
+
+def test_never_reported_stays_none_rather_than_becoming_now():
+    state = NodeState(node_id="!045de249")
+    assert state.battery_last_ts() is None
+    assert state.soil_last_ts() is None
+
+
+def test_metadata_publishes_both_stamps():
+    ing = _bare_ingestor()
+    state = NodeState(node_id="!045de249")
+    ing.apply_payload(state, "battery", {"ts": AUG_22, "batteryLevel": 91.0})
+    md = state.metadata("Spirit Farm", "sensor")
+    assert md["battery_last_ts"] == AUG_22
+    assert md["soil_last_ts"] is None
+
+
+def test_both_stamps_are_carried_forward_by_the_upsert():
+    """A restart empties applied_ts, so a live link packet arriving before the
+    retained battery topic is replayed would otherwise write a null over a good
+    stored value. Both keys must appear in the carry-forward, and NULLIF must be
+    there too -- `->` on a JSON null yields the jsonb literal 'null', which
+    COALESCE happily selects, silently doing nothing."""
+    w = PostgresWriter.__new__(PostgresWriter)
+    w._table_name = "mesh_nodes"
+    sql = w._metadata_carry_forward_sql()
+    for key in ("soil_last_ts", "battery_last_ts"):
+        assert f"'{key}'" in sql
+        assert f"NULLIF(EXCLUDED.metadata->'{key}'" in sql
