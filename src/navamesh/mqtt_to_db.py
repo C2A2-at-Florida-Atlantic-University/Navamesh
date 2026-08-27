@@ -294,9 +294,15 @@ class NodeState:
         }
 
 
-def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "") -> dict:
+def _state_to_dict(state: NodeState, location_name: str = "", node_type: str = "",
+                   point_ts: Optional[int] = None) -> dict:
     return {
         "node_id": state.node_id,
+        # The timestamp of the packet this row came from, kept separate from
+        # last_seen_ts so a queued write flushed hours later is still stamped
+        # with when the reading was taken. Absent in rows queued by an older
+        # build, which is why every reader treats it as optional.
+        "point_ts": point_ts,
         "last_seen_ts": state.last_seen_ts,
         "lat": state.lat,
         "lon": state.lon,
@@ -801,6 +807,33 @@ class PostgresWriter:
             self._conn = None
 
 
+def _point_time(state: "NodeState", point_ts: Optional[int]) -> datetime:
+    """When to stamp an InfluxDB point.
+
+    `point_ts` is the timestamp of the packet that caused this write, and it is
+    the correct answer. `state.last_seen_ts` is the newest timestamp seen from
+    this node in ANY payload kind, which is a different thing entirely -- and
+    using it re-dates old readings to the present.
+
+    That is not hypothetical. Retained MQTT topics are replayed to the ingestor
+    on every reconnect, carrying their own original timestamps. Meanwhile link
+    packets keep arriving and keep pushing `last_seen_ts` forward. So on
+    2026-08-26 a reconnect replayed `farm/nodes/<id>/battery` topics whose
+    readings were taken on 2026-08-22, and because `last_seen_ts` was by then
+    current, six Spirit Farm nodes had four-day-old battery levels written into
+    InfluxDB stamped 2026-08-26 -- appearing on the public site as fresh
+    measurements. The values were real; only their dates were invented.
+
+    Falls back to `last_seen_ts` and then to now when no packet timestamp is
+    supplied, so a caller that does not know one still writes something rather
+    than failing -- but every caller inside this module does know one.
+    """
+    ts = point_ts if point_ts is not None else state.last_seen_ts
+    if ts is None:
+        ts = int(datetime.now(tz=timezone.utc).timestamp())
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
 class InfluxWriter:
     def __init__(self, url: str, token: str, org: str, bucket: str):
         self._url = url
@@ -832,13 +865,10 @@ class InfluxWriter:
         self._write_api = self._client.write_api(write_options=SYNCHRONOUS)
         logger.info("Connected to InfluxDB.")
 
-    def write_soil(self, state: NodeState) -> None:
+    def write_soil(self, state: NodeState, point_ts: Optional[int] = None) -> None:
         if self._write_api is None:
             return
-        ts = datetime.fromtimestamp(
-            state.last_seen_ts or int(datetime.now(tz=timezone.utc).timestamp()),
-            tz=timezone.utc,
-        )
+        ts = _point_time(state, point_ts)
         point = Point("soil_moisture").tag("node_id", state.node_id)
         if state.soil_raw is not None:
             point = point.field("raw", float(state.soil_raw))
@@ -862,16 +892,13 @@ class InfluxWriter:
         self._write_api.write(bucket=self._bucket, org=self._org, record=point)
         logger.info("Wrote InfluxDB soil point for %s.", state.node_id)
 
-    def write_link(self, state: NodeState) -> None:
+    def write_link(self, state: NodeState, point_ts: Optional[int] = None) -> None:
         """Write RSSI/SNR link quality as a time-series measurement."""
         if self._write_api is None:
             return
         if state.rx_rssi is None and state.rx_snr is None:
             return
-        ts = datetime.fromtimestamp(
-            state.last_seen_ts or int(datetime.now(tz=timezone.utc).timestamp()),
-            tz=timezone.utc,
-        )
+        ts = _point_time(state, point_ts)
         point = Point("link_quality").tag("node_id", state.node_id)
         if state.rx_rssi is not None:
             point = point.field("rssi", float(state.rx_rssi))
@@ -881,16 +908,13 @@ class InfluxWriter:
         self._write_api.write(bucket=self._bucket, org=self._org, record=point)
         logger.info("Wrote InfluxDB link point for %s (rssi=%s snr=%s).", state.node_id, state.rx_rssi, state.rx_snr)
 
-    def write_position(self, state: NodeState) -> None:
+    def write_position(self, state: NodeState, point_ts: Optional[int] = None) -> None:
         """Write GPS position as a time-series measurement."""
         if self._write_api is None:
             return
         if state.lat is None or state.lon is None:
             return
-        ts = datetime.fromtimestamp(
-            state.last_seen_ts or int(datetime.now(tz=timezone.utc).timestamp()),
-            tz=timezone.utc,
-        )
+        ts = _point_time(state, point_ts)
         point = Point("position").tag("node_id", state.node_id)
         point = point.field("lat", float(state.lat))
         point = point.field("lon", float(state.lon))
@@ -979,12 +1003,13 @@ class CloudSyncWorker:
                     # unconnected writer as a transient failure so the row is kept.
                     if not self._influx.connected:
                         raise ConnectionError("cloud InfluxDB not connected")
+                    point_ts = payload.get("point_ts")
                     if target == "influx":
-                        self._influx.write_soil(state)
+                        self._influx.write_soil(state, point_ts)
                     elif target == "influx_link":
-                        self._influx.write_link(state)
+                        self._influx.write_link(state, point_ts)
                     else:
-                        self._influx.write_position(state)
+                        self._influx.write_position(state, point_ts)
                 else:
                     # Never silently mark an unsupported target as flushed.
                     logger.error(
@@ -1338,21 +1363,29 @@ class MqttToDbIngestor:
                 state.firmware_version = version
 
     def write_outputs(self, state: NodeState, kind: str) -> None:
+        # apply_payload() has just recorded this packet's timestamp under its own
+        # kind, so this is the timestamp of the reading being written -- not the
+        # newest timestamp seen from the node, which is what last_seen_ts holds
+        # and what silently re-dated replayed readings to the present. Queued
+        # cloud writes carry it too, so a row flushed hours later still lands on
+        # the instant it was measured.
+        point_ts = state.applied_ts.get(kind)
+
         # --- Local (primary — always write) ---
         if self.influx.enabled:
             if kind in {"soil_raw", "soil_percent", "soil_band", "battery"}:
                 try:
-                    self.influx.write_soil(state)
+                    self.influx.write_soil(state, point_ts)
                 except Exception as e:
                     logger.warning("Local InfluxDB soil write failed: %s", e)
             elif kind == "link":
                 try:
-                    self.influx.write_link(state)
+                    self.influx.write_link(state, point_ts)
                 except Exception as e:
                     logger.warning("Local InfluxDB link write failed: %s", e)
             elif kind == "position":
                 try:
-                    self.influx.write_position(state)
+                    self.influx.write_position(state, point_ts)
                 except Exception as e:
                     logger.warning("Local InfluxDB position write failed: %s", e)
 
@@ -1366,22 +1399,22 @@ class MqttToDbIngestor:
         if self.influx_cloud.enabled:
             if kind in {"soil_raw", "soil_percent", "soil_band", "battery"}:
                 try:
-                    self.influx_cloud.write_soil(state)
+                    self.influx_cloud.write_soil(state, point_ts)
                 except Exception as e:
                     logger.warning("Cloud InfluxDB soil write failed, queuing: %s", e)
-                    self.sync_queue.enqueue("influx", _state_to_dict(state))
+                    self.sync_queue.enqueue("influx", _state_to_dict(state, point_ts=point_ts))
             elif kind == "link":
                 try:
-                    self.influx_cloud.write_link(state)
+                    self.influx_cloud.write_link(state, point_ts)
                 except Exception as e:
                     logger.warning("Cloud InfluxDB link write failed, queuing: %s", e)
-                    self.sync_queue.enqueue("influx_link", _state_to_dict(state))
+                    self.sync_queue.enqueue("influx_link", _state_to_dict(state, point_ts=point_ts))
             elif kind == "position":
                 try:
-                    self.influx_cloud.write_position(state)
+                    self.influx_cloud.write_position(state, point_ts)
                 except Exception as e:
                     logger.warning("Cloud InfluxDB position write failed, queuing: %s", e)
-                    self.sync_queue.enqueue("influx_position", _state_to_dict(state))
+                    self.sync_queue.enqueue("influx_position", _state_to_dict(state, point_ts=point_ts))
 
         if self.pg_cloud.enabled:
             try:
@@ -1390,7 +1423,8 @@ class MqttToDbIngestor:
                 logger.warning("Cloud Postgres write failed, queuing: %s", e)
                 self.sync_queue.enqueue(
                     "pg",
-                    _state_to_dict(state, self.db_cfg.location_name, self.db_cfg.node_type),
+                    _state_to_dict(state, self.db_cfg.location_name, self.db_cfg.node_type,
+                                   point_ts=point_ts),
                 )
 
     @staticmethod

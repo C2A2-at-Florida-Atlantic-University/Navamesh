@@ -149,3 +149,96 @@ def test_position_columns_are_guarded_too():
     for column in ("lat", "lon", "geom"):
         assert f"EXCLUDED.{column}" in sql
         assert f"ELSE mesh_nodes.{column}" in sql
+
+
+# ── InfluxDB point timestamps ────────────────────────────────────────────────
+#
+# The guards above stop a replayed packet rewriting the *cache*. They do not
+# stop it being written to the time series under the wrong date, because the
+# writers took their timestamp from state.last_seen_ts -- the newest timestamp
+# from ANY payload kind -- rather than from the packet in hand.
+#
+# Measured on spirit-farm-pi, 2026-08-27: an ingestor MQTT reconnect at
+# 2026-08-26 17:00 UTC replayed retained battery topics holding readings taken
+# on 2026-08-22. Link packets had kept last_seen_ts current throughout, so six
+# nodes' four-day-old battery levels were written stamped 2026-08-26 and read as
+# fresh measurements on the public site.
+
+from navamesh.mqtt_to_db import InfluxWriter, _point_time, _state_to_dict
+
+
+AUG_22 = 1787397653   # when the reading was actually taken
+AUG_26 = 1787763600   # when a reconnect replayed it
+
+
+def _writer_recording_points():
+    """An InfluxWriter whose _write_api records what it was handed."""
+    w = InfluxWriter.__new__(InfluxWriter)
+    w._bucket, w._org = "b", "o"
+    written = []
+    w._write_api = SimpleNamespace(write=lambda bucket, org, record: written.append(record))
+    return w, written
+
+
+def test_a_replayed_reading_is_stamped_when_it_was_taken_not_when_it_arrived():
+    state = NodeState(node_id="!045de249")
+    state.battery_level = 91.0
+    # Link traffic has carried recency forward while the battery topic sat retained.
+    state.last_seen_ts = AUG_26
+    assert _point_time(state, AUG_22).timestamp() == AUG_22, (
+        "the packet's own timestamp must win over last_seen_ts"
+    )
+
+
+def test_write_soil_stamps_the_packet_not_the_node_s_recency():
+    w, written = _writer_recording_points()
+    state = NodeState(node_id="!045de249")
+    state.battery_level = 91.0
+    state.last_seen_ts = AUG_26
+    w.write_soil(state, AUG_22)
+    assert len(written) == 1
+    # Point stores the time it was given; compare through its own line protocol.
+    assert str(AUG_22) in written[0].to_line_protocol()
+
+
+def test_last_seen_is_only_the_fallback_when_no_packet_time_is_known():
+    state = NodeState(node_id="!045de249")
+    state.last_seen_ts = AUG_26
+    assert _point_time(state, None).timestamp() == AUG_26
+
+
+def test_a_queued_cloud_write_carries_the_packet_time_so_a_late_flush_is_not_re_dated():
+    state = NodeState(node_id="!045de249")
+    state.last_seen_ts = AUG_26
+    assert _state_to_dict(state, point_ts=AUG_22)["point_ts"] == AUG_22
+    # Rows queued by an older build have no such key; readers must tolerate that.
+    assert _state_to_dict(state)["point_ts"] is None
+
+
+def test_write_outputs_uses_the_timestamp_apply_payload_recorded_for_that_kind():
+    """The two halves have to agree: apply_payload files the packet's ts under
+    its kind, and write_outputs must read it back from there. A mismatch is
+    invisible -- the write still succeeds, just under the wrong date."""
+    ing = _bare_ingestor()
+    state = NodeState(node_id="!045de249")
+
+    calls = []
+    ing.influx = SimpleNamespace(
+        enabled=True,
+        write_soil=lambda st, pts: calls.append(("soil", pts)),
+        write_link=lambda st, pts: calls.append(("link", pts)),
+        write_position=lambda st, pts: calls.append(("position", pts)),
+    )
+    ing.influx_cloud = SimpleNamespace(enabled=False)
+    ing.pg = SimpleNamespace(enabled=False)
+    ing.pg_cloud = SimpleNamespace(enabled=False)
+
+    # A stale battery replay arriving while link traffic keeps recency current.
+    ing.apply_payload(state, "link", {"ts": AUG_26, "rxRssi": -73, "rxSnr": 6.0})
+    ing.apply_payload(state, "battery", {"ts": AUG_22, "batteryLevel": 91.0})
+    assert state.last_seen_ts == AUG_26      # recency is still the newest packet
+    ing.write_outputs(state, "battery")
+
+    assert calls == [("soil", AUG_22)], (
+        "the battery reading must be stamped 2026-08-22, not dragged to 2026-08-26"
+    )
