@@ -389,12 +389,25 @@ restart. Its update path is `/home/pi/navamesh-updates`, not `/home/tj/...`.
 - Its `/home/pi/Navamesh` working tree carries ~22 untracked junk files (`[bridge]`,
   `exporting`, `transferring`, influx tarballs, an `mqtt_to_db.py.bak`) from a word-split
   build command. Harmless, and none collide with tracked files, so pulls are unaffected.
-- **Open: the cloud table has four rows the Pi no longer feeds.** `mesh_nodes_farm2` holds
-  22 rows against the farm's 18 — `unknown`, `!da6338b4`, `!6c730dac`, `!04b595ed`, all
-  last seen 13-19 Aug, and three of them *with* coordinates. All four are in the farm's
-  `IGNORED_NODES`, so the Pi stopped writing them and the rows simply persist; the local
-  table is clean. Anything reading `mesh_nodes_farm2` directly — the public site — still
-  sees them. Deleting them is a write to Azure that affects nextg-ag.org, so ask first.
+- **Closed 2026-08-27: four foreign radios were sitting in the cloud table labelled as
+  Spirit Farm.** `mesh_nodes_farm2` held 22 rows against the farm's 18 — `unknown`,
+  `!da6338b4`, `!6c730dac`, `!04b595ed`. They were not retired farm sensors. Their stored
+  coordinates put them **191 km, 209 km and 342 km away** (central New Mexico and Arizona),
+  i.e. strangers' Meshtastic nodes heard on the **default public channel**, written with
+  `"location": "Spirit Farm"` and `"status": "online"` and pushed to the cloud. Deleted
+  after backing the rows up to `/home/pi/cloud_stale_rows_<stamp>.tsv` on that Pi, gated on
+  a count of exactly 4; the table is now 18 rows, all named `Node A`-`Node R`, all with
+  coordinates. Five stale retained MQTT topics for those ids were cleared too.
+
+  **Two things worth carrying forward.** `IGNORED_NODES` is what stops this at the Pi, and
+  it is the reason the local table stayed clean while the cloud one did not — the rows
+  predate those ids being added to the list, and nothing retroactively removes what was
+  already written. And `MAP_OUTLIER_GUARD_ENABLED` /
+  `MAP_SEPARATE_FARM_DISTANCE_METERS=3000` protect **the Pi's rendered map only**:
+  `Navamesh-Cloud` reads the table directly with no such guard, so a stray public-channel
+  node with a GPS fix lands on the public site as a pin hundreds of km from the farm. Worth
+  re-checking `mesh_nodes_farm2` for rows outside the farm box after any period of new
+  radios appearing.
 - To close the open question above: that Pi **has** `/dev/rtc0` and NTP is active and
   synchronized, so the backwards-clock `cmd_id` trap does not apply to it.
 
