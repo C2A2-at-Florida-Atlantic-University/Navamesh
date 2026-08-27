@@ -360,11 +360,41 @@ Its cloud writes are always on. **The merge that was planned here happened on 20
 The firmware stays on its fork branch. The schema changes are `ON CONFLICT` clauses and
 metadata keys, so no migration is needed.
 
-Two things to remember when deploying there, both of which make it unlike `devpi`:
-its services are **systemd, not containers**, so deploying is a service restart rather
-than `docker compose build`; and its update path is `/home/pi/navamesh-updates` (not
-`/home/tj/...`), which was still serving **1.9.8** as of 2026-08-23 against the app's
-current 1.9.23.
+**Read "native Postgres and InfluxDB" narrowly: it means the databases.** The Navamesh
+services themselves — `navamesh_bridge`, `navamesh_ingestor`, `navamesh_reticulum`,
+`navamesh_tiles` — are Docker there exactly as on `devpi`, building from the same
+`docker-compose.yml`. So deploying is `docker compose build` + `up -d`, not a systemd
+restart. Its update path is `/home/pi/navamesh-updates`, not `/home/tj/...`.
+
+**Deployed there 2026-08-26** (first pull since `638b12a`, taking it to `719f357`):
+
+- Rebuilt and restarted **only `reticulum`**. `bridge` owns the serial radio and
+  `ingestor` owns the MQTT→DB path, so leaving both running means no gap in field data;
+  nothing outside the reply/map path changed anyway. The gateway keeps its LXMF identity
+  across the restart (`/home/pi/.reticulum` is a bind mount), so paired phones stay paired.
+- The suite runs there the same way it does on `devpi` — throwaway container, **356 passed**.
+- **All 18 nodes report no `firmware_version` at all**, i.e. none has ever acked a command:
+  they predate the NavameshCommand module. `setloc` and every other write verb will simply
+  time out on that fleet until it is reflashed. Plan around it.
+- **Their coordinates were therefore written straight into `mesh_nodes`** (lat/lon plus
+  PostGIS `geom`), from a surveyed list, matched on `long_name` so a wrong id could not
+  silently mis-place a sensor. That is safe to do precisely because these nodes never send
+  position: the upsert only touches `lat`/`lon`/`geom` on a packet that carries
+  coordinates, so battery/link/info traffic leaves them alone. Once the fleet is reflashed,
+  prefer `setloc` — it puts the position on the node, where it belongs.
+- All 18 sit inside the farm `CACHE_*` box with z14-19 tiles present, so maps render fully
+  offline. Confirmed: `map` plots 18, `map <id>` plots 1 at the same scale.
+- **`soil_last_ts` and `soil_raw` are NULL for the whole fleet**, so `classify_node_health()`
+  flags every node "no soil readings recently" and the map draws `?` for soil — while soil
+  is in fact arriving (351 points into InfluxDB in 24 h). The legacy percent path feeds
+  Influx but not the node metadata the flag reads. Battery, voltage and link resolve
+  normally, so the nodes are genuinely up. Expected to clear itself when the fleet moves to
+  the raw-ADC firmware; until then do not read those warnings as dead sensors.
+- Its `/home/pi/Navamesh` working tree carries ~22 untracked junk files (`[bridge]`,
+  `exporting`, `transferring`, influx tarballs, an `mqtt_to_db.py.bak`) from a word-split
+  build command. Harmless, and none collide with tracked files, so pulls are unaffected.
+- To close the open question above: that Pi **has** `/dev/rtc0` and NTP is active and
+  synchronized, so the backwards-clock `cmd_id` trap does not apply to it.
 
 ### Verified end to end on the bench, 2026-08-23
 
