@@ -1,5 +1,36 @@
 # TODO
 
+## Publish app 1.9.24 to spirit-farm-pi
+
+**Status:** open, 2026-08-30. The dev Pi is already serving it; the farm Pi is not.
+
+`devpi` serves **1.9.24** at `/home/tj/navamesh-updates` (verified: `version.json` correct,
+Range request returns 206). `spirit-farm-pi` is still on **1.9.23**, so the phones there
+will not see the change that made this build -- node pickers showing each node's name
+instead of its Meshtastic hex id.
+
+Deferred only because of the link. It was built at the ISU conference with the Mac on an
+iPhone hotspot, and pushing a 91 MB APK over cellular to New Mexico -- the worst link in
+the project -- was not worth it when nothing at the farm needed it that night. The APK is
+already built and sitting in `dist/`, so this is a single command on a real connection:
+
+```bash
+cd navamesh-sideband-wrapper
+bash scripts/publish_update.sh pi@spirit-farm-pi          # defaults to /home/pi/navamesh-updates
+```
+
+`publish_update.sh` takes the newest APK in `dist/` **by mtime**, so check the filename it
+echoes says `1.9.24` -- rebuilding another branch first would silently ship that instead.
+Reaching the Pi needs the tailnet hop (`spirit-farm-pi` shell function; it reverts on
+exit). Afterwards confirm the farm Pi serves it and still answers a Range request with
+**206**, not 200:
+
+```bash
+curl -s http://spirit-farm-pi:8090/version.json
+curl -s -o /dev/null -w '%{http_code}\n' -r 0-999 \
+  http://spirit-farm-pi:8090/navameshfarm-1.9.24-arm64-v8a-debug.apk   # want 206
+```
+
 ## Restrict control commands to known senders
 
 **Status:** deliberately deferred. Not a blocker for testing or first deployment.
