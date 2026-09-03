@@ -18,8 +18,8 @@ bites. Read the one for whichever you are touching; this file is only the map be
 | `Navamesh-Cloud` | the public site, nextg-ag.org (Flask + frontend) | `CLAUDE.md` in that repo |
 
 **`Navamesh-Cloud` is a fourth consumer that is easy to forget.** It reads the **cloud**
-Postgres (`mesh_nodes_farm2` on Azure), not this Pi's, on branch `main` rather than
-`raw-adc-private-app`, and it is not part of the mesh path below — which is exactly why a
+Postgres (`mesh_nodes_farm2` on Azure), not this Pi's, and it is not part of the mesh
+path below — which is exactly why a
 farmer-facing change here can leave it contradicting the app. It no longer prints a
 percentage (closed 2026-08-26): it derives DRY/DAMP/WET like everything else, falling back
 to the legacy percentage only to classify it, and marks that case `uncal.`. Two consequences
@@ -34,7 +34,9 @@ one machine has them flat under a parent (`Navamesh-Dev/`), another nests the fi
 inside a `Navamesh-Hardware/` folder and renames `Navamesh` to `Navamesh-main`. Identify a
 repo by its git remote, not its folder name, and do not assume they are siblings on disk.
 
-The three mesh repos track the branch **`raw-adc-private-app`** (`Navamesh-Cloud` is on `main`). The firmware repo pushes to the
+This repo, the app and the site are all on **`main`**. Only the firmware repo still
+tracks **`raw-adc-private-app`** — it is our fork of a partner's codebase and is where
+firmware work continues. The firmware repo pushes to the
 `myfork` remote, not `origin` — `origin` (Sarkors) is read-only for us and a push there
 403s.
 
@@ -234,13 +236,15 @@ and what closing them would take — not a bullet list of tasks. Match that shap
 
 ## Recent work (Aug 2026)
 
-Ends at: app **1.9.23**, Pi `eefb8e2`, firmware `2133f6a42` (fleet flashed with
+Ends at: app **1.9.24**, Pi `eefb8e2`, firmware `2133f6a42` (fleet flashed with
 `7d66535` / `2.7.20.7d66535`).
 
-**`main` and `raw-adc-private-app` are level again** for this repo and the app, as of
-2026-08-26 — both fast-forwarded, nothing divergent. That was the long-standing
-precondition for `spirit-farm-pi` (which is on `main`) to pull any of this. The firmware
-stays on its fork branch.
+**There is one branch now** for this repo and the app. `raw-adc-private-app` was
+fast-forwarded into `main` and then deleted, locally and on GitHub, on 2026-09-03 — it had
+drifted ahead again after the 2026-08-26 merge, and a private branch that keeps re-diverging
+from the branch `spirit-farm-pi` actually pulls is the drift itself, not protection from it.
+The firmware repo keeps `raw-adc-private-app`: it is our fork of a partner's codebase, whose
+`develop` carries the moisture code we replaced, so that branch is the work, not a detour.
 
 ### 2026-08-26 — a demo bench, and three silent failures found by measuring
 
@@ -360,11 +364,11 @@ field data. Read it for context freely; change nothing on it without saying so f
 
 `spirit-farm-pi` is on branch **`main`** and has **native Postgres and InfluxDB** under
 systemd rather than containers — deliberate, so a second farm's Pi keeps its own data.
-Its cloud writes are always on. **The merge that was planned here happened on 2026-08-26**:
-`raw-adc-private-app` was fast-forwarded into `main` for both `Navamesh` and
-`navamesh-sideband-wrapper` and pushed, so that Pi can now pull `main` and get everything.
-The firmware stays on its fork branch. The schema changes are `ON CONFLICT` clauses and
-metadata keys, so no migration is needed.
+Its cloud writes are always on. `raw-adc-private-app` was fast-forwarded into `main` for
+both `Navamesh` and `navamesh-sideband-wrapper` on 2026-08-26 and again on 2026-09-03, when
+that branch was deleted from both — so `main` is simply what this Pi pulls, with no second
+branch to reconcile first. The firmware keeps its fork branch. The schema changes are
+`ON CONFLICT` clauses and metadata keys, so no migration is needed.
 
 **Read "native Postgres and InfluxDB" narrowly: it means the databases.** The Navamesh
 services themselves — `navamesh_bridge`, `navamesh_ingestor`, `navamesh_reticulum`,
